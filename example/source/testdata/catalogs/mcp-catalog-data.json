@@ -1,0 +1,195 @@
+{
+  "servers": [
+    {
+      "id": "aws-knowledge",
+      "name": "AWS Knowledge MCP Server",
+      "description": "Provides documentation, code samples, and other official AWS content",
+      "url": "https://knowledge-mcp.global.api.aws",
+      "tarsUrl": "https://api.router.tetrate.ai/mcp/s/aws-knowledge",
+      "categories": ["Documentation", "Cloud"],
+      "icon": "https://aws.amazon.com/favicon.ico",
+      "installExamples": {
+        "goose": "goose://extension?type=streamable_http&url=https://api.router.tetrate.ai/mcp/s/aws-knowledge&id=aws-knowledge&name=AWS Knowledge MCP Server&description=AWS documentation and code samples",
+        "claude": "claude mcp add --transport http aws-knowledge https://api.router.tetrate.ai/mcp/s/aws-knowledge"
+      },
+      "tools": [],
+      "authentication": "Open"
+    },
+    {
+      "id": "context7",
+      "name": "Context7",
+      "description": "Up-to-date documentation for LLMs and AI code editors",
+      "url": "https://mcp.context7.com/mcp",
+      "tarsUrl": "https://api.router.tetrate.ai/mcp/s/context7",
+      "categories": ["Documentation", "AI/ML"],
+      "icon": "https://context7.com/favicon.ico",
+      "installExamples": {
+        "goose": "goose://extension?type=streamable_http&url=https://api.router.tetrate.ai/mcp/s/context7&id=context7&name=Context7&description=Up-to-date documentation for LLMs and AI code editors",
+        "claude": "claude mcp add --transport http context7 https://api.router.tetrate.ai/mcp/s/context7"
+      },
+      "tools": [],
+      "authentication": "Open"
+    },
+    {
+      "id": "microsoft-learn",
+      "name": "Microsoft Learn",
+      "description": "Provides documentation from Microsoft Learn",
+      "url": "https://learn.microsoft.com/api/mcp",
+      "tarsUrl": "https://api.router.tetrate.ai/mcp/s/microsoft-learn",
+      "categories": ["Documentation", "Cloud"],
+      "icon": "https://learn.microsoft.com/favicon.ico",
+      "installExamples": {
+        "goose": "goose://extension?type=streamable_http&url=https://api.router.tetrate.ai/mcp/s/microsoft-learn&id=microsoft-learn&name=Microsoft Learn&description=Provides documentation from Microsoft Learn",
+        "claude": "claude mcp add --transport http microsoft-learn https://api.router.tetrate.ai/mcp/s/microsoft-learn"
+      },
+      "tools": [],
+      "authentication": "Open"
+    },
+    {
+      "id": "kiwi",
+      "name": "Kiwi Flight Search",
+      "description": "Search flights and get a direct booking link",
+      "url": "https://mcp.kiwi.com",
+      "tarsUrl": "https://api.router.tetrate.ai/mcp/s/kiwi",
+      "categories": ["Travel", "Search"],
+      "icon": "https://images.kiwi.com/whitelabels/favicon/kiwicom.png",
+      "installExamples": {
+        "goose": "goose://extension?type=streamable_http&url=https://api.router.tetrate.ai/mcp/s/kiwi&id=kiwi&name=Kiwi Flight Search&description=Search flights and get a direct booking link",
+        "claude": "claude mcp add --transport http kiwi https://api.router.tetrate.ai/mcp/s/kiwi"
+      },
+      "tools": [],
+      "authentication": "Open"
+    },
+    {
+      "id": "huggingface",
+      "name": "Hugging Face",
+      "description": "Official HF Hub access: ML models, datasets, spaces, papers, and documentation",
+      "url": "https://huggingface.co/mcp",
+      "tarsUrl": "https://api.router.tetrate.ai/mcp/s/huggingface",
+      "categories": ["AI/ML", "Developer Tools"],
+      "icon": "https://huggingface.co/favicon.ico",
+      "requiresAuth": true,
+      "installExamples": {
+        "goose": "goose://extension?type=streamable_http&url=https://api.router.tetrate.ai/mcp/s/huggingface&id=huggingface&name=Hugging Face&description=Official HF Hub access with authentication",
+        "claude": "claude mcp add --transport http huggingface https://api.router.tetrate.ai/mcp/s/huggingface"
+      },
+      "tools": [],
+      "authentication": "Bearer Token"
+    },
+    {
+      "id": "github-copilot",
+      "name": "GitHub Copilot",
+      "description": "Read repositories, manage issues and PRs, analyze code, and automate workflows",
+      "url": "https://api.githubcopilot.com/mcp",
+      "tarsUrl": "https://api.router.tetrate.ai/mcp/s/github-copilot",
+      "categories": ["Developer Tools", "Productivity"],
+      "icon": "https://github.githubassets.com/favicons/favicon.svg",
+      "requiresAuth": true,
+      "installExamples": {
+        "goose": "goose://extension?type=streamable_http&url=https://api.router.tetrate.ai/mcp/s/github-copilot&id=github-copilot&name=GitHub Copilot&description=Read repositories, manage issues and PRs, analyze code, and automate workflows",
+        "claude": "claude mcp add --transport http github-copilot https://api.router.tetrate.ai/mcp/s/github-copilot"
+      },
+      "tools": [],
+      "authentication": "Bearer Token"
+    },
+    {
+      "id": "stripe",
+      "name": "Stripe",
+      "description": "Payment processing and financial services",
+      "url": "https://mcp.stripe.com/",
+      "tarsUrl": "https://api.router.tetrate.ai/mcp/s/stripe",
+      "categories": ["Payments", "Finance"],
+      "icon": "https://stripe.com/favicon.ico",
+      "requiresAuth": true,
+      "installExamples": {
+        "goose": "goose://extension?type=streamable_http&url=https://api.router.tetrate.ai/mcp/s/stripe&id=stripe&name=Stripe&description=Payment processing and financial services",
+        "claude": "claude mcp add --transport http stripe https://api.router.tetrate.ai/mcp/s/stripe"
+      },
+      "tools": [],
+      "authentication": "Bearer Token"
+    },
+    {
+      "id": "netlify",
+      "name": "Netlify",
+      "description": "Deploy and manage modern web projects",
+      "url": "https://netlify-mcp.netlify.app/mcp",
+      "tarsUrl": "https://api.router.tetrate.ai/mcp/s/netlify",
+      "categories": ["Developer Tools", "Deployment"],
+      "icon": "https://www.netlify.com/favicon/favicon.ico",
+      "requiresAuth": true,
+      "installExamples": {
+        "goose": "goose://extension?type=streamable_http&url=https://api.router.tetrate.ai/mcp/s/netlify&id=netlify&name=Netlify&description=Deploy and manage modern web projects",
+        "claude": "claude mcp add --transport http netlify https://api.router.tetrate.ai/mcp/s/netlify"
+      },
+      "tools": [],
+      "authentication": "Bearer Token"
+    },
+    {
+      "id": "neon",
+      "name": "Neon Database",
+      "description": "Natural-language SQL queries, project and branch management for Postgres",
+      "url": "https://mcp.neon.tech/mcp",
+      "tarsUrl": "https://api.router.tetrate.ai/mcp/s/neon",
+      "categories": ["Database", "Developer Tools"],
+      "icon": "https://neon.com/apple-touch-icon.png",
+      "requiresAuth": true,
+      "installExamples": {
+        "goose": "goose://extension?type=streamable_http&url=https://api.router.tetrate.ai/mcp/s/neon&id=neon&name=Neon Database&description=Natural-language SQL queries and Postgres management",
+        "claude": "claude mcp add --transport http neon https://api.router.tetrate.ai/mcp/s/neon"
+      },
+      "tools": [],
+      "authentication": "Bearer Token"
+    },
+    {
+      "id": "postman-minimal",
+      "name": "Postman (Minimal)",
+      "description": "Essential Postman API tools for basic operations with faster performance",
+      "url": "https://mcp.postman.com/minimal",
+      "tarsUrl": "https://api.router.tetrate.ai/mcp/s/postman-minimal",
+      "categories": ["Developer Tools", "API Testing"],
+      "icon": "https://voyager.postman.com/logo/postman-logo-icon-orange.svg",
+      "requiresAuth": true,
+      "note": "Minimal configuration with essential tools only. EU server: https://mcp.eu.postman.com/minimal",
+      "installExamples": {
+        "goose": "goose://extension?type=streamable_http&url=https://api.router.tetrate.ai/mcp/s/postman-minimal&id=postman-minimal&name=Postman Minimal&description=Essential Postman API tools",
+        "claude": "claude mcp add --transport http postman-minimal https://api.router.tetrate.ai/mcp/s/postman-minimal"
+      },
+      "tools": [],
+      "authentication": "Bearer Token"
+    },
+    {
+      "id": "postman-full",
+      "name": "Postman (Full)",
+      "description": "Complete Postman API access with 100+ tools for comprehensive API management",
+      "url": "https://mcp.postman.com/mcp",
+      "tarsUrl": "https://api.router.tetrate.ai/mcp/s/postman-full",
+      "categories": ["Developer Tools", "API Testing"],
+      "icon": "https://voyager.postman.com/logo/postman-logo-icon-orange.svg",
+      "requiresAuth": true,
+      "note": "Full configuration with 100+ tools. EU server: https://mcp.eu.postman.com/mcp",
+      "installExamples": {
+        "goose": "goose://extension?type=streamable_http&url=https://api.router.tetrate.ai/mcp/s/postman-full&id=postman-full&name=Postman Full&description=Complete Postman API access with 100+ tools",
+        "claude": "claude mcp add --transport http postman-full https://api.router.tetrate.ai/mcp/s/postman-full"
+      },
+      "tools": [],
+      "authentication": "Bearer Token"
+    },
+    {
+      "id": "brightdata",
+      "name": "Brightdata",
+      "description": "Web access server that enables AI models to retrieve real-time web information without getting blocked",
+      "url": "https://mcp.brightdata.com/mcp",
+      "tarsUrl": "https://api.router.tetrate.ai/mcp/s/brightdata",
+      "categories": ["AI/ML", "Developer Tools", "Search"],
+      "icon": "https://brightdata.com/favicon.ico",
+      "requiresAuth": true,
+      "note": "Free tier with 5,000 monthly requests, Pro mode available for advanced features",
+      "installExamples": {
+        "goose": "goose://extension?type=streamable_http&url=https://api.router.tetrate.ai/mcp/s/brightdata&id=brightdata&name=Brightdata&description=Web access server for real-time web information",
+        "claude": "claude mcp add --transport http brightdata https://api.router.tetrate.ai/mcp/s/brightdata"
+      },
+      "tools": [],
+      "authentication": "Bearer Token"
+    }
+  ]
+}

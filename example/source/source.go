@@ -3,11 +3,13 @@ package source
 import (
 	"bytes"
 	"embed"
+	"encoding/json"
 	"fmt"
 	"os"
 
-	cherry "github.com/dio/cherry"
 	"gopkg.in/yaml.v3"
+
+	cherry "github.com/dio/cherry"
 )
 
 //go:embed testdata/example_fixture.yaml
@@ -80,10 +82,11 @@ type Tag struct {
 }
 
 type Rule struct {
-	ID          string               `yaml:"id"`
-	Specificity Specificity          `yaml:"specificity"`
-	Overrides   map[string]RouteNode `yaml:"overrides"`
-	RateLimit   *RateLimitPolicy     `yaml:"rate_limit"`
+	ID               string               `yaml:"id"`
+	Specificity      Specificity          `yaml:"specificity"`
+	Overrides        map[string]RouteNode `yaml:"overrides"`
+	RoutingOverrides map[string]RouteNode `yaml:"routing_overrides"`
+	RateLimit        *RateLimitPolicy     `yaml:"rate_limit"`
 }
 
 type Specificity int
@@ -141,10 +144,12 @@ func (s Specificity) MarshalYAML() (any, error) {
 }
 
 type RouteNode struct {
-	Kind   string              `yaml:"kind"`
-	Target *Target             `yaml:"target"`
-	Chain  []RouteNode         `yaml:"chain"`
-	Split  []WeightedRouteNode `yaml:"split"`
+	Kind     string              `yaml:"kind"`
+	Target   *Target             `yaml:"target"`
+	Chain    []RouteNode         `yaml:"chain"`
+	Split    []WeightedRouteNode `yaml:"split"`
+	Retry    *RetryPolicy        `yaml:"retry"`
+	OnStatus []int               `yaml:"on_status"`
 }
 
 type WeightedRouteNode struct {
@@ -152,10 +157,109 @@ type WeightedRouteNode struct {
 	Node   RouteNode `yaml:"node"`
 }
 
+type RetryPolicy struct {
+	RetryOn         string `yaml:"retry_on"`
+	PerTryTimeoutMS int    `yaml:"per_try_timeout_ms"`
+}
+
 type Target struct {
 	Provider  string `yaml:"provider"`
 	Model     string `yaml:"model"`
+	Name      string `yaml:"name"`
 	SecretRef string `yaml:"secret_ref"`
+}
+
+func (n *RouteNode) UnmarshalYAML(value *yaml.Node) error {
+	var aux struct {
+		Kind     string             `yaml:"kind"`
+		Target   *Target            `yaml:"target"`
+		Chain    *routeChildrenNode `yaml:"chain"`
+		Split    *routeChildrenNode `yaml:"split"`
+		Retry    *RetryPolicy       `yaml:"retry"`
+		OnStatus []int              `yaml:"on_status"`
+	}
+	if err := value.Decode(&aux); err != nil {
+		return err
+	}
+	*n = RouteNode{
+		Kind:     aux.Kind,
+		Target:   aux.Target,
+		Retry:    aux.Retry,
+		OnStatus: aux.OnStatus,
+	}
+	if aux.Chain != nil {
+		n.Kind = firstNonEmpty(n.Kind, "chain")
+		n.Retry = aux.Chain.Retry
+		n.Chain = aux.Chain.RouteChildren
+	}
+	if aux.Split != nil {
+		n.Kind = firstNonEmpty(n.Kind, "split")
+		n.Retry = aux.Split.Retry
+		n.Split = aux.Split.WeightedChildren
+	}
+	if n.Target != nil {
+		n.Kind = firstNonEmpty(n.Kind, "target")
+	}
+	return nil
+}
+
+type routeChildrenNode struct {
+	Retry            *RetryPolicy
+	RouteChildren    []RouteNode
+	WeightedChildren []WeightedRouteNode
+}
+
+func (n *routeChildrenNode) UnmarshalYAML(value *yaml.Node) error {
+	switch value.Kind {
+	case yaml.SequenceNode:
+		return value.Decode(&n.RouteChildren)
+	case yaml.MappingNode:
+		var aux struct {
+			Retry    *RetryPolicy        `yaml:"retry"`
+			Children []WeightedRouteNode `yaml:"children"`
+		}
+		if err := value.Decode(&aux); err != nil {
+			return err
+		}
+		n.Retry = aux.Retry
+		n.WeightedChildren = aux.Children
+		n.RouteChildren = make([]RouteNode, 0, len(aux.Children))
+		for _, child := range aux.Children {
+			n.RouteChildren = append(n.RouteChildren, child.Node)
+		}
+		return nil
+	default:
+		return fmt.Errorf("route children must be a sequence or mapping")
+	}
+}
+
+func (n *WeightedRouteNode) UnmarshalYAML(value *yaml.Node) error {
+	var aux struct {
+		Weight int        `yaml:"weight"`
+		Node   *RouteNode `yaml:"node"`
+		Target *Target    `yaml:"target"`
+		Chain  *RouteNode `yaml:"chain"`
+		Split  *RouteNode `yaml:"split"`
+	}
+	if err := value.Decode(&aux); err != nil {
+		return err
+	}
+	n.Weight = aux.Weight
+	switch {
+	case aux.Node != nil:
+		n.Node = *aux.Node
+	case aux.Target != nil:
+		n.Node = RouteNode{Kind: "target", Target: aux.Target}
+	case aux.Chain != nil:
+		n.Node = *aux.Chain
+		n.Node.Kind = firstNonEmpty(n.Node.Kind, "chain")
+	case aux.Split != nil:
+		n.Node = *aux.Split
+		n.Node.Kind = firstNonEmpty(n.Node.Kind, "split")
+	default:
+		return fmt.Errorf("weighted route node requires node, target, chain, or split")
+	}
+	return nil
 }
 
 type RateLimitPolicy struct {
@@ -207,6 +311,46 @@ type MCPServer struct {
 	Tools     []string `yaml:"tools"`
 }
 
+type rawModelCatalog struct {
+	Models []json.RawMessage `json:"models"`
+}
+
+type rawModelRow struct {
+	Model        string   `json:"model"`
+	Provider     string   `json:"provider"`
+	Mode         string   `json:"mode"`
+	IsEnabled    bool     `json:"isEnabled"`
+	Capabilities []string `json:"capabilities"`
+}
+
+type rawProviderCatalog struct {
+	Providers []rawProviderRow `json:"providers"`
+}
+
+type rawProviderRow struct {
+	Name       string `json:"name"`
+	APIBaseURL string `json:"apiBaseUrl"`
+	AuthType   string `json:"authType"`
+	IsEnabled  bool   `json:"isEnabled"`
+}
+
+type rawMCPCatalogObject struct {
+	Servers []rawMCPServerRow `json:"servers"`
+}
+
+type rawMCPServerRow struct {
+	ID             string          `json:"id"`
+	URL            string          `json:"url"`
+	TarsURL        string          `json:"tarsUrl"`
+	Authentication string          `json:"authentication"`
+	RequiresAuth   bool            `json:"requiresAuth"`
+	Tools          []rawMCPToolRow `json:"tools"`
+}
+
+type rawMCPToolRow struct {
+	Name string `json:"name"`
+}
+
 func ExampleFixture() Fixture {
 	data, err := fixtureFiles.ReadFile("testdata/example_fixture.yaml")
 	if err != nil {
@@ -225,6 +369,216 @@ func LoadFixtureYAML(path string) (Fixture, error) {
 		return Fixture{}, fmt.Errorf("read fixture yaml %q: %w", path, err)
 	}
 	return decodeFixture(data)
+}
+
+func LoadModelCatalogJSON(path string) ([]Model, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read model catalog json %q: %w", path, err)
+	}
+	var catalog rawModelCatalog
+	if err := json.Unmarshal(data, &catalog); err != nil {
+		return nil, fmt.Errorf("decode model catalog json %q: %w", path, err)
+	}
+	models := make([]Model, 0, len(catalog.Models))
+	for _, raw := range catalog.Models {
+		var row rawModelRow
+		if err := json.Unmarshal(raw, &row); err != nil {
+			return nil, fmt.Errorf("decode model catalog row: %w", err)
+		}
+		if !row.IsEnabled || row.Model == "" || row.Provider == "" {
+			continue
+		}
+		models = append(models, Model{
+			ID:           row.Model,
+			Provider:     row.Provider,
+			Name:         row.Model,
+			Mode:         row.Mode,
+			Capabilities: row.Capabilities,
+			MetadataJSON: string(raw),
+		})
+	}
+	return models, nil
+}
+
+func LoadProviderCatalogJSON(path string) ([]Provider, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read provider catalog json %q: %w", path, err)
+	}
+	var catalog rawProviderCatalog
+	if err := json.Unmarshal(data, &catalog); err != nil {
+		return nil, fmt.Errorf("decode provider catalog json %q: %w", path, err)
+	}
+	providers := make([]Provider, 0, len(catalog.Providers))
+	for _, row := range catalog.Providers {
+		if row.Name == "" {
+			continue
+		}
+		providers = append(providers, Provider{
+			ID:       row.Name,
+			Kind:     row.Name,
+			Endpoint: row.APIBaseURL,
+		})
+	}
+	return providers, nil
+}
+
+func LoadMCPCatalogJSON(path string) ([]MCPServer, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read mcp catalog json %q: %w", path, err)
+	}
+	rows, err := decodeMCPCatalog(data)
+	if err != nil {
+		return nil, fmt.Errorf("decode mcp catalog json %q: %w", path, err)
+	}
+	servers := make([]MCPServer, 0, len(rows))
+	for _, row := range rows {
+		if row.ID == "" {
+			continue
+		}
+		tools := make([]string, 0, len(row.Tools))
+		for _, tool := range row.Tools {
+			if tool.Name != "" {
+				tools = append(tools, tool.Name)
+			}
+		}
+		servers = append(servers, MCPServer{
+			ID:       row.ID,
+			Endpoint: firstNonEmpty(row.URL, row.TarsURL),
+			AuthType: mcpAuthType(row.Authentication, row.RequiresAuth),
+			Tools:    tools,
+		})
+	}
+	return servers, nil
+}
+
+func decodeMCPCatalog(data []byte) ([]rawMCPServerRow, error) {
+	var rows []rawMCPServerRow
+	if err := json.Unmarshal(data, &rows); err == nil {
+		return rows, nil
+	}
+	var object rawMCPCatalogObject
+	if err := json.Unmarshal(data, &object); err != nil {
+		return nil, err
+	}
+	return object.Servers, nil
+}
+
+func MergeModels(base []Model, overlay []Model) []Model {
+	merged := make([]Model, 0, len(base)+len(overlay))
+	seen := map[string]int{}
+	for _, model := range base {
+		seen[model.ID] = len(merged)
+		merged = append(merged, model)
+	}
+	for _, model := range overlay {
+		if index, ok := seen[model.ID]; ok {
+			merged[index] = model
+			continue
+		}
+		seen[model.ID] = len(merged)
+		merged = append(merged, model)
+	}
+	return merged
+}
+
+func MergeProviders(base []Provider, overlay []Provider) []Provider {
+	merged := make([]Provider, 0, len(base)+len(overlay))
+	seen := map[string]int{}
+	for _, provider := range base {
+		seen[provider.ID] = len(merged)
+		merged = append(merged, provider)
+	}
+	for _, provider := range overlay {
+		if index, ok := seen[provider.ID]; ok {
+			merged[index] = mergeProvider(merged[index], provider)
+			continue
+		}
+		seen[provider.ID] = len(merged)
+		merged = append(merged, provider)
+	}
+	return merged
+}
+
+func mergeProvider(base Provider, overlay Provider) Provider {
+	if overlay.Kind != "" {
+		base.Kind = overlay.Kind
+	}
+	if overlay.Endpoint != "" {
+		base.Endpoint = overlay.Endpoint
+	}
+	if overlay.SecretRef != "" {
+		base.SecretRef = overlay.SecretRef
+	}
+	if len(overlay.RequestMutations) > 0 {
+		base.RequestMutations = overlay.RequestMutations
+	}
+	if len(overlay.ResponseMutations) > 0 {
+		base.ResponseMutations = overlay.ResponseMutations
+	}
+	return base
+}
+
+func MergeMCPServers(base []MCPServer, overlay []MCPServer) []MCPServer {
+	merged := make([]MCPServer, 0, len(base)+len(overlay))
+	seen := map[string]int{}
+	for _, server := range base {
+		seen[server.ID] = len(merged)
+		merged = append(merged, server)
+	}
+	for _, server := range overlay {
+		if index, ok := seen[server.ID]; ok {
+			merged[index] = mergeMCPServer(merged[index], server)
+			continue
+		}
+		seen[server.ID] = len(merged)
+		merged = append(merged, server)
+	}
+	return merged
+}
+
+func mergeMCPServer(base MCPServer, overlay MCPServer) MCPServer {
+	if overlay.Endpoint != "" {
+		base.Endpoint = overlay.Endpoint
+	}
+	if overlay.SecretRef != "" {
+		base.SecretRef = overlay.SecretRef
+	}
+	if overlay.AuthType != "" {
+		base.AuthType = overlay.AuthType
+	}
+	if len(overlay.Tools) > 0 {
+		base.Tools = overlay.Tools
+	}
+	return base
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func mcpAuthType(authentication string, requiresAuth bool) string {
+	switch authentication {
+	case "", "Open":
+		if requiresAuth {
+			return "bearer"
+		}
+		return "none"
+	case "Bearer Token":
+		return "bearer"
+	default:
+		if requiresAuth {
+			return "bearer"
+		}
+		return authentication
+	}
 }
 
 func decodeFixture(data []byte) (Fixture, error) {

@@ -5,7 +5,6 @@ import (
 	"math"
 	"reflect"
 	"sort"
-	"strings"
 
 	cherry "github.com/dio/cherry"
 	"github.com/dio/cherry/example/source"
@@ -94,7 +93,7 @@ func buildScope(fixture source.Fixture, workspaceID string) (cherry.Scope, error
 		tools := make([]cherry.MCPToolBinding, 0, len(server.Tools))
 		for _, tool := range server.Tools {
 			tools = append(tools, cherry.MCPToolBinding{
-				ExposedName: tool,
+				ExposedName: server.ID + "__" + tool,
 				Server:      server.ID,
 				Tool:        tool,
 				SecretRef:   server.SecretRef,
@@ -170,7 +169,7 @@ func resolveModelRoute(fixture source.Fixture, rules []source.Rule, requestedMod
 	if !ok {
 		return cherry.RoutePlan{}, fmt.Errorf("unknown requested model %q", requestedModel)
 	}
-	base := cherry.RoutePlan{Provider: model.Provider, Model: model.ID}
+	base := cherry.RoutePlan{Kind: cherry.RouteKindTarget, Provider: model.Provider, Model: model.ID}
 	baseProvider, _ := FindProvider(fixture, model.Provider)
 	base.SecretRef = baseProvider.SecretRef
 
@@ -182,7 +181,7 @@ func resolveModelRoute(fixture source.Fixture, rules []source.Rule, requestedMod
 		return routeFromNode(fixture, *modelNode, base)
 	}
 
-	providerNode, err := highestOverride(rules, "provider:"+model.Provider)
+	providerNode, err := highestOverride(rules, "@"+model.Provider, "provider:"+model.Provider)
 	if err != nil {
 		return cherry.RoutePlan{}, err
 	}
@@ -192,39 +191,82 @@ func resolveModelRoute(fixture source.Fixture, rules []source.Rule, requestedMod
 	return base, nil
 }
 
-func highestOverride(rules []source.Rule, key string) (*source.RouteNode, error) {
+func highestOverride(rules []source.Rule, keys ...string) (*source.RouteNode, error) {
 	var found *source.RouteNode
 	var specificity source.Specificity
 	for _, rule := range rules {
-		node, ok := rule.Overrides[key]
-		if !ok {
-			continue
-		}
-		if err := validateNode(node); err != nil {
-			return nil, fmt.Errorf("rule %q override %q: %w", rule.ID, key, err)
-		}
-		if found != nil && rule.Specificity == specificity && !reflect.DeepEqual(*found, node) {
-			return nil, fmt.Errorf("conflicting same-specificity override for %q", key)
-		}
-		if found == nil || rule.Specificity >= specificity {
-			copy := node
-			found = &copy
-			specificity = rule.Specificity
+		overrides := ruleOverrides(rule)
+		for _, key := range keys {
+			node, ok := overrides[key]
+			if !ok {
+				continue
+			}
+			if err := validateNode(node); err != nil {
+				return nil, fmt.Errorf("rule %q override %q: %w", rule.ID, key, err)
+			}
+			if found != nil && rule.Specificity == specificity && !reflect.DeepEqual(*found, node) {
+				return nil, fmt.Errorf("conflicting same-specificity override for %q", key)
+			}
+			if found == nil || rule.Specificity >= specificity {
+				copy := node
+				found = &copy
+				specificity = rule.Specificity
+			}
+			break
 		}
 	}
 	return found, nil
 }
 
-func routeFromNode(fixture source.Fixture, node source.RouteNode, base cherry.RoutePlan) (cherry.RoutePlan, error) {
-	if node.Kind != "target" || node.Target == nil {
-		return cherry.RoutePlan{}, fmt.Errorf("pack example supports target route nodes")
+func ruleOverrides(rule source.Rule) map[string]source.RouteNode {
+	if len(rule.RoutingOverrides) == 0 {
+		return rule.Overrides
 	}
+	if len(rule.Overrides) == 0 {
+		return rule.RoutingOverrides
+	}
+	merged := map[string]source.RouteNode{}
+	for key, value := range rule.Overrides {
+		merged[key] = value
+	}
+	for key, value := range rule.RoutingOverrides {
+		merged[key] = value
+	}
+	return merged
+}
+
+func routeFromNode(fixture source.Fixture, node source.RouteNode, base cherry.RoutePlan) (cherry.RoutePlan, error) {
+	if err := validateNode(node); err != nil {
+		return cherry.RoutePlan{}, err
+	}
+	switch node.Kind {
+	case "target":
+		return routeFromTarget(fixture, node, base)
+	case "chain":
+		return routeFromChain(fixture, node, base)
+	case "split":
+		return routeFromSplit(fixture, node, base)
+	default:
+		return cherry.RoutePlan{}, fmt.Errorf("unsupported route node kind %q", node.Kind)
+	}
+}
+
+func routeFromTarget(fixture source.Fixture, node source.RouteNode, base cherry.RoutePlan) (cherry.RoutePlan, error) {
 	route := base
+	route.Kind = cherry.RouteKindTarget
+	route.Retry = nil
+	route.Children = nil
+	route.Split = nil
+	providerChanged := false
 	if node.Target.Provider != "" {
+		providerChanged = node.Target.Provider != route.Provider
 		route.Provider = node.Target.Provider
 	}
 	if node.Target.Model != "" {
 		route.Model = node.Target.Model
+	}
+	if node.Target.Model == "" && node.Target.Name != "" {
+		route.Model = node.Target.Name
 	}
 	if node.Target.SecretRef != "" {
 		route.SecretRef = node.Target.SecretRef
@@ -235,9 +277,51 @@ func routeFromNode(fixture source.Fixture, node source.RouteNode, base cherry.Ro
 	if _, ok := FindModel(fixture, route.Model); !ok {
 		return cherry.RoutePlan{}, fmt.Errorf("unknown model %q", route.Model)
 	}
-	if route.SecretRef == "" {
+	if route.SecretRef == "" || (node.Target.SecretRef == "" && providerChanged) {
 		provider, _ := FindProvider(fixture, route.Provider)
 		route.SecretRef = provider.SecretRef
+	}
+	return route, nil
+}
+
+func routeFromChain(fixture source.Fixture, node source.RouteNode, base cherry.RoutePlan) (cherry.RoutePlan, error) {
+	if len(node.Chain) == 0 {
+		return cherry.RoutePlan{}, fmt.Errorf("chain route node must not be empty")
+	}
+	route := cherry.RoutePlan{Kind: cherry.RouteKindChain}
+	if node.Retry != nil {
+		route.Retry = &cherry.RetryPolicy{
+			RetryOn:         node.Retry.RetryOn,
+			PerTryTimeoutMS: uint32(node.Retry.PerTryTimeoutMS),
+		}
+	}
+	for index, child := range node.Chain {
+		compiled, err := routeFromNode(fixture, child, base)
+		if err != nil {
+			return cherry.RoutePlan{}, fmt.Errorf("chain[%d]: %w", index, err)
+		}
+		route.Children = append(route.Children, compiled)
+	}
+	return route, nil
+}
+
+func routeFromSplit(fixture source.Fixture, node source.RouteNode, base cherry.RoutePlan) (cherry.RoutePlan, error) {
+	if len(node.Split) == 0 {
+		return cherry.RoutePlan{}, fmt.Errorf("split route node must not be empty")
+	}
+	route := cherry.RoutePlan{Kind: cherry.RouteKindSplit}
+	for index, weighted := range node.Split {
+		compiled, err := routeFromNode(fixture, weighted.Node, base)
+		if err != nil {
+			return cherry.RoutePlan{}, fmt.Errorf("split[%d]: %w", index, err)
+		}
+		if weighted.Weight <= 0 {
+			return cherry.RoutePlan{}, fmt.Errorf("split[%d]: weight must be positive", index)
+		}
+		route.Split = append(route.Split, cherry.WeightedRoutePlan{
+			Weight: uint32(weighted.Weight),
+			Plan:   compiled,
+		})
 	}
 	return route, nil
 }
@@ -415,15 +499,32 @@ func FindMCPServer(fixture source.Fixture, id string) (source.MCPServer, bool) {
 }
 
 func packProviders(fixture source.Fixture) []cherry.Provider {
-	providers := make([]cherry.Provider, 0, len(fixture.Providers))
+	byID := map[string]cherry.Provider{}
 	for _, provider := range fixture.Providers {
-		providers = append(providers, cherry.Provider{
+		byID[provider.ID] = cherry.Provider{
 			ID:        provider.ID,
 			Kind:      provider.Kind,
 			Endpoint:  provider.Endpoint,
 			SecretRef: provider.SecretRef,
-		})
+		}
 	}
+	for _, model := range fixture.Models {
+		if model.Provider == "" {
+			continue
+		}
+		if _, ok := byID[model.Provider]; ok {
+			continue
+		}
+		byID[model.Provider] = cherry.Provider{
+			ID:   model.Provider,
+			Kind: model.Provider,
+		}
+	}
+	providers := make([]cherry.Provider, 0, len(byID))
+	for _, provider := range byID {
+		providers = append(providers, provider)
+	}
+	sort.Slice(providers, func(i, j int) bool { return providers[i].ID < providers[j].ID })
 	return providers
 }
 
@@ -478,10 +579,36 @@ func validateNode(node source.RouteNode) error {
 	if populated != 1 {
 		return fmt.Errorf("route node must contain exactly one of target, chain, or split")
 	}
-	if node.Kind != "target" {
-		return fmt.Errorf("pack example supports target route nodes, got %q", node.Kind)
+	switch node.Kind {
+	case "target":
+		if node.Target == nil {
+			return fmt.Errorf("target is required")
+		}
+	case "chain":
+		if len(node.Chain) == 0 {
+			return fmt.Errorf("chain route node must not be empty")
+		}
+		for index, child := range node.Chain {
+			if err := validateNode(child); err != nil {
+				return fmt.Errorf("chain[%d]: %w", index, err)
+			}
+		}
+	case "split":
+		if len(node.Split) == 0 {
+			return fmt.Errorf("split route node must not be empty")
+		}
+		for index, weighted := range node.Split {
+			if weighted.Weight <= 0 {
+				return fmt.Errorf("split[%d] weight must be positive", index)
+			}
+			if err := validateNode(weighted.Node); err != nil {
+				return fmt.Errorf("split[%d]: %w", index, err)
+			}
+		}
+	default:
+		return fmt.Errorf("unsupported route node kind %q", node.Kind)
 	}
-	if node.Target == nil {
+	if node.Kind == "target" && node.Target == nil {
 		return fmt.Errorf("target is required")
 	}
 	return nil
@@ -490,10 +617,6 @@ func validateNode(node source.RouteNode) error {
 func sortedKeys[T any](values map[string]T) []string {
 	keys := make([]string, 0, len(values))
 	for key := range values {
-		if strings.Contains(key, "__") {
-			// The pack writer also rejects this. Catching it here keeps fixture
-			// errors near the source data.
-		}
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)

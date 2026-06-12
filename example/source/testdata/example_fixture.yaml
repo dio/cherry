@@ -57,20 +57,38 @@ keys:
     scope: workspace
     tag_ids:
       - marketing
+  - id: workspace1-byok-always-key
+    slug: slug:workspace1-byok-always
+    user_id: bob
+    project_id: project1
+    workspace_id: workspace1
+    scope: workspace
+    tag_ids:
+      - byok-always
+  - id: workspace1-byok-preferred-key
+    slug: slug:workspace1-byok-preferred
+    user_id: bob
+    project_id: project1
+    workspace_id: workspace1
+    scope: workspace
+    tag_ids:
+      - byok-preferred
   - id: workspace2-key
     slug: slug:workspace2
     user_id: bob
     project_id: project1
     workspace_id: workspace2
     scope: workspace
-    tag_ids: []
+    tag_ids:
+      - split-openai
   - id: project2-key
     slug: slug:project2
     user_id: bob
     project_id: project2
     workspace_id: ""
     scope: project
-    tag_ids: []
+    tag_ids:
+      - autofallback-anthropic-vertex
 
 tags:
   marketing:
@@ -78,22 +96,110 @@ tags:
     llm_rule:
       id: tag:marketing
       specificity: tag
-      overrides:
-        provider:anthropic:
-          kind: target
+      routing_overrides:
+        "@anthropic":
           target:
             provider: openai
-            model: gpt-4o-mini
+            name: gpt-4o-mini
             secret_ref: env://MARKETING_OPENAI_KEY
       rate_limit:
         usd_per_day: 50
         rpm: 60
         on_exceed: reject
+  byok-always:
+    id: byok-always
+    llm_rule:
+      id: tag:byok-always
+      specificity: tag
+      routing_overrides:
+        "@anthropic":
+          target:
+            provider: anthropic
+            secret_ref: env://WORKSPACE1_BYOK_ANTHROPIC_KEY
+  byok-preferred:
+    id: byok-preferred
+    llm_rule:
+      id: tag:byok-preferred
+      specificity: tag
+      routing_overrides:
+        "@openai":
+          chain:
+            retry:
+              retry_on: "401"
+              per_try_timeout_ms: 10000
+            children:
+              - target:
+                  provider: openai
+                  secret_ref: env://ANTHROPIC_API_KEY
+              - target:
+                  provider: openai
+        "@anthropic":
+          chain:
+            retry:
+              retry_on: "401"
+              per_try_timeout_ms: 10000
+            children:
+              - target:
+                  provider: anthropic
+                  secret_ref: env://WORKSPACE1_BYOK_ANTHROPIC_KEY
+              - target:
+                  provider: anthropic
+  split-openai:
+    id: split-openai
+    llm_rule:
+      id: tag:split-openai
+      specificity: tag
+      routing_overrides:
+        claude-haiku-4-5:
+          split:
+            children:
+              - weight: 80
+                target:
+                  provider: openai
+                  name: gpt-4o-mini
+                  secret_ref: env://OPENAI_API_KEY
+              - weight: 20
+                target:
+                  provider: fallback_p2
+                  name: gpt-4o-mini
+                  secret_ref: literal://fake
+  autofallback-anthropic-vertex:
+    id: autofallback-anthropic-vertex
+    llm_rule:
+      id: tag:autofallback-anthropic-vertex
+      specificity: tag
+      routing_overrides:
+        "@anthropic":
+          chain:
+            retry:
+              retry_on: "connect-failure,reset,5xx,retriable-status-codes"
+              per_try_timeout_ms: 10000
+            children:
+              - target: { provider: fallback_p1, name: claude-haiku-4-5 }
+              - target: { provider: fallback_p2, name: claude-haiku-4-5 }
+              - target: { provider: fallback_p3, name: claude-haiku-4-5 }
+              - target: { provider: vertex_anthropic, name: claude-opus-4@20250514 }
 
 profiles:
   - id: dev-tools
     slug: slug:profile-dev-tools
     path: profile-dev-tools
+    workspace_id: workspace1
+    auth:
+      type: none
+    tools:
+      github:
+        auth:
+          type: bearer
+          secret_ref: env://GITHUB_TOKEN
+        include:
+          - list-repos
+      kiwi:
+        include:
+          - search-flight
+  - id: kiwi-and-github
+    slug: slug:profile-kiwi-and-github
+    path: profile-kiwi-and-github
     workspace_id: workspace1
     auth:
       type: none
@@ -121,6 +227,9 @@ models:
   - id: gpt-4o-mini-2
     provider: openai
     name: gpt-4o-mini-20241001
+  - id: claude-opus-4@20250514
+    provider: vertex_anthropic
+    name: claude-opus-4@20250514
 
 providers:
   - id: anthropic
@@ -145,6 +254,17 @@ providers:
         body:
           providerId: openai-default
     response_mutations: {}
+  - id: vertex_anthropic
+    kind: anthropic
+    endpoint: https://us-east5-aiplatform.googleapis.com
+    secret_ref: env://VERTEX_ANTHROPIC_API_KEY
+    request_mutations:
+      "*":
+        headers:
+          x-provider-id: vertex-anthropic-default
+        body:
+          providerId: vertex-anthropic-default
+    response_mutations: {}
   - id: fallback_p1
     kind: anthropic
     endpoint: https://192.0.2.1
@@ -154,6 +274,12 @@ providers:
   - id: fallback_p2
     kind: anthropic
     endpoint: https://192.0.2.2
+    secret_ref: literal://fake
+    request_mutations: {}
+    response_mutations: {}
+  - id: fallback_p3
+    kind: anthropic
+    endpoint: https://192.0.2.3
     secret_ref: literal://fake
     request_mutations: {}
     response_mutations: {}

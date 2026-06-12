@@ -5,6 +5,7 @@ go 1.26.2
 require (
 	github.com/chzyer/readline v1.5.1
 	github.com/klauspost/compress v1.18.6
+	github.com/shopspring/decimal v1.4.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 

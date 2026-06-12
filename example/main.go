@@ -1,6 +1,9 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -11,10 +14,11 @@ import (
 	"time"
 
 	"github.com/chzyer/readline"
+	"gopkg.in/yaml.v3"
+
 	cherry "github.com/dio/cherry"
 	"github.com/dio/cherry/example/source"
 	"github.com/dio/cherry/example/transform"
-	"gopkg.in/yaml.v3"
 )
 
 func main() {
@@ -53,14 +57,18 @@ func printHelp() {
 	fmt.Println("usage:")
 	fmt.Println("  go run ./example")
 	fmt.Println("  go run ./example [fixture.yaml]")
-	fmt.Println("  go run ./example pack <workspace|project> <id> <fixture.yaml> [out.zst]")
+	fmt.Println("  go run ./example pack [--models models.json] [--providers providers.json] [--mcp-catalog catalog.json] <workspace|project> <id> <fixture.yaml> [out.zst]")
 	fmt.Println("  go run ./example repl <cherry.zst>")
 	fmt.Println("  go run ./example stress-pack <principals-per-scope> <queries> [scopes]")
 }
 
 func runPack(args []string) error {
+	catalogs, args, err := parseCatalogFlags(args)
+	if err != nil {
+		return err
+	}
 	if len(args) != 3 && len(args) != 4 {
-		return fmt.Errorf("usage: pack <workspace|project> <id> <fixture.yaml> [out.zst]")
+		return fmt.Errorf("usage: pack [--models models.json] [--providers providers.json] [--mcp-catalog catalog.json] <workspace|project> <id> <fixture.yaml> [out.zst]")
 	}
 	scopeKind := transform.ScopeKind(args[0])
 	if scopeKind != transform.ScopeKindWorkspace && scopeKind != transform.ScopeKindProject {
@@ -70,6 +78,27 @@ func runPack(args []string) error {
 	fixture, err := source.LoadFixtureYAML(args[2])
 	if err != nil {
 		return err
+	}
+	if catalogs.modelsPath != "" {
+		models, err := source.LoadModelCatalogJSON(catalogs.modelsPath)
+		if err != nil {
+			return err
+		}
+		fixture.Models = source.MergeModels(fixture.Models, models)
+	}
+	if catalogs.providersPath != "" {
+		providers, err := source.LoadProviderCatalogJSON(catalogs.providersPath)
+		if err != nil {
+			return err
+		}
+		fixture.Providers = source.MergeProviders(fixture.Providers, providers)
+	}
+	if catalogs.mcpCatalogPath != "" {
+		servers, err := source.LoadMCPCatalogJSON(catalogs.mcpCatalogPath)
+		if err != nil {
+			return err
+		}
+		fixture.MCPServers = source.MergeMCPServers(fixture.MCPServers, servers)
 	}
 	outPath := fmt.Sprintf("%s-%s.pack.zst", scopeKind, scopeID)
 	if len(args) == 4 {
@@ -92,8 +121,54 @@ func runPack(args []string) error {
 	if err := os.WriteFile(outPath, compressed, 0644); err != nil {
 		return err
 	}
-	fmt.Printf("wrote %s scope=%s:%s scopes=%s raw_bytes=%d\n", outPath, scopeKind, scopeID, strings.Join(result.Scopes, ","), len(blob))
+	fmt.Printf(
+		"wrote %s scope=%s:%s scopes=%s providers=%d models=%d mcp_servers=%d raw_bytes=%d\n",
+		outPath,
+		scopeKind,
+		scopeID,
+		strings.Join(result.Scopes, ","),
+		len(result.Input.Providers),
+		len(result.Input.Models),
+		len(result.Input.MCPServers),
+		len(blob),
+	)
 	return nil
+}
+
+type catalogFlags struct {
+	modelsPath     string
+	providersPath  string
+	mcpCatalogPath string
+}
+
+func parseCatalogFlags(args []string) (catalogFlags, []string, error) {
+	out := make([]string, 0, len(args))
+	var catalogs catalogFlags
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--models":
+			if i+1 >= len(args) {
+				return catalogFlags{}, nil, fmt.Errorf("--models requires a path")
+			}
+			catalogs.modelsPath = args[i+1]
+			i++
+		case "--providers":
+			if i+1 >= len(args) {
+				return catalogFlags{}, nil, fmt.Errorf("--providers requires a path")
+			}
+			catalogs.providersPath = args[i+1]
+			i++
+		case "--mcp-catalog":
+			if i+1 >= len(args) {
+				return catalogFlags{}, nil, fmt.Errorf("--mcp-catalog requires a path")
+			}
+			catalogs.mcpCatalogPath = args[i+1]
+			i++
+		default:
+			out = append(out, args[i])
+		}
+	}
+	return catalogs, out, nil
 }
 
 func runREPL(args []string) error {
@@ -113,16 +188,18 @@ func runREPL(args []string) error {
 	if session.scope != "" {
 		fmt.Printf("using scope %s\n", session.scope)
 	}
-	fmt.Println("commands: summary, scopes, use <scope>, llm [scope] <slug> <model>, mcp [scope] <path> [tool], inspect <metadata|principals|mcp|all>, reload, help, quit")
+	fmt.Println("commands: summary, scopes, use <scope>, llm principals|providers|models|model|capability, mcp paths|initialize|list|call, inspect <metadata|principals|mcp|all>, reload, help, quit")
 
 	rl, err := readline.NewEx(&readline.Config{Prompt: "cherry> "})
 	if err != nil {
 		return err
 	}
-	defer rl.Close()
+	defer func() {
+		_ = rl.Close()
+	}()
 	for {
 		line, err := rl.Readline()
-		if err == io.EOF || err == readline.ErrInterrupt {
+		if errors.Is(err, io.EOF) || errors.Is(err, readline.ErrInterrupt) {
 			return nil
 		}
 		if err != nil {
@@ -237,8 +314,27 @@ func (s *replSession) inspect(fields []string) {
 }
 
 func (s *replSession) llm(fields []string) {
+	if len(fields) >= 2 {
+		switch fields[1] {
+		case "principals":
+			s.llmPrincipals(fields)
+			return
+		case "providers":
+			s.llmProviders(fields)
+			return
+		case "models":
+			s.llmModels(fields)
+			return
+		case "model":
+			s.llmModel(fields)
+			return
+		case "capability":
+			s.llmCapability(fields)
+			return
+		}
+	}
 	if len(fields) != 3 && len(fields) != 4 {
-		fmt.Println("usage: llm [scope] <principal-slug> <model>")
+		fmt.Println("usage: llm [scope] <principal-slug> <model> | llm principals [scope] | llm providers | llm models [--provider=name] | llm model <model> | llm capability <model> <capability>")
 		return
 	}
 	scope, offset := s.scopeAndOffset(fields, 3)
@@ -247,29 +343,363 @@ func (s *replSession) llm(fields []string) {
 	}
 	principalSlug := fields[offset]
 	requestedModel := fields[offset+1]
-	ids, ok := s.pack.Reader.ResolveLLMIDs(scope, principalSlug, requestedModel)
+	plan, ok := s.pack.Reader.ResolveLLMPlan(scope, principalSlug, requestedModel)
 	if !ok {
 		fmt.Printf("rejected: no LLM route for scope=%s principal=%s model=%s\n", scope, principalSlug, requestedModel)
+		s.printLLMRejectHint(scope, principalSlug)
 		return
 	}
 	fmt.Printf("scope: %s\n", scope)
 	fmt.Printf("principal: %s\n", principalSlug)
 	fmt.Printf("requested_model: %s\n", requestedModel)
-	fmt.Printf("target:\n")
-	fmt.Printf(
-		"  provider=%s kind=%s model=%s model_name=%s endpoint=%s secret_ref=%s\n",
-		s.pack.Reader.String(ids.ProviderSID),
-		s.pack.Reader.String(ids.KindSID),
-		s.pack.Reader.String(ids.ModelSID),
-		s.pack.Reader.String(ids.ModelNameSID),
-		s.pack.Reader.String(ids.EndpointSID),
-		s.pack.Reader.String(ids.SecretSID),
+	fmt.Println("route_plan:")
+	printLLMRoutePlan(s.pack.Reader, plan.Plan, 2)
+	fmt.Printf("rate_limit: usd_per_day=%.2f rpm=%d on_exceed=%s\n", float64(plan.Rate.USDPerDayCents)/100, plan.Rate.RPM, plan.Rate.OnExceed)
+}
+
+func (s *replSession) printLLMRejectHint(scope string, principalSlug string) {
+	principals, ok := s.pack.Reader.Principals(scope)
+	if !ok || len(principals) == 0 {
+		return
+	}
+	fmt.Println("available_principals:")
+	for _, principal := range principals {
+		fmt.Printf("  - %s\n", principal.PrincipalSlug)
+	}
+	if !strings.HasPrefix(principalSlug, "slug:") {
+		fmt.Println("hint: pass the verified principal slug from the bundle, not the source key id; use `llm principals` to list slugs")
+	}
+	if len(s.pack.Metadata.Scopes) > 1 {
+		fmt.Printf("hint: active scope is %s; bundle scopes=%s\n", scope, strings.Join(s.pack.Metadata.Scopes, ","))
+	}
+}
+
+func printLLMRoutePlan(reader cherry.Reader, plan cherry.LLMRoutePlan, indent int) {
+	pad := strings.Repeat(" ", indent)
+	switch plan.Kind {
+	case cherry.RouteKindTarget:
+		fmt.Printf("%starget:\n", pad)
+		fmt.Printf(
+			"%s  provider=%s kind=%s model=%s model_name=%s endpoint=%s secret_ref=%s\n",
+			pad,
+			plan.Provider,
+			plan.ProviderKind,
+			plan.Model,
+			plan.ModelName,
+			plan.Endpoint,
+			plan.SecretRef,
+		)
+		printResolvedModelMetadataIndented(reader, plan.Model, indent+2)
+	case cherry.RouteKindChain:
+		fmt.Printf("%schain:\n", pad)
+		if plan.RetryOn != "" || plan.PerTryTimeoutMS != 0 {
+			fmt.Printf("%s  retry_on: %s\n", pad, plan.RetryOn)
+			fmt.Printf("%s  per_try_timeout_ms: %d\n", pad, plan.PerTryTimeoutMS)
+		}
+		fmt.Printf("%s  children:\n", pad)
+		for _, child := range plan.Children {
+			fmt.Printf("%s    -\n", pad)
+			printLLMRoutePlan(reader, child.Plan, indent+6)
+		}
+	case cherry.RouteKindSplit:
+		fmt.Printf("%ssplit:\n", pad)
+		fmt.Printf("%s  children:\n", pad)
+		for _, child := range plan.Children {
+			fmt.Printf("%s    - weight: %d\n", pad, child.Weight)
+			printLLMRoutePlan(reader, child.Plan, indent+6)
+		}
+	default:
+		fmt.Printf("%sunknown: %s\n", pad, plan.Kind)
+	}
+}
+
+func printResolvedModelMetadataIndented(reader cherry.Reader, modelID string, indent int) {
+	pad := strings.Repeat(" ", indent)
+	model, ok := reader.ResolveModel(modelID)
+	if !ok {
+		return
+	}
+	fmt.Printf("%smodel_catalog:\n", pad)
+	fmt.Printf("%s  mode: %s\n", pad, model.Mode)
+	if len(model.Capabilities) == 0 {
+		fmt.Printf("%s  capabilities: []\n", pad)
+	} else {
+		fmt.Printf("%s  capabilities:\n", pad)
+		for _, capability := range model.Capabilities {
+			fmt.Printf("%s    - %s\n", pad, capability)
+		}
+	}
+	metadata := compactModelMetadata(model.MetadataJSON)
+	if metadata.ContextWindow != 0 {
+		fmt.Printf("%s  context_window: %d\n", pad, metadata.ContextWindow)
+	}
+	if metadata.MaxOutputTokens != 0 {
+		fmt.Printf("%s  max_output_tokens: %d\n", pad, metadata.MaxOutputTokens)
+	}
+	if metadata.InputPricePerMillion != "" || metadata.OutputPricePerMillion != "" {
+		fmt.Printf("%s  price_per_million:\n", pad)
+		if metadata.InputPricePerMillion != "" {
+			fmt.Printf("%s    input: %s\n", pad, metadata.InputPricePerMillion)
+		}
+		if metadata.CachedPricePerMillion != "" {
+			fmt.Printf("%s    cached: %s\n", pad, metadata.CachedPricePerMillion)
+		}
+		if metadata.CachingPricePerMillion != "" {
+			fmt.Printf("%s    caching: %s\n", pad, metadata.CachingPricePerMillion)
+		}
+		if metadata.OutputPricePerMillion != "" {
+			fmt.Printf("%s    output: %s\n", pad, metadata.OutputPricePerMillion)
+		}
+	}
+}
+
+type compactLLMModelMetadata struct {
+	ContextWindow          int64
+	MaxOutputTokens        int64
+	InputPricePerMillion   string
+	OutputPricePerMillion  string
+	CachedPricePerMillion  string
+	CachingPricePerMillion string
+}
+
+func compactModelMetadata(metadataJSON string) compactLLMModelMetadata {
+	if metadataJSON == "" {
+		return compactLLMModelMetadata{}
+	}
+	var raw struct {
+		ContextWindow                int64           `json:"contextWindow"`
+		InputTokensPricePerMillion   flexibleString  `json:"inputTokensPricePerMillion"`
+		OutputTokensPricePerMillion  flexibleString  `json:"outputTokensPricePerMillion"`
+		CachedTokensPricePerMillion  flexibleString  `json:"cachedTokensPricePerMillion"`
+		CachingTokensPricePerMillion flexibleString  `json:"cachingTokensPricePerMillion"`
+		Limits                       json.RawMessage `json:"limits"`
+	}
+	if err := json.Unmarshal([]byte(metadataJSON), &raw); err != nil {
+		return compactLLMModelMetadata{}
+	}
+	var limits struct {
+		MaxOutputTokens int64 `json:"max_output_tokens"`
+	}
+	if len(raw.Limits) > 0 {
+		_ = json.Unmarshal(raw.Limits, &limits)
+	}
+	return compactLLMModelMetadata{
+		ContextWindow:          raw.ContextWindow,
+		MaxOutputTokens:        limits.MaxOutputTokens,
+		InputPricePerMillion:   string(raw.InputTokensPricePerMillion),
+		OutputPricePerMillion:  string(raw.OutputTokensPricePerMillion),
+		CachedPricePerMillion:  string(raw.CachedTokensPricePerMillion),
+		CachingPricePerMillion: string(raw.CachingTokensPricePerMillion),
+	}
+}
+
+type flexibleString string
+
+func (s *flexibleString) UnmarshalJSON(data []byte) error {
+	if string(data) == "null" {
+		return nil
+	}
+	var value string
+	if len(data) > 0 && data[0] == '"' {
+		if err := json.Unmarshal(data, &value); err != nil {
+			return err
+		}
+	} else {
+		value = string(data)
+	}
+	*s = flexibleString(value)
+	return nil
+}
+
+func (s *replSession) llmPrincipals(fields []string) {
+	scope, ok := s.optionalScope(fields, "llm principals [scope]")
+	if !ok {
+		return
+	}
+	principals, found := s.pack.Reader.Principals(scope)
+	if !found {
+		fmt.Printf("unknown scope %q\n", scope)
+		return
+	}
+	type principalSummary struct {
+		ScopeID             string `yaml:"scope_id"`
+		PrincipalSlug       string `yaml:"principal_slug"`
+		RequestedModelCount int    `yaml:"requested_model_count"`
+	}
+	summaries := make([]principalSummary, 0, len(principals))
+	for _, principal := range principals {
+		summaries = append(summaries, principalSummary{
+			ScopeID:             principal.ScopeID,
+			PrincipalSlug:       principal.PrincipalSlug,
+			RequestedModelCount: len(principal.RequestedModels),
+		})
+	}
+	printYAML(summaries)
+}
+
+func (s *replSession) llmProviders(fields []string) {
+	if len(fields) != 2 {
+		fmt.Println("usage: llm providers")
+		return
+	}
+	printYAML(s.pack.Reader.Providers())
+}
+
+func (s *replSession) llmModels(fields []string) {
+	providerID, ok := parseProviderOnlyArgs(fields[2:])
+	if !ok {
+		fmt.Println("usage: llm models [--provider=<provider>]")
+		return
+	}
+	var (
+		payload []byte
+		err     error
 	)
-	fmt.Printf("rate_limit: usd_per_day=%.2f rpm=%d on_exceed=%s\n", float64(ids.Rate.USDPerDayCents)/100, ids.Rate.RPM, s.pack.Reader.String(ids.Rate.OnExceedSID))
+	if providerID == "" {
+		payload, err = s.pack.Reader.V1ModelsJSON()
+	} else {
+		payload, err = s.pack.Reader.V1ModelsJSONForProvider(providerID)
+	}
+	if err != nil {
+		fmt.Printf("models failed: %v\n", err)
+		return
+	}
+	var pretty bytes.Buffer
+	if err := json.Indent(&pretty, payload, "", "  "); err != nil {
+		fmt.Println(string(payload))
+		return
+	}
+	fmt.Println(pretty.String())
+}
+
+func parseProviderOnlyArgs(args []string) (string, bool) {
+	var providerID string
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "--provider":
+			if i+1 >= len(args) || args[i+1] == "" {
+				return "", false
+			}
+			providerID = args[i+1]
+			i++
+		case strings.HasPrefix(arg, "--provider="):
+			providerID = strings.TrimPrefix(arg, "--provider=")
+			if providerID == "" {
+				return "", false
+			}
+		default:
+			return "", false
+		}
+	}
+	return providerID, true
+}
+
+func (s *replSession) llmModel(fields []string) {
+	modelID, providerID, ok := parseLLMModelArgs(fields[2:])
+	if !ok {
+		fmt.Println("usage: llm model <model> [--provider=<provider>] | llm model --provider=<provider>")
+		return
+	}
+	if providerID != "" && modelID == "" {
+		models := modelsForProvider(s.pack.Reader.Models(), providerID)
+		if len(models) == 0 {
+			fmt.Printf("no models for provider %q\n", providerID)
+			return
+		}
+		printYAML(models)
+		return
+	}
+	model, found := s.pack.Reader.ResolveModel(modelID)
+	if !found {
+		fmt.Printf("unknown model %q\n", modelID)
+		return
+	}
+	if providerID != "" && model.Provider != providerID {
+		fmt.Printf("model %q belongs to provider %q, not %q\n", modelID, model.Provider, providerID)
+		return
+	}
+	printYAML(model)
+}
+
+func parseLLMModelArgs(args []string) (string, string, bool) {
+	var modelID string
+	var providerID string
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "--provider":
+			if i+1 >= len(args) || args[i+1] == "" {
+				return "", "", false
+			}
+			providerID = args[i+1]
+			i++
+		case strings.HasPrefix(arg, "--provider="):
+			providerID = strings.TrimPrefix(arg, "--provider=")
+			if providerID == "" {
+				return "", "", false
+			}
+		case strings.HasPrefix(arg, "--"):
+			return "", "", false
+		default:
+			if modelID != "" {
+				return "", "", false
+			}
+			modelID = arg
+		}
+	}
+	if modelID == "" && providerID == "" {
+		return "", "", false
+	}
+	return modelID, providerID, true
+}
+
+func modelsForProvider(models []cherry.ModelInfo, providerID string) []cherry.ModelInfo {
+	filtered := make([]cherry.ModelInfo, 0)
+	for _, model := range models {
+		if model.Provider == providerID {
+			filtered = append(filtered, model)
+		}
+	}
+	return filtered
+}
+
+func (s *replSession) llmCapability(fields []string) {
+	if len(fields) != 4 {
+		fmt.Println("usage: llm capability <model> <capability>")
+		return
+	}
+	printYAML(struct {
+		Model      string `yaml:"model"`
+		Capability string `yaml:"capability"`
+		Supported  bool   `yaml:"supported"`
+	}{
+		Model:      fields[2],
+		Capability: fields[3],
+		Supported:  s.pack.Reader.ModelCapability(fields[2], fields[3]),
+	})
 }
 
 func (s *replSession) mcp(fields []string) {
-	if len(fields) < 2 || len(fields) > 4 {
+	if len(fields) < 2 {
+		fmt.Println("usage: mcp [scope] <path> [tool] | mcp <paths|initialize|list|call> [scope] <path|profile=name|server=name> [tool]")
+		return
+	}
+	switch fields[1] {
+	case "paths":
+		s.mcpPaths(fields)
+		return
+	case "initialize":
+		s.mcpInitialize(fields)
+		return
+	case "list":
+		s.mcpList(fields)
+		return
+	case "call":
+		s.mcpCall(fields)
+		return
+	}
+	if len(fields) > 4 {
 		fmt.Println("usage: mcp [scope] <path> [tool]")
 		return
 	}
@@ -283,7 +713,7 @@ func (s *replSession) mcp(fields []string) {
 		fmt.Println("no active scope; run use <scope>")
 		return
 	}
-	path := fields[pathOffset]
+	path := normalizeMCPTarget(fields[pathOffset])
 	if len(fields) > pathOffset+1 {
 		toolName := fields[pathOffset+1]
 		tool, ok := s.pack.Reader.ResolveMCPToolIDs(scope, path, toolName)
@@ -316,6 +746,147 @@ func (s *replSession) mcp(fields []string) {
 	}
 }
 
+func (s *replSession) mcpPaths(fields []string) {
+	scope, showTools, ok := s.optionalScopeWithTools(fields, "mcp paths [scope] [--tools]")
+	if !ok {
+		return
+	}
+	paths, found := s.pack.Reader.MCPPaths(scope)
+	if !found {
+		fmt.Printf("unknown scope %q\n", scope)
+		return
+	}
+	type pathSummary struct {
+		ScopeID   string   `yaml:"scope_id"`
+		Path      string   `yaml:"path"`
+		ToolCount int      `yaml:"tool_count"`
+		Tools     []string `yaml:"tools,omitempty"`
+	}
+	summaries := make([]pathSummary, 0, len(paths))
+	for _, path := range paths {
+		tools := make([]string, 0, len(path.Tools))
+		if showTools {
+			for _, tool := range path.Tools {
+				tools = append(tools, tool.ExposedName)
+			}
+		}
+		summaries = append(summaries, pathSummary{
+			ScopeID:   path.ScopeID,
+			Path:      path.Path,
+			ToolCount: len(path.Tools),
+			Tools:     tools,
+		})
+	}
+	printYAML(summaries)
+}
+
+func (s *replSession) mcpInitialize(fields []string) {
+	scope, path, ok := s.mcpCommandScopeAndPath(fields, "mcp initialize [scope] <path|profile=name|server=name>")
+	if !ok {
+		return
+	}
+	result, found := s.pack.Reader.ResolveMCPInitialize(scope, path)
+	if !found {
+		fmt.Printf("rejected: no MCP path for scope=%s path=%s\n", scope, path)
+		return
+	}
+	fmt.Printf("scope: %s\n", scope)
+	fmt.Printf("path: %s\n", result.Path)
+	fmt.Println("initialize_servers:")
+	for _, server := range result.Servers {
+		fmt.Printf("  server=%s endpoint=%s auth_type=%s secret_ref=%s\n", server.Server, server.Endpoint, server.AuthType, server.SecretRef)
+	}
+}
+
+func (s *replSession) mcpList(fields []string) {
+	scope, path, ok := s.mcpCommandScopeAndPath(fields, "mcp list [scope] <path|profile=name|server=name>")
+	if !ok {
+		return
+	}
+	result, found := s.pack.Reader.ResolveMCP(scope, path)
+	if !found {
+		fmt.Printf("rejected: no MCP path for scope=%s path=%s\n", scope, path)
+		return
+	}
+	fmt.Printf("scope: %s\n", scope)
+	fmt.Printf("path: %s\n", result.Path)
+	fmt.Println("tools:")
+	for _, tool := range result.Tools {
+		fmt.Printf("  %s -> server=%s endpoint=%s upstream_tool=%s auth_type=%s secret_ref=%s\n", tool.ExposedName, tool.Server, tool.ServerEndpoint, tool.Tool, tool.AuthType, tool.SecretRef)
+	}
+}
+
+func (s *replSession) mcpCall(fields []string) {
+	if len(fields) != 4 && len(fields) != 5 {
+		fmt.Println("usage: mcp call [scope] <path|profile=name|server=name> <tool>")
+		return
+	}
+	scope := s.scope
+	pathOffset := 2
+	if len(fields) == 5 {
+		if !contains(s.pack.Metadata.Scopes, fields[2]) {
+			fmt.Printf("scope %q is not in this bundle\n", fields[2])
+			return
+		}
+		scope = fields[2]
+		pathOffset = 3
+	}
+	if scope == "" {
+		fmt.Println("no active scope; run use <scope>")
+		return
+	}
+	path := normalizeMCPTarget(fields[pathOffset])
+	toolName := fields[pathOffset+1]
+	tool, found := s.pack.Reader.ResolveMCPToolIDs(scope, path, toolName)
+	if !found {
+		fmt.Printf("rejected: no MCP tool for scope=%s path=%s tool=%s\n", scope, path, toolName)
+		return
+	}
+	fmt.Printf("scope: %s\n", scope)
+	fmt.Printf("path: %s\n", path)
+	fmt.Printf("call: %s -> server=%s endpoint=%s upstream_tool=%s auth_type=%s secret_ref=%s\n",
+		toolName,
+		s.pack.Reader.String(tool.ServerSID),
+		s.pack.Reader.String(tool.ServerEndpointSID),
+		s.pack.Reader.String(tool.ToolSID),
+		s.pack.Reader.String(tool.AuthTypeSID),
+		s.pack.Reader.String(tool.SecretSID),
+	)
+}
+
+func (s *replSession) mcpCommandScopeAndPath(fields []string, usage string) (string, string, bool) {
+	if len(fields) != 3 && len(fields) != 4 {
+		fmt.Println("usage: " + usage)
+		return "", "", false
+	}
+	scope := s.scope
+	pathOffset := 2
+	if len(fields) == 4 {
+		if !contains(s.pack.Metadata.Scopes, fields[2]) {
+			fmt.Printf("scope %q is not in this bundle\n", fields[2])
+			return "", "", false
+		}
+		scope = fields[2]
+		pathOffset = 3
+	}
+	if scope == "" {
+		fmt.Println("no active scope; run use <scope>")
+		return "", "", false
+	}
+	return scope, normalizeMCPTarget(fields[pathOffset]), true
+}
+
+func normalizeMCPTarget(value string) string {
+	switch {
+	case strings.HasPrefix(value, "server="):
+		return "s/" + strings.TrimPrefix(value, "server=")
+	case strings.HasPrefix(value, "profile="):
+		return strings.TrimPrefix(value, "profile=")
+	default:
+		return value
+	}
+}
+
 func (s *replSession) activeScope() string {
 	if s.scope == "" {
 		fmt.Println("no active scope; run use <scope>")
@@ -338,16 +909,72 @@ func (s *replSession) scopeAndOffset(fields []string, noScopeLen int) (string, i
 	return fields[1], 2
 }
 
+func (s *replSession) optionalScope(fields []string, usage string) (string, bool) {
+	if len(fields) != 2 && len(fields) != 3 {
+		fmt.Println("usage: " + usage)
+		return "", false
+	}
+	if len(fields) == 2 {
+		if s.scope == "" {
+			fmt.Println("no active scope; run use <scope>")
+			return "", false
+		}
+		return s.scope, true
+	}
+	if !contains(s.pack.Metadata.Scopes, fields[2]) {
+		fmt.Printf("scope %q is not in this bundle\n", fields[2])
+		return "", false
+	}
+	return fields[2], true
+}
+
+func (s *replSession) optionalScopeWithTools(fields []string, usage string) (string, bool, bool) {
+	scope := s.scope
+	showTools := false
+	if len(fields) < 2 || len(fields) > 4 {
+		fmt.Println("usage: " + usage)
+		return "", false, false
+	}
+	for _, field := range fields[2:] {
+		if field == "--tools" {
+			showTools = true
+			continue
+		}
+		if scope != "" && scope != s.scope {
+			fmt.Println("usage: " + usage)
+			return "", false, false
+		}
+		if !contains(s.pack.Metadata.Scopes, field) {
+			fmt.Printf("scope %q is not in this bundle\n", field)
+			return "", false, false
+		}
+		scope = field
+	}
+	if scope == "" {
+		fmt.Println("no active scope; run use <scope>")
+		return "", false, false
+	}
+	return scope, showTools, true
+}
+
 func printREPLHelp() {
 	fmt.Println("commands:")
 	fmt.Println("  summary                         print bundle metadata")
 	fmt.Println("  scopes                          list scopes in the loaded bundle")
 	fmt.Println("  use <scope>                     select the active enforcement scope")
 	fmt.Println("  llm [scope] <slug> <model>      resolve an LLM request")
-	fmt.Println("  mcp [scope] <path> [tool]       resolve or list MCP tools for a path")
+	fmt.Println("  llm principals [scope]          list LLM principal slugs and model counts")
+	fmt.Println("  llm providers                   list packed LLM providers")
+	fmt.Println("  llm models [--provider=name]    print simulated /v1/models catalog")
+	fmt.Println("  llm model <model>               inspect one packed model")
+	fmt.Println("  mcp paths [scope] [--tools]     list MCP paths, optionally with tool names")
+	fmt.Println("  mcp initialize [scope] <target> resolve upstream MCP servers for initialize")
+	fmt.Println("  mcp list [scope] <target>       list exposed MCP tools for a target")
+	fmt.Println("  mcp call [scope] <target> <tool> resolve one MCP tool call")
+	fmt.Println("  mcp [scope] <path> [tool]       compatibility form for list or call")
 	fmt.Println("  inspect metadata                print bundle metadata")
-	fmt.Println("  inspect principals              list principal/model routes for active scope")
-	fmt.Println("  inspect mcp                     list MCP paths and tool bindings for active scope")
+	fmt.Println("  inspect principals              dump principal/model routes for active scope")
+	fmt.Println("  inspect mcp                     dump MCP paths and tool bindings for active scope")
 	fmt.Println("  inspect all                     print all inspectable data for active scope")
 	fmt.Println("  reload                          reload the pack file")
 	fmt.Println("  quit                            exit")

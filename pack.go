@@ -15,16 +15,21 @@ package cherry
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
+
+	"github.com/shopspring/decimal"
 )
 
 const (
-	magic      = "OPK1"
-	versionV1  = uint32(1)
-	headerSize = 64
+	magic              = "OPK1"
+	currentPackVersion = uint32(3)
+	headerSize         = 64
 
 	// Header layout:
 	//   0:4   magic "OPK1"
@@ -56,15 +61,35 @@ const (
 	headerMCPPathsOff    = 52
 
 	principalLen      = 24 // hash64(slug + "\x00" + requestedModel), slugSID, routeID, rateID, requestedModelID
-	modelLen          = 24 // hash64, idSID, providerID, nameSID, reserved
+	modelLen          = 32 // hash64, idSID, providerID, nameSID, modeSID, capabilitiesSID, metadataSID
 	providerLen       = 16 // idSID, kindSID, endpointSID, secretSID
-	routeLen          = 12 // providerID, modelID, secretSID
+	routeLen          = 24 // kind, target fields or child count/offset/retry fields
+	routeChildLen     = 8  // weight, childRouteID; weight is zero for chain children
 	rateLen           = 16 // usdCents, rpm, onExceedSID
 	mcpServerLen      = 16 // idSID, endpointSID, secretSID, authTypeSID
 	mcpToolsetLen     = 8  // bindingCount, bindingOffset
 	mcpToolBindingLen = 20 // exposedSID, serverID, toolSID, secretSID, authTypeSID
 	scopeLen          = 20 // sid, principalCount, principalOffset, mcpPathCount, mcpPathOffset
 	mcpPathLen        = 16 // hash64, pathSID, toolsetID
+)
+
+const (
+	routeKindTargetID uint32 = 1
+	routeKindChainID  uint32 = 2
+	routeKindSplitID  uint32 = 3
+)
+
+// RouteKind identifies the shape of an LLM route plan node.
+type RouteKind string
+
+const (
+	// RouteKindTarget sends the request to one concrete provider/model target.
+	RouteKindTarget RouteKind = "target"
+	// RouteKindChain tries child route plans in order. Retry describes when the
+	// next child should be attempted by the enforcement point.
+	RouteKindChain RouteKind = "chain"
+	// RouteKindSplit chooses among weighted child route plans.
+	RouteKindSplit RouteKind = "split"
 )
 
 // Provider describes an upstream LLM provider available to compiled LLM routes.
@@ -79,18 +104,48 @@ type Provider struct {
 // Model describes a logical model name accepted by enforcement requests.
 // Provider must reference an entry in Input.Providers. Name is the upstream model
 // name sent to the selected provider after routing has been resolved.
+//
+// Mode, Capabilities, and MetadataJSON preserve normalized catalog data for
+// model listing and capability checks. MetadataJSON is intentionally opaque to
+// Cherry so producers can retain pricing, limits, modalities, and provider-
+// specific fields without forcing those fields into the binary schema.
 type Model struct {
-	ID       string
-	Provider string
-	Name     string
+	ID           string
+	Provider     string
+	Name         string
+	Mode         string
+	Capabilities []string
+	MetadataJSON string
 }
 
-// RoutePlan is the final LLM target selected for a principal and requested
-// model. The route must already reflect external rule precedence and overrides.
+// RetryPolicy describes retry/fallback behavior attached to a chain route node.
+// Cherry stores this metadata verbatim; the enforcement point decides how to
+// interpret RetryOn values such as "401" or "connect-failure,reset,5xx".
+type RetryPolicy struct {
+	RetryOn         string
+	PerTryTimeoutMS uint32
+}
+
+// WeightedRoutePlan is one weighted child under a split route node.
+type WeightedRoutePlan struct {
+	Weight uint32
+	Plan   RoutePlan
+}
+
+// RoutePlan is a compiled LLM route tree for a principal and requested model.
+// A zero Kind with Provider/Model set is treated as a target for compatibility
+// with simple callers. The route must already reflect external rule precedence
+// and overrides.
 type RoutePlan struct {
-	Provider  string
-	Model     string
+	Kind     RouteKind
+	Provider string
+	Model    string
+	// SecretRef overrides the selected provider default for target nodes. It is
+	// always a reference to secret material, never the material itself.
 	SecretRef string
+	Retry     *RetryPolicy
+	Children  []RoutePlan
+	Split     []WeightedRoutePlan
 }
 
 // RatePolicy is immutable rate-limit metadata attached to a principal route.
@@ -202,6 +257,45 @@ type RatePolicyIDs struct {
 	OnExceedSID    uint32
 }
 
+// LLMRouteChildIDs is one child of a materialized route-plan node. Weight is
+// zero for ordered chain children and non-zero for split children.
+type LLMRouteChildIDs struct {
+	Weight uint32
+	Plan   LLMRoutePlanIDs
+}
+
+// LLMRoutePlanIDs is the ID-returning representation of an LLM route tree. It
+// is the preferred data-path API when the enforcement point needs fallback or
+// weighted split behavior without string materialization.
+type LLMRoutePlanIDs struct {
+	RouteID         uint32
+	Kind            RouteKind
+	ProviderID      uint32
+	ProviderSID     uint32
+	KindSID         uint32
+	EndpointSID     uint32
+	ModelID         uint32
+	ModelSID        uint32
+	ModelNameSID    uint32
+	SecretSID       uint32
+	RetryOnSID      uint32
+	PerTryTimeoutMS uint32
+	Children        []LLMRouteChildIDs
+}
+
+// LLMPlanIDs is the complete ID-returning result for an LLM lookup, including
+// the requested principal/model index entry, immutable rate-limit metadata, and
+// the route tree selected for enforcement.
+type LLMPlanIDs struct {
+	PrincipalSID      uint32
+	RequestedModelID  uint32
+	RequestedModelSID uint32
+	RouteID           uint32
+	RateID            uint32
+	Rate              RatePolicyIDs
+	Plan              LLMRoutePlanIDs
+}
+
 // LLMResult is the string-materialized form of an LLM lookup. It is convenient
 // for tests, CLIs, and diagnostics; hot paths should prefer LLMIDs.
 type LLMResult struct {
@@ -213,6 +307,58 @@ type LLMResult struct {
 	ModelName     string
 	SecretRef     string
 	Rate          RatePolicy
+}
+
+// LLMRouteChild is one materialized route-plan child. Weight is zero for chain
+// children and non-zero for split children.
+type LLMRouteChild struct {
+	Weight uint32
+	Plan   LLMRoutePlan
+}
+
+// LLMRoutePlan is the string-materialized representation of an LLM route tree.
+// Target nodes populate Provider/Model/SecretRef fields. Chain and split nodes
+// populate Children.
+type LLMRoutePlan struct {
+	Kind            RouteKind
+	Provider        string
+	ProviderKind    string
+	Endpoint        string
+	Model           string
+	ModelName       string
+	SecretRef       string
+	RetryOn         string
+	PerTryTimeoutMS uint32
+	Children        []LLMRouteChild
+}
+
+// LLMPlan is the string-materialized complete route plan for an LLM lookup.
+type LLMPlan struct {
+	PrincipalSlug  string
+	RequestedModel string
+	Plan           LLMRoutePlan
+	Rate           RatePolicy
+}
+
+// ProviderInfo is the string-materialized metadata for one provider stored in
+// the pack. It is intended for diagnostics and EP setup inspection.
+type ProviderInfo struct {
+	ID        string
+	Kind      string
+	Endpoint  string
+	SecretRef string
+}
+
+// ModelInfo is the string-materialized metadata for one model stored in the
+// pack. MetadataJSON is the raw normalized catalog object supplied by the
+// producer.
+type ModelInfo struct {
+	ID           string
+	Provider     string
+	Name         string
+	Mode         string
+	Capabilities []string
+	MetadataJSON string
 }
 
 // MCPToolIDs is the allocation-minimizing representation of one MCP tool
@@ -236,6 +382,24 @@ type MCPResultIDs struct {
 	Tools     []MCPToolIDs
 }
 
+// MCPUpstreamServerIDs is the allocation-minimizing representation of one
+// upstream MCP server needed to initialize a resolved MCP path.
+type MCPUpstreamServerIDs struct {
+	ServerID    uint32
+	ServerSID   uint32
+	EndpointSID uint32
+	SecretSID   uint32
+	AuthTypeSID uint32
+}
+
+// MCPInitializeIDs is the allocation-minimizing result for MCP initialize. It
+// contains the upstream servers behind a path, including the effective auth and
+// secret refs selected for that path.
+type MCPInitializeIDs struct {
+	PathSID uint32
+	Servers []MCPUpstreamServerIDs
+}
+
 // MCPTool is the string-materialized form of one MCP tool binding.
 type MCPTool struct {
 	ExposedName    string
@@ -252,6 +416,21 @@ type MCPResult struct {
 	Tools []MCPTool
 }
 
+// MCPUpstreamServer is the string-materialized form of one upstream server
+// needed to initialize a resolved MCP path.
+type MCPUpstreamServer struct {
+	Server    string
+	Endpoint  string
+	SecretRef string
+	AuthType  string
+}
+
+// MCPInitializeResult is the string-materialized result for MCP initialize.
+type MCPInitializeResult struct {
+	Path    string
+	Servers []MCPUpstreamServer
+}
+
 // PrincipalRoute is an inspector record for one principal/requested-model route
 // stored in a scope. It is derived from the packed indexes and is not used by the
 // hot request path.
@@ -259,10 +438,19 @@ type PrincipalRoute struct {
 	ScopeID        string
 	PrincipalSlug  string
 	RequestedModel string
+	RouteKind      RouteKind
 	Provider       string
 	Model          string
 	SecretRef      string
 	Rate           RatePolicy
+}
+
+// PrincipalInfo is an inspector record for one principal slug in a scope and
+// the requested model IDs it can route.
+type PrincipalInfo struct {
+	ScopeID         string
+	PrincipalSlug   string
+	RequestedModels []string
 }
 
 // MCPPath is an inspector record for one MCP path and its effective tool
@@ -297,7 +485,8 @@ func Build(input Input) ([]byte, error) {
 	providerIDs := map[string]uint32{}
 	modelIDs := map[string]uint32{}
 	mcpServerIDs := map[string]uint32{}
-	routeIDs := map[RoutePlan]uint32{}
+	routeIDs := map[string]uint32{}
+	routes := []RoutePlan{}
 	rateIDs := map[RatePolicy]uint32{}
 	toolsetIDs := map[string]uint32{}
 	toolsets := [][]MCPToolBinding{}
@@ -319,6 +508,9 @@ func Build(input Input) ([]byte, error) {
 		modelIDs[model.ID] = uint32(i)
 		builder.stringID(model.ID)
 		builder.stringID(model.Name)
+		builder.stringID(model.Mode)
+		builder.stringID(capabilitiesKey(model.Capabilities))
+		builder.stringID(model.MetadataJSON)
 	}
 
 	mcpServers := sortedMCPServers(input.MCPServers)
@@ -339,15 +531,8 @@ func Build(input Input) ([]byte, error) {
 				if _, ok := modelIDs[requestedModel]; !ok {
 					return nil, fmt.Errorf("principal %q references unknown requested model %q", principal.Slug, requestedModel)
 				}
-				if _, ok := modelIDs[route.Model]; !ok {
-					return nil, fmt.Errorf("principal %q route for %q references unknown target model %q", principal.Slug, requestedModel, route.Model)
-				}
-				if _, ok := providerIDs[route.Provider]; !ok {
-					return nil, fmt.Errorf("principal %q route for %q references unknown provider %q", principal.Slug, requestedModel, route.Provider)
-				}
-				builder.stringID(route.SecretRef)
-				if _, ok := routeIDs[route]; !ok {
-					routeIDs[route] = uint32(len(routeIDs))
+				if _, err := internRoute(route, builder, providerIDs, modelIDs, routeIDs, &routes); err != nil {
+					return nil, fmt.Errorf("principal %q route for %q: %w", principal.Slug, requestedModel, err)
 				}
 			}
 			if _, ok := rateIDs[principal.Rate]; !ok {
@@ -357,10 +542,15 @@ func Build(input Input) ([]byte, error) {
 		for _, profile := range scope.MCPProfiles {
 			builder.stringID(profile.Path)
 			canonicalTools := canonicalToolset(profile.Tools)
+			serverAuth := map[string]MCPToolBinding{}
 			for _, tool := range canonicalTools {
 				if _, ok := mcpServerIDs[tool.Server]; !ok {
 					return nil, fmt.Errorf("mcp profile %q references unknown server %q", profile.Path, tool.Server)
 				}
+				if existing, ok := serverAuth[tool.Server]; ok && (existing.SecretRef != tool.SecretRef || existing.AuthType != tool.AuthType) {
+					return nil, fmt.Errorf("mcp profile %q has conflicting auth for server %q", profile.Path, tool.Server)
+				}
+				serverAuth[tool.Server] = tool
 				builder.stringID(tool.ExposedName)
 				builder.stringID(tool.Tool)
 				builder.stringID(tool.SecretRef)
@@ -385,7 +575,7 @@ func Build(input Input) ([]byte, error) {
 	modelsOff := uint32(out.Len())
 	writeModels(&out, builder, models, providerIDs)
 	routesOff := uint32(out.Len())
-	writeRoutes(&out, builder, routeIDs, providerIDs, modelIDs)
+	writeRoutes(&out, builder, routes, routeIDs, providerIDs, modelIDs)
 	ratesOff := uint32(out.Len())
 	writeRates(&out, builder, rateIDs)
 	mcpServersOff := uint32(out.Len())
@@ -397,7 +587,7 @@ func Build(input Input) ([]byte, error) {
 
 	blob := out.Bytes()
 	copy(blob[headerMagicOff:headerMagicOff+4], []byte(magic))
-	put32(blob[headerVersionOff:headerVersionOff+4], versionV1)
+	put32(blob[headerVersionOff:headerVersionOff+4], currentPackVersion)
 	put32(blob[headerStringsOff:headerStringsOff+4], stringsOff)
 	put32(blob[headerProvidersOff:headerProvidersOff+4], providersOff)
 	put32(blob[headerModelsOff:headerModelsOff+4], modelsOff)
@@ -423,7 +613,7 @@ func Open(blob []byte) (Reader, error) {
 	if len(blob) < headerSize || string(blob[headerMagicOff:headerMagicOff+4]) != magic {
 		return Reader{}, errors.New("invalid pack header")
 	}
-	if u32(blob[headerVersionOff:headerVersionOff+4]) != versionV1 {
+	if u32(blob[headerVersionOff:headerVersionOff+4]) != currentPackVersion {
 		return Reader{}, fmt.Errorf("unsupported pack version %d", u32(blob[headerVersionOff:headerVersionOff+4]))
 	}
 	wantChecksum := binary.LittleEndian.Uint64(blob[headerChecksumOff : headerChecksumOff+8])
@@ -491,7 +681,7 @@ func OpenWithManifest(blob []byte, manifest Manifest) (Reader, error) {
 // header. It does not validate table offsets; Open performs that structural
 // validation.
 func ValidateManifest(blob []byte, manifest Manifest) error {
-	if manifest.FormatVersion != versionV1 {
+	if manifest.FormatVersion != currentPackVersion {
 		return fmt.Errorf("unsupported manifest pack version %d", manifest.FormatVersion)
 	}
 	if manifest.SizeBytes != uint64(len(blob)) {
@@ -506,47 +696,71 @@ func ValidateManifest(blob []byte, manifest Manifest) error {
 	return nil
 }
 
-// ResolveLLMIDs resolves an LLM request to integer IDs into pack tables.
+// ResolveLLMPlanIDs resolves an LLM request to the compiled route tree as
+// integer IDs into pack tables.
 //
 // scopeID identifies the enforcement scope, principalSlug is the verified
 // principal produced by an external verifier, and modelID is the requested model
-// from the LLM request body. The returned IDs can be dereferenced with String or
-// used directly by a caller that interns provider/model/secret tables elsewhere.
+// from the LLM request body. Target nodes in the returned plan can be
+// dereferenced with String or used directly by callers that intern provider,
+// model, endpoint, and secret-ref tables elsewhere.
 //
 // The boolean is false when the scope, principal/model route, or requested model
 // is not present in the pack.
-func (r Reader) ResolveLLMIDs(scopeID string, principalSlug string, modelID string) (LLMIDs, bool) {
+func (r Reader) ResolveLLMPlanIDs(scopeID string, principalSlug string, modelID string) (LLMPlanIDs, bool) {
 	scopeIndex, ok := r.findScope(scopeID)
 	if !ok {
-		return LLMIDs{}, false
+		return LLMPlanIDs{}, false
 	}
 	principal, ok := r.findPrincipal(scopeIndex, principalSlug, modelID)
 	if !ok {
+		return LLMPlanIDs{}, false
+	}
+	requestedModelID, ok := r.findModel(modelID)
+	if !ok {
+		return LLMPlanIDs{}, false
+	}
+	plan, ok := r.routePlanIDs(principal.routeID)
+	if !ok {
+		return LLMPlanIDs{}, false
+	}
+	return LLMPlanIDs{
+		PrincipalSID:      principal.slugSID,
+		RequestedModelID:  requestedModelID,
+		RequestedModelSID: r.model(requestedModelID).idSID,
+		RouteID:           principal.routeID,
+		RateID:            principal.rateID,
+		Rate:              r.rateIDs(principal.rateID),
+		Plan:              plan,
+	}, true
+}
+
+// ResolveLLMIDs resolves an LLM request to the first executable target in the
+// compiled route tree. It is retained for callers that only understand a single
+// provider/model target. Enforcement points that implement fallback or weighted
+// split behavior should use ResolveLLMPlanIDs instead.
+func (r Reader) ResolveLLMIDs(scopeID string, principalSlug string, modelID string) (LLMIDs, bool) {
+	plan, ok := r.ResolveLLMPlanIDs(scopeID, principalSlug, modelID)
+	if !ok {
 		return LLMIDs{}, false
 	}
-	route := r.route(principal.routeID)
-	if _, ok := r.findModel(modelID); !ok {
+	target, ok := firstTargetPlanIDs(plan.Plan)
+	if !ok {
 		return LLMIDs{}, false
-	}
-	provider := r.provider(route.providerID)
-	model := r.model(route.modelID)
-	secretSID := route.secretSID
-	if r.stringEqual(secretSID, "") {
-		secretSID = provider.secretSID
 	}
 	return LLMIDs{
-		PrincipalSID: principal.slugSID,
-		ProviderID:   route.providerID,
-		ProviderSID:  provider.idSID,
-		KindSID:      provider.kindSID,
-		EndpointSID:  provider.endpointSID,
-		ModelID:      route.modelID,
-		ModelSID:     model.idSID,
-		ModelNameSID: model.nameSID,
-		SecretSID:    secretSID,
-		RouteID:      principal.routeID,
-		RateID:       principal.rateID,
-		Rate:         r.rateIDs(principal.rateID),
+		PrincipalSID: plan.PrincipalSID,
+		ProviderID:   target.ProviderID,
+		ProviderSID:  target.ProviderSID,
+		KindSID:      target.KindSID,
+		EndpointSID:  target.EndpointSID,
+		ModelID:      target.ModelID,
+		ModelSID:     target.ModelSID,
+		ModelNameSID: target.ModelNameSID,
+		SecretSID:    target.SecretSID,
+		RouteID:      target.RouteID,
+		RateID:       plan.RateID,
+		Rate:         plan.Rate,
 	}, true
 }
 
@@ -574,6 +788,119 @@ func (r Reader) ResolveLLM(scopeID string, principalSlug string, modelID string)
 	}, true
 }
 
+// ResolveLLMPlan resolves an LLM request and materializes the complete compiled
+// route tree as strings. It is intended for diagnostics and example code; hot
+// paths should prefer ResolveLLMPlanIDs.
+func (r Reader) ResolveLLMPlan(scopeID string, principalSlug string, modelID string) (LLMPlan, bool) {
+	ids, ok := r.ResolveLLMPlanIDs(scopeID, principalSlug, modelID)
+	if !ok {
+		return LLMPlan{}, false
+	}
+	return LLMPlan{
+		PrincipalSlug:  principalSlug,
+		RequestedModel: modelID,
+		Plan:           r.materializeLLMRoutePlan(ids.Plan),
+		Rate: RatePolicy{
+			USDPerDayCents: ids.Rate.USDPerDayCents,
+			RPM:            ids.Rate.RPM,
+			OnExceed:       r.String(ids.Rate.OnExceedSID),
+		},
+	}, true
+}
+
+// ResolveProvider returns catalog metadata for one provider ID.
+func (r Reader) ResolveProvider(providerID string) (ProviderInfo, bool) {
+	count := r.sectionCount(r.providersOff)
+	for id := uint32(0); id < count; id++ {
+		info := r.providerInfo(id)
+		if info.ID == providerID {
+			return info, true
+		}
+	}
+	return ProviderInfo{}, false
+}
+
+// Providers returns all provider catalog entries in deterministic order by
+// provider ID.
+func (r Reader) Providers() []ProviderInfo {
+	count := r.sectionCount(r.providersOff)
+	providers := make([]ProviderInfo, 0, count)
+	for id := uint32(0); id < count; id++ {
+		providers = append(providers, r.providerInfo(id))
+	}
+	sort.Slice(providers, func(i, j int) bool {
+		return providers[i].ID < providers[j].ID
+	})
+	return providers
+}
+
+// ResolveModel returns catalog metadata for one model ID.
+func (r Reader) ResolveModel(modelID string) (ModelInfo, bool) {
+	id, ok := r.findModel(modelID)
+	if !ok {
+		return ModelInfo{}, false
+	}
+	return r.modelInfo(id), true
+}
+
+// Models returns all model catalog entries in deterministic order by model ID.
+func (r Reader) Models() []ModelInfo {
+	count := r.sectionCount(r.modelsOff)
+	models := make([]ModelInfo, 0, count)
+	for id := uint32(0); id < count; id++ {
+		models = append(models, r.modelInfo(id))
+	}
+	sort.Slice(models, func(i, j int) bool {
+		return models[i].ID < models[j].ID
+	})
+	return models
+}
+
+// ModelCapability reports whether a model has capability in its normalized
+// catalog metadata.
+func (r Reader) ModelCapability(modelID string, capability string) bool {
+	info, ok := r.ResolveModel(modelID)
+	if !ok {
+		return false
+	}
+	for _, candidate := range info.Capabilities {
+		if candidate == capability {
+			return true
+		}
+	}
+	return false
+}
+
+// V1ModelsJSON renders the loaded model catalog in an OpenAI-compatible
+// /v1/models response shape. It is derived from Model.MetadataJSON when present
+// and falls back to the indexed model fields otherwise.
+func (r Reader) V1ModelsJSON() ([]byte, error) {
+	return v1ModelsJSON(r.Models())
+}
+
+// V1ModelsJSONForProvider renders a /v1/models response shape containing only
+// models whose base provider matches providerID.
+func (r Reader) V1ModelsJSONForProvider(providerID string) ([]byte, error) {
+	models := []ModelInfo{}
+	for _, model := range r.Models() {
+		if model.Provider == providerID {
+			models = append(models, model)
+		}
+	}
+	return v1ModelsJSON(models)
+}
+
+func v1ModelsJSON(models []ModelInfo) ([]byte, error) {
+	data := make([]v1Model, 0, len(models))
+	for _, model := range models {
+		data = append(data, v1ModelFromModelInfo(model))
+	}
+	return json.Marshal(v1ModelsResponse{
+		Object: "list",
+		Data:   data,
+	})
+}
+
 // ResolveMCPIDs resolves an MCP path suffix to the effective toolset IDs for a
 // scope. Use this when the caller needs to list or inspect the whole MCP profile.
 // Use ResolveMCPToolIDs when forwarding a single tool call.
@@ -590,6 +917,38 @@ func (r Reader) ResolveMCPIDs(scopeID string, pathSuffix string) (MCPResultIDs, 
 		PathSID:   path.pathSID,
 		ToolsetID: path.toolsetID,
 		Tools:     r.toolset(path.toolsetID),
+	}, true
+}
+
+// ResolveMCPInitializeIDs resolves an MCP path to the upstream server set needed
+// for MCP initialize. Each server appears once with the effective auth and secret
+// ref selected for that path.
+func (r Reader) ResolveMCPInitializeIDs(scopeID string, pathSuffix string) (MCPInitializeIDs, bool) {
+	result, ok := r.ResolveMCPIDs(scopeID, pathSuffix)
+	if !ok {
+		return MCPInitializeIDs{}, false
+	}
+	servers := make([]MCPUpstreamServerIDs, 0, len(result.Tools))
+	seen := map[uint32]bool{}
+	for _, tool := range result.Tools {
+		if seen[tool.ServerID] {
+			continue
+		}
+		seen[tool.ServerID] = true
+		servers = append(servers, MCPUpstreamServerIDs{
+			ServerID:    tool.ServerID,
+			ServerSID:   tool.ServerSID,
+			EndpointSID: tool.ServerEndpointSID,
+			SecretSID:   tool.SecretSID,
+			AuthTypeSID: tool.AuthTypeSID,
+		})
+	}
+	sort.Slice(servers, func(i, j int) bool {
+		return r.String(servers[i].ServerSID) < r.String(servers[j].ServerSID)
+	})
+	return MCPInitializeIDs{
+		PathSID: result.PathSID,
+		Servers: servers,
 	}, true
 }
 
@@ -625,6 +984,28 @@ func (r Reader) ResolveMCPToolIDs(scopeID string, pathSuffix string, exposedTool
 		}, true
 	}
 	return MCPToolIDs{}, false
+}
+
+// ResolveMCPInitialize materializes the upstream server set needed for MCP
+// initialize. Use ResolveMCPInitializeIDs on lower-allocation data paths.
+func (r Reader) ResolveMCPInitialize(scopeID string, pathSuffix string) (MCPInitializeResult, bool) {
+	ids, ok := r.ResolveMCPInitializeIDs(scopeID, pathSuffix)
+	if !ok {
+		return MCPInitializeResult{}, false
+	}
+	servers := make([]MCPUpstreamServer, 0, len(ids.Servers))
+	for _, server := range ids.Servers {
+		servers = append(servers, MCPUpstreamServer{
+			Server:    r.String(server.ServerSID),
+			Endpoint:  r.String(server.EndpointSID),
+			SecretRef: r.String(server.SecretSID),
+			AuthType:  r.String(server.AuthTypeSID),
+		})
+	}
+	return MCPInitializeResult{
+		Path:    r.String(ids.PathSID),
+		Servers: servers,
+	}, true
 }
 
 // ResolveMCP materializes an MCP path lookup as strings. It is intended for
@@ -675,6 +1056,29 @@ func (r Reader) ScopeIDs() []string {
 	return ids
 }
 
+func (r Reader) providerInfo(id uint32) ProviderInfo {
+	provider := r.provider(id)
+	return ProviderInfo{
+		ID:        r.String(provider.idSID),
+		Kind:      r.String(provider.kindSID),
+		Endpoint:  r.String(provider.endpointSID),
+		SecretRef: r.String(provider.secretSID),
+	}
+}
+
+func (r Reader) modelInfo(id uint32) ModelInfo {
+	model := r.model(id)
+	provider := r.provider(model.providerID)
+	return ModelInfo{
+		ID:           r.String(model.idSID),
+		Provider:     r.String(provider.idSID),
+		Name:         r.String(model.nameSID),
+		Mode:         r.String(model.modeSID),
+		Capabilities: splitCapabilities(r.String(model.capabilitiesSID)),
+		MetadataJSON: r.String(model.metadataSID),
+	}
+}
+
 // PrincipalRoutes returns inspector records for every principal/requested-model
 // route in scopeID. The boolean is false when the scope is not present.
 func (r Reader) PrincipalRoutes(scopeID string) ([]PrincipalRoute, bool) {
@@ -691,15 +1095,22 @@ func (r Reader) PrincipalRoutes(scopeID string) ([]PrincipalRoute, bool) {
 			routeID: r.read32(entryBase + 12),
 			rateID:  r.read32(entryBase + 16),
 		}
-		route := r.route(principal.routeID)
-		provider := r.provider(route.providerID)
+		plan, ok := r.routePlanIDs(principal.routeID)
+		if !ok {
+			continue
+		}
+		target, ok := firstTargetPlanIDs(plan)
+		if !ok {
+			continue
+		}
 		routes = append(routes, PrincipalRoute{
 			ScopeID:        scopeID,
 			PrincipalSlug:  r.string(principal.slugSID),
 			RequestedModel: r.string(r.read32(entryBase + 20)),
-			Provider:       r.string(provider.idSID),
-			Model:          r.string(r.model(route.modelID).idSID),
-			SecretRef:      r.string(route.secretSID),
+			RouteKind:      plan.Kind,
+			Provider:       r.string(target.ProviderSID),
+			Model:          r.string(target.ModelSID),
+			SecretRef:      r.string(target.SecretSID),
 			Rate:           ratePolicyFromIDs(r, r.rateIDs(principal.rateID)),
 		})
 	}
@@ -710,6 +1121,32 @@ func (r Reader) PrincipalRoutes(scopeID string) ([]PrincipalRoute, bool) {
 		return routes[i].PrincipalSlug < routes[j].PrincipalSlug
 	})
 	return routes, true
+}
+
+// Principals returns unique principal slugs in scopeID with their requested
+// model allowsets. The boolean is false when the scope is not present.
+func (r Reader) Principals(scopeID string) ([]PrincipalInfo, bool) {
+	routes, ok := r.PrincipalRoutes(scopeID)
+	if !ok {
+		return nil, false
+	}
+	bySlug := map[string][]string{}
+	for _, route := range routes {
+		bySlug[route.PrincipalSlug] = append(bySlug[route.PrincipalSlug], route.RequestedModel)
+	}
+	principals := make([]PrincipalInfo, 0, len(bySlug))
+	for slug, models := range bySlug {
+		sort.Strings(models)
+		principals = append(principals, PrincipalInfo{
+			ScopeID:         scopeID,
+			PrincipalSlug:   slug,
+			RequestedModels: models,
+		})
+	}
+	sort.Slice(principals, func(i, j int) bool {
+		return principals[i].PrincipalSlug < principals[j].PrincipalSlug
+	})
+	return principals, true
 }
 
 // MCPPaths returns inspector records for every MCP path in scopeID. The boolean
@@ -820,6 +1257,122 @@ func principalRoutes(principal Principal) map[string]RoutePlan {
 	}
 }
 
+func normalizeRoutePlan(route RoutePlan) RoutePlan {
+	if route.Kind == "" {
+		route.Kind = RouteKindTarget
+	}
+	if route.Kind == RouteKindTarget {
+		route.Retry = nil
+		route.Children = nil
+		route.Split = nil
+	}
+	return route
+}
+
+func internRoute(route RoutePlan, b *builder, providerIDs map[string]uint32, modelIDs map[string]uint32, routeIDs map[string]uint32, routes *[]RoutePlan) (uint32, error) {
+	normalized := normalizeRoutePlan(route)
+	key := routeKey(normalized)
+	if id, ok := routeIDs[key]; ok {
+		return id, nil
+	}
+	switch normalized.Kind {
+	case RouteKindTarget:
+		if _, ok := modelIDs[normalized.Model]; !ok {
+			return 0, fmt.Errorf("references unknown target model %q", normalized.Model)
+		}
+		if _, ok := providerIDs[normalized.Provider]; !ok {
+			return 0, fmt.Errorf("references unknown provider %q", normalized.Provider)
+		}
+		b.stringID(normalized.SecretRef)
+	case RouteKindChain:
+		if len(normalized.Children) == 0 {
+			return 0, errors.New("chain route node must not be empty")
+		}
+		if normalized.Retry != nil {
+			b.stringID(normalized.Retry.RetryOn)
+		}
+		for index, child := range normalized.Children {
+			childID, err := internRoute(child, b, providerIDs, modelIDs, routeIDs, routes)
+			if err != nil {
+				return 0, fmt.Errorf("chain[%d]: %w", index, err)
+			}
+			_ = childID
+		}
+	case RouteKindSplit:
+		if len(normalized.Split) == 0 {
+			return 0, errors.New("split route node must not be empty")
+		}
+		for index, child := range normalized.Split {
+			if child.Weight == 0 {
+				return 0, fmt.Errorf("split[%d]: weight must be positive", index)
+			}
+			if _, err := internRoute(child.Plan, b, providerIDs, modelIDs, routeIDs, routes); err != nil {
+				return 0, fmt.Errorf("split[%d]: %w", index, err)
+			}
+		}
+	default:
+		return 0, fmt.Errorf("unsupported route node kind %q", normalized.Kind)
+	}
+	id := uint32(len(*routes))
+	routeIDs[key] = id
+	*routes = append(*routes, normalized)
+	return id, nil
+}
+
+func routeKey(route RoutePlan) string {
+	route = normalizeRoutePlan(route)
+	var builder strings.Builder
+	writeRouteKey(&builder, route)
+	return builder.String()
+}
+
+func writeRouteKey(builder *strings.Builder, route RoutePlan) {
+	route = normalizeRoutePlan(route)
+	builder.WriteString(string(route.Kind))
+	builder.WriteByte('\x00')
+	switch route.Kind {
+	case RouteKindTarget:
+		builder.WriteString(route.Provider)
+		builder.WriteByte('\x00')
+		builder.WriteString(route.Model)
+		builder.WriteByte('\x00')
+		builder.WriteString(route.SecretRef)
+	case RouteKindChain:
+		if route.Retry != nil {
+			builder.WriteString(route.Retry.RetryOn)
+			builder.WriteByte('\x00')
+			builder.WriteString(strconv.FormatUint(uint64(route.Retry.PerTryTimeoutMS), 10))
+		}
+		for _, child := range route.Children {
+			builder.WriteByte('\x00')
+			writeRouteKey(builder, child)
+		}
+	case RouteKindSplit:
+		for _, child := range route.Split {
+			builder.WriteByte('\x00')
+			builder.WriteString(strconv.FormatUint(uint64(child.Weight), 10))
+			builder.WriteByte('\x00')
+			writeRouteKey(builder, child.Plan)
+		}
+	}
+}
+
+func capabilitiesKey(values []string) string {
+	if len(values) == 0 {
+		return ""
+	}
+	out := append([]string{}, values...)
+	sort.Strings(out)
+	return strings.Join(out, "\x00")
+}
+
+func splitCapabilities(value string) []string {
+	if value == "" {
+		return nil
+	}
+	return strings.Split(value, "\x00")
+}
+
 type principalEntry struct {
 	slug           string
 	requestedModel string
@@ -902,23 +1455,92 @@ func writeModels(out *bytes.Buffer, b *builder, models []Model, providerIDs map[
 		putU32(out, b.stringID(model.ID))
 		putU32(out, providerIDs[model.Provider])
 		putU32(out, b.stringID(model.Name))
-		putU32(out, 0)
+		putU32(out, b.stringID(model.Mode))
+		putU32(out, b.stringID(capabilitiesKey(model.Capabilities)))
+		putU32(out, b.stringID(model.MetadataJSON))
 	}
 }
 
-// writeRoutes writes deduplicated final LLM targets. Principal index records
-// reference this table by route ID.
-func writeRoutes(out *bytes.Buffer, b *builder, routeIDs map[RoutePlan]uint32, providerIDs map[string]uint32, modelIDs map[string]uint32) {
-	putU32(out, uint32(len(routeIDs)))
-	routes := make([]RoutePlan, len(routeIDs))
-	for route, id := range routeIDs {
-		routes[id] = route
+// writeRoutes writes deduplicated LLM route trees. Principal index records
+// reference this table by route ID. Chain and split nodes point into a child
+// table stored immediately after the fixed-width route records.
+func writeRoutes(out *bytes.Buffer, b *builder, routes []RoutePlan, routeIDs map[string]uint32, providerIDs map[string]uint32, modelIDs map[string]uint32) {
+	putU32(out, uint32(len(routes)))
+	records := make([]routeRef, len(routes))
+	var children bytes.Buffer
+	baseOffset := uint32(out.Len() + len(routes)*routeLen)
+	for i, route := range routes {
+		route = normalizeRoutePlan(route)
+		switch route.Kind {
+		case RouteKindTarget:
+			records[i] = routeRef{
+				kind:       routeKindTargetID,
+				providerID: providerIDs[route.Provider],
+				modelID:    modelIDs[route.Model],
+				secretSID:  b.stringID(route.SecretRef),
+			}
+		case RouteKindChain:
+			records[i] = routeRef{
+				kind:            routeKindChainID,
+				childCount:      uint32(len(route.Children)),
+				childOffset:     baseOffset + uint32(children.Len()),
+				retryOnSID:      retryOnSID(b, route.Retry),
+				perTryTimeoutMS: retryTimeout(route.Retry),
+			}
+			for _, child := range route.Children {
+				putU32(&children, 0)
+				putU32(&children, routeIDs[routeKey(child)])
+			}
+		case RouteKindSplit:
+			records[i] = routeRef{
+				kind:        routeKindSplitID,
+				childCount:  uint32(len(route.Split)),
+				childOffset: baseOffset + uint32(children.Len()),
+			}
+			for _, child := range route.Split {
+				putU32(&children, child.Weight)
+				putU32(&children, routeIDs[routeKey(child.Plan)])
+			}
+		}
 	}
-	for _, route := range routes {
-		putU32(out, providerIDs[route.Provider])
-		putU32(out, modelIDs[route.Model])
-		putU32(out, b.stringID(route.SecretRef))
+	for _, record := range records {
+		putU32(out, record.kind)
+		switch record.kind {
+		case routeKindTargetID:
+			putU32(out, record.providerID)
+			putU32(out, record.modelID)
+			putU32(out, record.secretSID)
+			putU32(out, 0)
+			putU32(out, 0)
+		case routeKindChainID:
+			putU32(out, record.childCount)
+			putU32(out, record.childOffset)
+			putU32(out, record.retryOnSID)
+			putU32(out, record.perTryTimeoutMS)
+			putU32(out, 0)
+		case routeKindSplitID:
+			putU32(out, record.childCount)
+			putU32(out, record.childOffset)
+			putU32(out, 0)
+			putU32(out, 0)
+			putU32(out, 0)
+		}
 	}
+	out.Write(children.Bytes())
+}
+
+func retryOnSID(b *builder, retry *RetryPolicy) uint32 {
+	if retry == nil {
+		return b.stringID("")
+	}
+	return b.stringID(retry.RetryOn)
+}
+
+func retryTimeout(retry *RetryPolicy) uint32 {
+	if retry == nil {
+		return 0
+	}
+	return retry.PerTryTimeoutMS
 }
 
 // writeRates writes deduplicated immutable rate-limit metadata. Runtime counters
@@ -977,7 +1599,7 @@ func writeMCPToolsets(out *bytes.Buffer, b *builder, toolsets [][]MCPToolBinding
 
 // writeScopes writes scope records plus the two scope-local indexes they point
 // at: principal/model routes and MCP path suffixes.
-func writeScopes(out *bytes.Buffer, b *builder, scopes []Scope, routeIDs map[RoutePlan]uint32, rateIDs map[RatePolicy]uint32, toolsetIDs map[string]uint32) (uint32, uint32) {
+func writeScopes(out *bytes.Buffer, b *builder, scopes []Scope, routeIDs map[string]uint32, rateIDs map[RatePolicy]uint32, toolsetIDs map[string]uint32) (uint32, uint32) {
 	putU32(out, uint32(len(scopes)))
 	scopeRecords := make([]scopeRef, len(scopes))
 	var principalData bytes.Buffer
@@ -1005,7 +1627,7 @@ func writeScopes(out *bytes.Buffer, b *builder, scopes []Scope, routeIDs map[Rou
 		for _, principal := range principalEntries {
 			putU64(&principalData, principalLookupHash(principal.slug, principal.requestedModel))
 			putU32(&principalData, b.stringID(principal.slug))
-			putU32(&principalData, routeIDs[principal.route])
+			putU32(&principalData, routeIDs[routeKey(principal.route)])
 			putU32(&principalData, rateIDs[principal.rate])
 			putU32(&principalData, b.stringID(principal.requestedModel))
 		}
@@ -1063,9 +1685,12 @@ type mcpPathRef struct {
 }
 
 type modelRef struct {
-	idSID      uint32
-	providerID uint32
-	nameSID    uint32
+	idSID           uint32
+	providerID      uint32
+	nameSID         uint32
+	modeSID         uint32
+	capabilitiesSID uint32
+	metadataSID     uint32
 }
 
 type providerRef struct {
@@ -1076,9 +1701,148 @@ type providerRef struct {
 }
 
 type routeRef struct {
-	providerID uint32
-	modelID    uint32
-	secretSID  uint32
+	kind            uint32
+	providerID      uint32
+	modelID         uint32
+	secretSID       uint32
+	childCount      uint32
+	childOffset     uint32
+	retryOnSID      uint32
+	perTryTimeoutMS uint32
+}
+
+type rawModelMetadata struct {
+	Model                        string          `json:"model"`
+	Provider                     string          `json:"provider"`
+	UpdatedAt                    string          `json:"updatedAt"`
+	InputTokensPricePerMillion   *catalogDecimal `json:"inputTokensPricePerMillion"`
+	OutputTokensPricePerMillion  *catalogDecimal `json:"outputTokensPricePerMillion"`
+	CachedTokensPricePerMillion  *catalogDecimal `json:"cachedTokensPricePerMillion"`
+	CachingTokensPricePerMillion *catalogDecimal `json:"cachingTokensPricePerMillion"`
+	ContextWindow                *int64          `json:"contextWindow"`
+	Capabilities                 []string        `json:"capabilities"`
+	Limits                       json.RawMessage `json:"limits"`
+}
+
+type catalogDecimal string
+
+func (d *catalogDecimal) UnmarshalJSON(data []byte) error {
+	if string(data) == "null" {
+		return nil
+	}
+	var value string
+	if len(data) > 0 && data[0] == '"' {
+		if err := json.Unmarshal(data, &value); err != nil {
+			return err
+		}
+	} else {
+		value = string(data)
+	}
+	*d = catalogDecimal(value)
+	return nil
+}
+
+type rawModelLimits struct {
+	MaxOutputTokens int64 `json:"max_output_tokens"`
+}
+
+type v1ModelsResponse struct {
+	Object string    `json:"object"`
+	Data   []v1Model `json:"data"`
+}
+
+type v1Model struct {
+	ID                  string `json:"id"`
+	Object              string `json:"object"`
+	Created             int64  `json:"created"`
+	OwnedBy             string `json:"owned_by"`
+	InputPrice          string `json:"input_price"`
+	CachingPrice        string `json:"caching_price"`
+	CachedPrice         string `json:"cached_price"`
+	OutputPrice         string `json:"output_price"`
+	MaxOutputTokens     int64  `json:"max_output_tokens"`
+	ContextWindow       int64  `json:"context_window"`
+	SupportsCaching     bool   `json:"supports_caching"`
+	SupportsVision      bool   `json:"supports_vision"`
+	SupportsComputerUse bool   `json:"supports_computer_use"`
+	SupportsReasoning   bool   `json:"supports_reasoning"`
+}
+
+func v1ModelFromModelInfo(model ModelInfo) v1Model {
+	out := v1Model{
+		ID:      model.ID,
+		Object:  "model",
+		OwnedBy: "system",
+	}
+	var raw rawModelMetadata
+	if model.MetadataJSON != "" {
+		_ = json.Unmarshal([]byte(model.MetadataJSON), &raw)
+	}
+	if raw.Model != "" {
+		out.ID = raw.Model
+	}
+	out.Created = unixSeconds(raw.UpdatedAt)
+	out.InputPrice = pricePerToken(raw.InputTokensPricePerMillion)
+	out.CachingPrice = pricePerToken(raw.CachingTokensPricePerMillion)
+	out.CachedPrice = pricePerToken(raw.CachedTokensPricePerMillion)
+	out.OutputPrice = pricePerToken(raw.OutputTokensPricePerMillion)
+	if raw.ContextWindow != nil {
+		out.ContextWindow = *raw.ContextWindow
+	}
+	var limits rawModelLimits
+	if len(raw.Limits) > 0 {
+		_ = json.Unmarshal(raw.Limits, &limits)
+		out.MaxOutputTokens = limits.MaxOutputTokens
+	}
+	capabilities := model.Capabilities
+	if len(raw.Capabilities) > 0 {
+		capabilities = raw.Capabilities
+	}
+	out.SupportsCaching = out.CachingPrice != "0" || out.CachedPrice != "0"
+	out.SupportsVision = hasCapability(capabilities, "vision")
+	out.SupportsComputerUse = hasCapability(capabilities, "computer_use")
+	out.SupportsReasoning = hasCapability(capabilities, "reasoning")
+	return out
+}
+
+func unixSeconds(value string) int64 {
+	if value == "" {
+		return 0
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		return 0
+	}
+	return parsed.Unix()
+}
+
+func pricePerToken(value *catalogDecimal) string {
+	if value == nil || *value == "" {
+		return "0"
+	}
+	pricePerMillion, err := decimal.NewFromString(string(*value))
+	if err != nil {
+		return "0"
+	}
+	return trimDecimal(pricePerMillion.Div(decimal.NewFromInt(1000000)).StringFixed(12))
+}
+
+func trimDecimal(value string) string {
+	value = strings.TrimRight(value, "0")
+	value = strings.TrimRight(value, ".")
+	if value == "" {
+		return "0"
+	}
+	return value
+}
+
+func hasCapability(capabilities []string, capability string) bool {
+	for _, candidate := range capabilities {
+		if candidate == capability {
+			return true
+		}
+	}
+	return false
 }
 
 func (r Reader) findScope(scopeID string) (scopeRef, bool) {
@@ -1170,9 +1934,12 @@ func (r Reader) findModel(modelID string) (uint32, bool) {
 func (r Reader) model(id uint32) modelRef {
 	base := int(r.modelsOff) + 4 + int(id)*modelLen
 	return modelRef{
-		idSID:      r.read32(base + 8),
-		providerID: r.read32(base + 12),
-		nameSID:    r.read32(base + 16),
+		idSID:           r.read32(base + 8),
+		providerID:      r.read32(base + 12),
+		nameSID:         r.read32(base + 16),
+		modeSID:         r.read32(base + 20),
+		capabilitiesSID: r.read32(base + 24),
+		metadataSID:     r.read32(base + 28),
 	}
 }
 
@@ -1188,11 +1955,148 @@ func (r Reader) provider(id uint32) providerRef {
 
 func (r Reader) route(id uint32) routeRef {
 	base := int(r.routesOff) + 4 + int(id)*routeLen
-	return routeRef{
-		providerID: r.read32(base),
-		modelID:    r.read32(base + 4),
-		secretSID:  r.read32(base + 8),
+	kind := r.read32(base)
+	switch kind {
+	case routeKindTargetID:
+		return routeRef{
+			kind:       kind,
+			providerID: r.read32(base + 4),
+			modelID:    r.read32(base + 8),
+			secretSID:  r.read32(base + 12),
+		}
+	case routeKindChainID:
+		return routeRef{
+			kind:            kind,
+			childCount:      r.read32(base + 4),
+			childOffset:     r.read32(base + 8),
+			retryOnSID:      r.read32(base + 12),
+			perTryTimeoutMS: r.read32(base + 16),
+		}
+	case routeKindSplitID:
+		return routeRef{
+			kind:        kind,
+			childCount:  r.read32(base + 4),
+			childOffset: r.read32(base + 8),
+		}
+	default:
+		return routeRef{kind: kind}
 	}
+}
+
+func (r Reader) routePlanIDs(routeID uint32) (LLMRoutePlanIDs, bool) {
+	route := r.route(routeID)
+	switch route.kind {
+	case routeKindTargetID:
+		provider := r.provider(route.providerID)
+		model := r.model(route.modelID)
+		secretSID := route.secretSID
+		if r.stringEqual(secretSID, "") {
+			secretSID = provider.secretSID
+		}
+		return LLMRoutePlanIDs{
+			RouteID:      routeID,
+			Kind:         RouteKindTarget,
+			ProviderID:   route.providerID,
+			ProviderSID:  provider.idSID,
+			KindSID:      provider.kindSID,
+			EndpointSID:  provider.endpointSID,
+			ModelID:      route.modelID,
+			ModelSID:     model.idSID,
+			ModelNameSID: model.nameSID,
+			SecretSID:    secretSID,
+		}, true
+	case routeKindChainID:
+		children, ok := r.routeChildren(route)
+		if !ok {
+			return LLMRoutePlanIDs{}, false
+		}
+		return LLMRoutePlanIDs{
+			RouteID:         routeID,
+			Kind:            RouteKindChain,
+			RetryOnSID:      route.retryOnSID,
+			PerTryTimeoutMS: route.perTryTimeoutMS,
+			Children:        children,
+		}, true
+	case routeKindSplitID:
+		children, ok := r.routeChildren(route)
+		if !ok {
+			return LLMRoutePlanIDs{}, false
+		}
+		return LLMRoutePlanIDs{
+			RouteID:  routeID,
+			Kind:     RouteKindSplit,
+			Children: children,
+		}, true
+	default:
+		return LLMRoutePlanIDs{}, false
+	}
+}
+
+func (r Reader) routeChildren(route routeRef) ([]LLMRouteChildIDs, bool) {
+	children := make([]LLMRouteChildIDs, 0, route.childCount)
+	for i := uint32(0); i < route.childCount; i++ {
+		entryBase := int(route.childOffset) + int(i)*routeChildLen
+		weight := r.read32(entryBase)
+		childRouteID := r.read32(entryBase + 4)
+		child, ok := r.routePlanIDs(childRouteID)
+		if !ok {
+			return nil, false
+		}
+		children = append(children, LLMRouteChildIDs{
+			Weight: weight,
+			Plan:   child,
+		})
+	}
+	return children, true
+}
+
+func firstTargetPlanIDs(plan LLMRoutePlanIDs) (LLMRoutePlanIDs, bool) {
+	switch plan.Kind {
+	case RouteKindTarget:
+		return plan, true
+	case RouteKindChain:
+		if len(plan.Children) == 0 {
+			return LLMRoutePlanIDs{}, false
+		}
+		return firstTargetPlanIDs(plan.Children[0].Plan)
+	case RouteKindSplit:
+		if len(plan.Children) == 0 {
+			return LLMRoutePlanIDs{}, false
+		}
+		best := plan.Children[0]
+		for _, child := range plan.Children[1:] {
+			if child.Weight > best.Weight {
+				best = child
+			}
+		}
+		return firstTargetPlanIDs(best.Plan)
+	default:
+		return LLMRoutePlanIDs{}, false
+	}
+}
+
+func (r Reader) materializeLLMRoutePlan(plan LLMRoutePlanIDs) LLMRoutePlan {
+	out := LLMRoutePlan{
+		Kind:            plan.Kind,
+		RetryOn:         r.String(plan.RetryOnSID),
+		PerTryTimeoutMS: plan.PerTryTimeoutMS,
+	}
+	if plan.Kind == RouteKindTarget {
+		out.Provider = r.String(plan.ProviderSID)
+		out.ProviderKind = r.String(plan.KindSID)
+		out.Endpoint = r.String(plan.EndpointSID)
+		out.Model = r.String(plan.ModelSID)
+		out.ModelName = r.String(plan.ModelNameSID)
+		out.SecretRef = r.String(plan.SecretSID)
+		return out
+	}
+	for _, child := range plan.Children {
+		out.Children = append(out.Children, LLMRouteChild{
+			Weight: child.Weight,
+			Plan:   r.materializeLLMRoutePlan(child.Plan),
+		})
+	}
+	return out
 }
 
 func (r Reader) rateIDs(id uint32) RatePolicyIDs {
