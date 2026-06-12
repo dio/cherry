@@ -1,0 +1,4 @@
+interface:
+  display_name: "Integrate Cherry"
+  short_description: "Produce and consume Cherry bundles."
+  default_prompt: "Integrate Cherry with producer code and enforcement-point consumer loading/querying."

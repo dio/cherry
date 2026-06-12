@@ -1,0 +1,173 @@
+org_id: org1
+
+projects:
+  - id: project1
+    org_id: org1
+  - id: project2
+    org_id: org1
+
+workspaces:
+  - id: workspace1
+    project_id: project1
+  - id: workspace2
+    project_id: project1
+  - id: workspace3
+    project_id: project2
+
+users:
+  - id: alice
+    org_id: org1
+    tag_ids:
+      - marketing
+  - id: bob
+    org_id: org1
+    tag_ids: []
+
+user_assignments:
+  - user_id: alice
+    scope: project
+    project_id: project1
+    workspace_id: ""
+  - user_id: bob
+    scope: workspace
+    project_id: project1
+    workspace_id: workspace1
+  - user_id: bob
+    scope: workspace
+    project_id: project1
+    workspace_id: workspace2
+  - user_id: bob
+    scope: project
+    project_id: project2
+    workspace_id: ""
+
+keys:
+  - id: project1-key
+    slug: slug:project1
+    user_id: alice
+    project_id: project1
+    workspace_id: ""
+    scope: project
+    tag_ids: []
+  - id: workspace1-key
+    slug: slug:workspace1
+    user_id: bob
+    project_id: project1
+    workspace_id: workspace1
+    scope: workspace
+    tag_ids:
+      - marketing
+  - id: workspace2-key
+    slug: slug:workspace2
+    user_id: bob
+    project_id: project1
+    workspace_id: workspace2
+    scope: workspace
+    tag_ids: []
+  - id: project2-key
+    slug: slug:project2
+    user_id: bob
+    project_id: project2
+    workspace_id: ""
+    scope: project
+    tag_ids: []
+
+tags:
+  marketing:
+    id: marketing
+    llm_rule:
+      id: tag:marketing
+      specificity: tag
+      overrides:
+        provider:anthropic:
+          kind: target
+          target:
+            provider: openai
+            model: gpt-4o-mini
+            secret_ref: env://MARKETING_OPENAI_KEY
+      rate_limit:
+        usd_per_day: 50
+        rpm: 60
+        on_exceed: reject
+
+profiles:
+  - id: dev-tools
+    slug: slug:profile-dev-tools
+    path: profile-dev-tools
+    workspace_id: workspace1
+    auth:
+      type: none
+    tools:
+      github:
+        auth:
+          type: bearer
+          secret_ref: env://GITHUB_TOKEN
+        include:
+          - list-repos
+      kiwi:
+        include:
+          - search-flight
+
+models:
+  - id: claude-haiku-4-5
+    provider: anthropic
+    name: claude-haiku-4-5-20251001
+  - id: claude-sonnet-4-5
+    provider: anthropic
+    name: claude-sonnet-4-5-20251001
+  - id: gpt-4o-mini
+    provider: openai
+    name: gpt-4o-mini
+  - id: gpt-4o-mini-2
+    provider: openai
+    name: gpt-4o-mini-20241001
+
+providers:
+  - id: anthropic
+    kind: anthropic
+    endpoint: https://api.anthropic.com
+    secret_ref: env://ANTHROPIC_API_KEY
+    request_mutations:
+      "*":
+        headers:
+          x-provider-id: anthropic-default
+        body:
+          providerId: anthropic-default
+    response_mutations: {}
+  - id: openai
+    kind: openai
+    endpoint: https://api.openai.com
+    secret_ref: env://OPENAI_API_KEY
+    request_mutations:
+      "*":
+        headers:
+          x-provider-id: openai-default
+        body:
+          providerId: openai-default
+    response_mutations: {}
+  - id: fallback_p1
+    kind: anthropic
+    endpoint: https://192.0.2.1
+    secret_ref: literal://fake
+    request_mutations: {}
+    response_mutations: {}
+  - id: fallback_p2
+    kind: anthropic
+    endpoint: https://192.0.2.2
+    secret_ref: literal://fake
+    request_mutations: {}
+    response_mutations: {}
+
+mcp_servers:
+  - id: kiwi
+    endpoint: https://mcp.kiwi.com
+    secret_ref: env://KIWI_MCP_TOKEN
+    auth_type: bearer
+    tools:
+      - search-flight
+  - id: github
+    endpoint: https://api.github.com
+    secret_ref: env://GITHUB_MCP_TOKEN
+    auth_type: bearer
+    tools:
+      - list-repos

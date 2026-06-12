@@ -1,0 +1,1383 @@
+// Package cherry contains a compact enforcement bundle writer and reader.
+//
+// A control plane uses Build or BuildWithManifest to turn normalized routing
+// rows into one immutable byte blob. An enforcement point uses Open,
+// OpenWithManifest, or OpenBundleZstd to validate that blob and query it in
+// place. Reader intentionally does not inflate the pack into one Go map/object
+// per principal, MCP profile, or rate-limit rule. Its hot-path methods binary
+// search fixed-width indexes and return integer IDs into shared tables.
+//
+// The package starts at the normalized-data boundary. It does not perform
+// tenancy joins, key verification, ownership checks, or rule merging. Those
+// decisions belong to the system that prepares Input.
+package cherry
+
+import (
+	"bytes"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"sort"
+	"strings"
+)
+
+const (
+	magic      = "OPK1"
+	versionV1  = uint32(1)
+	headerSize = 64
+
+	// Header layout:
+	//   0:4   magic "OPK1"
+	//   4:8   format version
+	//   8:16  FNV-1a checksum of blob[headerSize:]
+	//   16:20 strings table offset
+	//   20:24 providers table offset
+	//   24:28 models table offset
+	//   28:32 route plans table offset
+	//   32:36 rate policies table offset
+	//   36:40 MCP servers table offset
+	//   40:44 MCP toolsets table offset
+	//   44:48 scopes table offset
+	//   48:52 principals index offset
+	//   52:56 MCP paths index offset
+	//   56:64 reserved
+	headerMagicOff       = 0
+	headerVersionOff     = 4
+	headerChecksumOff    = 8
+	headerStringsOff     = 16
+	headerProvidersOff   = 20
+	headerModelsOff      = 24
+	headerRoutesOff      = 28
+	headerRatesOff       = 32
+	headerMCPServersOff  = 36
+	headerMCPToolsetsOff = 40
+	headerScopesOff      = 44
+	headerPrincipalsOff  = 48
+	headerMCPPathsOff    = 52
+
+	principalLen      = 24 // hash64(slug + "\x00" + requestedModel), slugSID, routeID, rateID, requestedModelID
+	modelLen          = 24 // hash64, idSID, providerID, nameSID, reserved
+	providerLen       = 16 // idSID, kindSID, endpointSID, secretSID
+	routeLen          = 12 // providerID, modelID, secretSID
+	rateLen           = 16 // usdCents, rpm, onExceedSID
+	mcpServerLen      = 16 // idSID, endpointSID, secretSID, authTypeSID
+	mcpToolsetLen     = 8  // bindingCount, bindingOffset
+	mcpToolBindingLen = 20 // exposedSID, serverID, toolSID, secretSID, authTypeSID
+	scopeLen          = 20 // sid, principalCount, principalOffset, mcpPathCount, mcpPathOffset
+	mcpPathLen        = 16 // hash64, pathSID, toolsetID
+)
+
+// Provider describes an upstream LLM provider available to compiled LLM routes.
+// SecretRef is a reference to secret material, not the secret material itself.
+type Provider struct {
+	ID        string
+	Kind      string
+	Endpoint  string
+	SecretRef string
+}
+
+// Model describes a logical model name accepted by enforcement requests.
+// Provider must reference an entry in Input.Providers. Name is the upstream model
+// name sent to the selected provider after routing has been resolved.
+type Model struct {
+	ID       string
+	Provider string
+	Name     string
+}
+
+// RoutePlan is the final LLM target selected for a principal and requested
+// model. The route must already reflect external rule precedence and overrides.
+type RoutePlan struct {
+	Provider  string
+	Model     string
+	SecretRef string
+}
+
+// RatePolicy is immutable rate-limit metadata attached to a principal route.
+// Mutable counters are intentionally not stored in the pack.
+type RatePolicy struct {
+	USDPerDayCents uint64
+	RPM            uint32
+	OnExceed       string
+}
+
+// Principal describes the compiled LLM routes for one verified principal slug in
+// one scope. The verifier that turns key or token material into Slug is outside
+// this package.
+type Principal struct {
+	Slug string
+	// ModelRoutes maps requested model ID to the already-compiled final target
+	// route for that request. Route is kept as a compatibility/default helper for
+	// small tests and synthetic inputs that only need one model route.
+	ModelRoutes map[string]RoutePlan
+	Route       RoutePlan
+	Rate        RatePolicy
+}
+
+// MCPServer describes an upstream MCP server that can be referenced by profile
+// tool bindings. SecretRef and AuthType are defaults that a profile binding may
+// override before data reaches this package.
+type MCPServer struct {
+	ID        string
+	Endpoint  string
+	SecretRef string
+	AuthType  string
+}
+
+// MCPToolBinding maps an exposed tool name to an upstream MCP server/tool pair.
+// Profile routes with multiple servers typically expose names such as
+// "github__list-repos" to keep the upstream identity unambiguous.
+type MCPToolBinding struct {
+	ExposedName string
+	Server      string
+	Tool        string
+	SecretRef   string
+	AuthType    string
+}
+
+// MCPProfile describes one MCP path suffix within a scope and the tools exposed
+// through that path. Path is the normalized suffix after the HTTP layer strips
+// the MCP prefix.
+type MCPProfile struct {
+	Path  string
+	Tools []MCPToolBinding
+}
+
+// Scope is one enforcement partition in the pack, commonly a workspace. A
+// project bundle can contain multiple workspace scopes.
+type Scope struct {
+	ID          string
+	Principals  []Principal
+	MCPProfiles []MCPProfile
+}
+
+// Input is the normalized data accepted by Build. Callers are responsible for
+// preparing only the providers, models, servers, scopes, principals, and profiles
+// that are valid for the bundle being built.
+type Input struct {
+	Providers  []Provider
+	Models     []Model
+	MCPServers []MCPServer
+	Scopes     []Scope
+}
+
+// Reader is an immutable, in-place view of a validated pack blob. A Reader is
+// safe to share between goroutines as long as callers do not mutate the
+// underlying blob slice passed to Open.
+type Reader struct {
+	blob           []byte
+	stringsOff     uint32
+	providersOff   uint32
+	modelsOff      uint32
+	routesOff      uint32
+	ratesOff       uint32
+	mcpServersOff  uint32
+	mcpToolsetsOff uint32
+	scopesOff      uint32
+	principalsOff  uint32
+	mcpPathsOff    uint32
+}
+
+// LLMIDs is the allocation-minimizing data-path result. It returns integer IDs
+// into the pack tables and string table. Callers that only need to dispatch to an
+// already-interned provider/model can avoid materializing strings entirely.
+type LLMIDs struct {
+	PrincipalSID uint32
+	ProviderID   uint32
+	ProviderSID  uint32
+	KindSID      uint32
+	EndpointSID  uint32
+	ModelID      uint32
+	ModelSID     uint32
+	ModelNameSID uint32
+	SecretSID    uint32
+	RouteID      uint32
+	RateID       uint32
+	Rate         RatePolicyIDs
+}
+
+type RatePolicyIDs struct {
+	USDPerDayCents uint64
+	RPM            uint32
+	OnExceedSID    uint32
+}
+
+// LLMResult is the string-materialized form of an LLM lookup. It is convenient
+// for tests, CLIs, and diagnostics; hot paths should prefer LLMIDs.
+type LLMResult struct {
+	PrincipalSlug string
+	Provider      string
+	ProviderKind  string
+	Endpoint      string
+	Model         string
+	ModelName     string
+	SecretRef     string
+	Rate          RatePolicy
+}
+
+// MCPToolIDs is the allocation-minimizing representation of one MCP tool
+// binding. String fields are returned as string-table IDs and can be materialized
+// with Reader.String when needed.
+type MCPToolIDs struct {
+	ExposedNameSID    uint32
+	ServerID          uint32
+	ServerSID         uint32
+	ServerEndpointSID uint32
+	ToolSID           uint32
+	SecretSID         uint32
+	AuthTypeSID       uint32
+}
+
+// MCPResultIDs is the allocation-minimizing representation of an MCP path lookup.
+// Tools contains the precomputed effective allowset for the resolved path.
+type MCPResultIDs struct {
+	PathSID   uint32
+	ToolsetID uint32
+	Tools     []MCPToolIDs
+}
+
+// MCPTool is the string-materialized form of one MCP tool binding.
+type MCPTool struct {
+	ExposedName    string
+	Server         string
+	ServerEndpoint string
+	Tool           string
+	SecretRef      string
+	AuthType       string
+}
+
+// MCPResult is the string-materialized form of an MCP path lookup.
+type MCPResult struct {
+	Path  string
+	Tools []MCPTool
+}
+
+// PrincipalRoute is an inspector record for one principal/requested-model route
+// stored in a scope. It is derived from the packed indexes and is not used by the
+// hot request path.
+type PrincipalRoute struct {
+	ScopeID        string
+	PrincipalSlug  string
+	RequestedModel string
+	Provider       string
+	Model          string
+	SecretRef      string
+	Rate           RatePolicy
+}
+
+// MCPPath is an inspector record for one MCP path and its effective tool
+// bindings in a scope.
+type MCPPath struct {
+	ScopeID string
+	Path    string
+	Tools   []MCPTool
+}
+
+// Manifest is the minimal external metadata needed to reject stale or corrupted
+// blobs before the reader is made visible to the enforcement data path. A real CP
+// envelope would add generation IDs, project/workspace labels, timestamps, and a
+// signature. The pack package keeps only the fields it can validate locally.
+type Manifest struct {
+	FormatVersion uint32
+	Checksum      uint64
+	SizeBytes     uint64
+}
+
+// Build encodes normalized enforcement data into a compact immutable pack blob.
+//
+// The input must already be scoped and compiled by the caller. Build validates
+// table references, rejects unknown providers/models/MCP servers, interns shared
+// strings, and writes fixed-width indexes for LLM and MCP lookups.
+//
+// The returned blob can be opened with Open. Use BuildWithManifest when the blob
+// will be delivered across a control-plane/enforcement-point boundary and the
+// receiver should validate size, checksum, and format version before use.
+func Build(input Input) ([]byte, error) {
+	builder := newBuilder()
+	providerIDs := map[string]uint32{}
+	modelIDs := map[string]uint32{}
+	mcpServerIDs := map[string]uint32{}
+	routeIDs := map[RoutePlan]uint32{}
+	rateIDs := map[RatePolicy]uint32{}
+	toolsetIDs := map[string]uint32{}
+	toolsets := [][]MCPToolBinding{}
+
+	providers := sortedProviders(input.Providers)
+	for i, provider := range providers {
+		providerIDs[provider.ID] = uint32(i)
+		builder.stringID(provider.ID)
+		builder.stringID(provider.Kind)
+		builder.stringID(provider.Endpoint)
+		builder.stringID(provider.SecretRef)
+	}
+
+	models := sortedModels(input.Models)
+	for i, model := range models {
+		if _, ok := providerIDs[model.Provider]; !ok {
+			return nil, fmt.Errorf("model %q references unknown provider %q", model.ID, model.Provider)
+		}
+		modelIDs[model.ID] = uint32(i)
+		builder.stringID(model.ID)
+		builder.stringID(model.Name)
+	}
+
+	mcpServers := sortedMCPServers(input.MCPServers)
+	for i, server := range mcpServers {
+		mcpServerIDs[server.ID] = uint32(i)
+		builder.stringID(server.ID)
+		builder.stringID(server.Endpoint)
+		builder.stringID(server.SecretRef)
+		builder.stringID(server.AuthType)
+	}
+
+	for _, scope := range input.Scopes {
+		builder.stringID(scope.ID)
+		for _, principal := range scope.Principals {
+			builder.stringID(principal.Slug)
+			builder.stringID(principal.Rate.OnExceed)
+			for requestedModel, route := range principalRoutes(principal) {
+				if _, ok := modelIDs[requestedModel]; !ok {
+					return nil, fmt.Errorf("principal %q references unknown requested model %q", principal.Slug, requestedModel)
+				}
+				if _, ok := modelIDs[route.Model]; !ok {
+					return nil, fmt.Errorf("principal %q route for %q references unknown target model %q", principal.Slug, requestedModel, route.Model)
+				}
+				if _, ok := providerIDs[route.Provider]; !ok {
+					return nil, fmt.Errorf("principal %q route for %q references unknown provider %q", principal.Slug, requestedModel, route.Provider)
+				}
+				builder.stringID(route.SecretRef)
+				if _, ok := routeIDs[route]; !ok {
+					routeIDs[route] = uint32(len(routeIDs))
+				}
+			}
+			if _, ok := rateIDs[principal.Rate]; !ok {
+				rateIDs[principal.Rate] = uint32(len(rateIDs))
+			}
+		}
+		for _, profile := range scope.MCPProfiles {
+			builder.stringID(profile.Path)
+			canonicalTools := canonicalToolset(profile.Tools)
+			for _, tool := range canonicalTools {
+				if _, ok := mcpServerIDs[tool.Server]; !ok {
+					return nil, fmt.Errorf("mcp profile %q references unknown server %q", profile.Path, tool.Server)
+				}
+				builder.stringID(tool.ExposedName)
+				builder.stringID(tool.Tool)
+				builder.stringID(tool.SecretRef)
+				builder.stringID(tool.AuthType)
+			}
+			key := toolsetKey(canonicalTools)
+			if _, ok := toolsetIDs[key]; !ok {
+				toolsetIDs[key] = uint32(len(toolsets))
+				toolsets = append(toolsets, canonicalTools)
+			}
+		}
+	}
+
+	var out bytes.Buffer
+	out.Grow(headerSize + len(input.Scopes)*scopeLen)
+	out.Write(make([]byte, headerSize))
+
+	stringsOff := uint32(out.Len())
+	writeStrings(&out, builder.strings)
+	providersOff := uint32(out.Len())
+	writeProviders(&out, builder, providers)
+	modelsOff := uint32(out.Len())
+	writeModels(&out, builder, models, providerIDs)
+	routesOff := uint32(out.Len())
+	writeRoutes(&out, builder, routeIDs, providerIDs, modelIDs)
+	ratesOff := uint32(out.Len())
+	writeRates(&out, builder, rateIDs)
+	mcpServersOff := uint32(out.Len())
+	writeMCPServers(&out, builder, mcpServers)
+	mcpToolsetsOff := uint32(out.Len())
+	writeMCPToolsets(&out, builder, toolsets, mcpServerIDs)
+	scopesOff := uint32(out.Len())
+	principalsOff, mcpPathsOff := writeScopes(&out, builder, input.Scopes, routeIDs, rateIDs, toolsetIDs)
+
+	blob := out.Bytes()
+	copy(blob[headerMagicOff:headerMagicOff+4], []byte(magic))
+	put32(blob[headerVersionOff:headerVersionOff+4], versionV1)
+	put32(blob[headerStringsOff:headerStringsOff+4], stringsOff)
+	put32(blob[headerProvidersOff:headerProvidersOff+4], providersOff)
+	put32(blob[headerModelsOff:headerModelsOff+4], modelsOff)
+	put32(blob[headerRoutesOff:headerRoutesOff+4], routesOff)
+	put32(blob[headerRatesOff:headerRatesOff+4], ratesOff)
+	put32(blob[headerMCPServersOff:headerMCPServersOff+4], mcpServersOff)
+	put32(blob[headerMCPToolsetsOff:headerMCPToolsetsOff+4], mcpToolsetsOff)
+	put32(blob[headerScopesOff:headerScopesOff+4], scopesOff)
+	put32(blob[headerPrincipalsOff:headerPrincipalsOff+4], principalsOff)
+	put32(blob[headerMCPPathsOff:headerMCPPathsOff+4], mcpPathsOff)
+	binary.LittleEndian.PutUint64(blob[headerChecksumOff:headerChecksumOff+8], checksum(blob[headerSize:]))
+	return blob, nil
+}
+
+// Open validates a pack blob and returns an immutable Reader over the same byte
+// slice. The caller must keep blob alive and must not mutate it while any Reader
+// is in use.
+//
+// Open checks the magic header, format version, checksum, and section offsets. It
+// does not validate an external envelope; use OpenWithManifest for delivered
+// bundles that carry manifest metadata.
+func Open(blob []byte) (Reader, error) {
+	if len(blob) < headerSize || string(blob[headerMagicOff:headerMagicOff+4]) != magic {
+		return Reader{}, errors.New("invalid pack header")
+	}
+	if u32(blob[headerVersionOff:headerVersionOff+4]) != versionV1 {
+		return Reader{}, fmt.Errorf("unsupported pack version %d", u32(blob[headerVersionOff:headerVersionOff+4]))
+	}
+	wantChecksum := binary.LittleEndian.Uint64(blob[headerChecksumOff : headerChecksumOff+8])
+	if gotChecksum := checksum(blob[headerSize:]); gotChecksum != wantChecksum {
+		return Reader{}, fmt.Errorf("pack checksum mismatch")
+	}
+	reader := Reader{
+		blob:           blob,
+		stringsOff:     u32(blob[headerStringsOff : headerStringsOff+4]),
+		providersOff:   u32(blob[headerProvidersOff : headerProvidersOff+4]),
+		modelsOff:      u32(blob[headerModelsOff : headerModelsOff+4]),
+		routesOff:      u32(blob[headerRoutesOff : headerRoutesOff+4]),
+		ratesOff:       u32(blob[headerRatesOff : headerRatesOff+4]),
+		mcpServersOff:  u32(blob[headerMCPServersOff : headerMCPServersOff+4]),
+		mcpToolsetsOff: u32(blob[headerMCPToolsetsOff : headerMCPToolsetsOff+4]),
+		scopesOff:      u32(blob[headerScopesOff : headerScopesOff+4]),
+		principalsOff:  u32(blob[headerPrincipalsOff : headerPrincipalsOff+4]),
+		mcpPathsOff:    u32(blob[headerMCPPathsOff : headerMCPPathsOff+4]),
+	}
+	if err := reader.validateOffsets(); err != nil {
+		return Reader{}, err
+	}
+	return reader, nil
+}
+
+// BuildWithManifest builds a pack blob and returns the metadata needed to
+// validate that exact blob before opening it in an enforcement point.
+func BuildWithManifest(input Input) ([]byte, Manifest, error) {
+	blob, err := Build(input)
+	if err != nil {
+		return nil, Manifest{}, err
+	}
+	manifest, err := ReadManifest(blob)
+	if err != nil {
+		return nil, Manifest{}, err
+	}
+	return blob, manifest, nil
+}
+
+// ReadManifest extracts the self-describing metadata from a complete pack blob.
+// It reads only the pack header and does not perform a full Open validation.
+func ReadManifest(blob []byte) (Manifest, error) {
+	if len(blob) < headerSize || string(blob[headerMagicOff:headerMagicOff+4]) != magic {
+		return Manifest{}, errors.New("invalid pack header")
+	}
+	return Manifest{
+		FormatVersion: u32(blob[headerVersionOff : headerVersionOff+4]),
+		Checksum:      binary.LittleEndian.Uint64(blob[headerChecksumOff : headerChecksumOff+8]),
+		SizeBytes:     uint64(len(blob)),
+	}, nil
+}
+
+// OpenWithManifest validates externally delivered manifest metadata before
+// opening the blob itself. This mirrors the enforcement-point load path where the
+// control plane sends both the compact content and an envelope describing it.
+func OpenWithManifest(blob []byte, manifest Manifest) (Reader, error) {
+	if err := ValidateManifest(blob, manifest); err != nil {
+		return Reader{}, err
+	}
+	return Open(blob)
+}
+
+// ValidateManifest checks whether manifest describes blob. It verifies the pack
+// format version, byte size, and checksum over the content after the fixed
+// header. It does not validate table offsets; Open performs that structural
+// validation.
+func ValidateManifest(blob []byte, manifest Manifest) error {
+	if manifest.FormatVersion != versionV1 {
+		return fmt.Errorf("unsupported manifest pack version %d", manifest.FormatVersion)
+	}
+	if manifest.SizeBytes != uint64(len(blob)) {
+		return fmt.Errorf("manifest size mismatch: manifest=%d blob=%d", manifest.SizeBytes, len(blob))
+	}
+	if len(blob) < headerSize {
+		return errors.New("invalid pack header")
+	}
+	if got := checksum(blob[headerSize:]); got != manifest.Checksum {
+		return fmt.Errorf("manifest checksum mismatch")
+	}
+	return nil
+}
+
+// ResolveLLMIDs resolves an LLM request to integer IDs into pack tables.
+//
+// scopeID identifies the enforcement scope, principalSlug is the verified
+// principal produced by an external verifier, and modelID is the requested model
+// from the LLM request body. The returned IDs can be dereferenced with String or
+// used directly by a caller that interns provider/model/secret tables elsewhere.
+//
+// The boolean is false when the scope, principal/model route, or requested model
+// is not present in the pack.
+func (r Reader) ResolveLLMIDs(scopeID string, principalSlug string, modelID string) (LLMIDs, bool) {
+	scopeIndex, ok := r.findScope(scopeID)
+	if !ok {
+		return LLMIDs{}, false
+	}
+	principal, ok := r.findPrincipal(scopeIndex, principalSlug, modelID)
+	if !ok {
+		return LLMIDs{}, false
+	}
+	route := r.route(principal.routeID)
+	if _, ok := r.findModel(modelID); !ok {
+		return LLMIDs{}, false
+	}
+	provider := r.provider(route.providerID)
+	model := r.model(route.modelID)
+	secretSID := route.secretSID
+	if r.stringEqual(secretSID, "") {
+		secretSID = provider.secretSID
+	}
+	return LLMIDs{
+		PrincipalSID: principal.slugSID,
+		ProviderID:   route.providerID,
+		ProviderSID:  provider.idSID,
+		KindSID:      provider.kindSID,
+		EndpointSID:  provider.endpointSID,
+		ModelID:      route.modelID,
+		ModelSID:     model.idSID,
+		ModelNameSID: model.nameSID,
+		SecretSID:    secretSID,
+		RouteID:      principal.routeID,
+		RateID:       principal.rateID,
+		Rate:         r.rateIDs(principal.rateID),
+	}, true
+}
+
+// ResolveLLM resolves an LLM request and materializes the result as strings. It
+// is easier to inspect than ResolveLLMIDs but allocates for string results and is
+// therefore better suited to diagnostics, tests, and CLIs than the hot path.
+func (r Reader) ResolveLLM(scopeID string, principalSlug string, modelID string) (LLMResult, bool) {
+	ids, ok := r.ResolveLLMIDs(scopeID, principalSlug, modelID)
+	if !ok {
+		return LLMResult{}, false
+	}
+	return LLMResult{
+		PrincipalSlug: principalSlug,
+		Provider:      r.String(ids.ProviderSID),
+		ProviderKind:  r.String(ids.KindSID),
+		Endpoint:      r.String(ids.EndpointSID),
+		Model:         r.String(ids.ModelSID),
+		ModelName:     r.String(ids.ModelNameSID),
+		SecretRef:     r.String(ids.SecretSID),
+		Rate: RatePolicy{
+			USDPerDayCents: ids.Rate.USDPerDayCents,
+			RPM:            ids.Rate.RPM,
+			OnExceed:       r.String(ids.Rate.OnExceedSID),
+		},
+	}, true
+}
+
+// ResolveMCPIDs resolves an MCP path suffix to the effective toolset IDs for a
+// scope. Use this when the caller needs to list or inspect the whole MCP profile.
+// Use ResolveMCPToolIDs when forwarding a single tool call.
+func (r Reader) ResolveMCPIDs(scopeID string, pathSuffix string) (MCPResultIDs, bool) {
+	scopeIndex, ok := r.findScope(scopeID)
+	if !ok {
+		return MCPResultIDs{}, false
+	}
+	path, ok := r.findMCPPath(scopeIndex, pathSuffix)
+	if !ok {
+		return MCPResultIDs{}, false
+	}
+	return MCPResultIDs{
+		PathSID:   path.pathSID,
+		ToolsetID: path.toolsetID,
+		Tools:     r.toolset(path.toolsetID),
+	}, true
+}
+
+// ResolveMCPToolIDs resolves one exposed tool name without materializing the
+// whole profile toolset. Use ResolveMCPIDs when the caller needs to list a
+// profile; use this method on the MCP forwarding path.
+func (r Reader) ResolveMCPToolIDs(scopeID string, pathSuffix string, exposedTool string) (MCPToolIDs, bool) {
+	scopeIndex, ok := r.findScope(scopeID)
+	if !ok {
+		return MCPToolIDs{}, false
+	}
+	path, ok := r.findMCPPath(scopeIndex, pathSuffix)
+	if !ok {
+		return MCPToolIDs{}, false
+	}
+	count, offset := r.toolsetRecord(path.toolsetID)
+	for i := uint32(0); i < count; i++ {
+		entryBase := int(offset) + int(i)*mcpToolBindingLen
+		exposedSID := r.read32(entryBase)
+		if !r.stringEqual(exposedSID, exposedTool) {
+			continue
+		}
+		serverID := r.read32(entryBase + 4)
+		server := r.mcpServer(serverID)
+		return MCPToolIDs{
+			ExposedNameSID:    exposedSID,
+			ServerID:          serverID,
+			ServerSID:         server.idSID,
+			ServerEndpointSID: server.endpointSID,
+			ToolSID:           r.read32(entryBase + 8),
+			SecretSID:         r.read32(entryBase + 12),
+			AuthTypeSID:       r.read32(entryBase + 16),
+		}, true
+	}
+	return MCPToolIDs{}, false
+}
+
+// ResolveMCP materializes an MCP path lookup as strings. It is intended for
+// diagnostics and control surfaces; use ResolveMCPIDs or ResolveMCPToolIDs for
+// lower-allocation data paths.
+func (r Reader) ResolveMCP(scopeID string, pathSuffix string) (MCPResult, bool) {
+	ids, ok := r.ResolveMCPIDs(scopeID, pathSuffix)
+	if !ok {
+		return MCPResult{}, false
+	}
+	tools := make([]MCPTool, 0, len(ids.Tools))
+	for _, tool := range ids.Tools {
+		tools = append(tools, MCPTool{
+			ExposedName:    r.String(tool.ExposedNameSID),
+			Server:         r.String(tool.ServerSID),
+			ServerEndpoint: r.String(tool.ServerEndpointSID),
+			Tool:           r.String(tool.ToolSID),
+			SecretRef:      r.String(tool.SecretSID),
+			AuthType:       r.String(tool.AuthTypeSID),
+		})
+	}
+	return MCPResult{
+		Path:  r.String(ids.PathSID),
+		Tools: tools,
+	}, true
+}
+
+// String returns the string-table value for id. It returns an empty string for an
+// invalid string ID, matching the internal reader behavior.
+func (r Reader) String(id uint32) string {
+	return r.string(id)
+}
+
+// BlobSize reports the number of bytes retained by this Reader.
+func (r Reader) BlobSize() int {
+	return len(r.blob)
+}
+
+// ScopeIDs returns all scope IDs stored in the pack in sorted order.
+func (r Reader) ScopeIDs() []string {
+	count := r.sectionCount(r.scopesOff)
+	base := int(r.scopesOff) + 4
+	ids := make([]string, 0, count)
+	for i := uint32(0); i < count; i++ {
+		ids = append(ids, r.string(r.read32(base+int(i)*scopeLen)))
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+// PrincipalRoutes returns inspector records for every principal/requested-model
+// route in scopeID. The boolean is false when the scope is not present.
+func (r Reader) PrincipalRoutes(scopeID string) ([]PrincipalRoute, bool) {
+	scope, ok := r.findScope(scopeID)
+	if !ok {
+		return nil, false
+	}
+	routes := make([]PrincipalRoute, 0, scope.principalCount)
+	base := int(scope.principalOffset)
+	for i := uint32(0); i < scope.principalCount; i++ {
+		entryBase := base + int(i)*principalLen
+		principal := principalRef{
+			slugSID: r.read32(entryBase + 8),
+			routeID: r.read32(entryBase + 12),
+			rateID:  r.read32(entryBase + 16),
+		}
+		route := r.route(principal.routeID)
+		provider := r.provider(route.providerID)
+		routes = append(routes, PrincipalRoute{
+			ScopeID:        scopeID,
+			PrincipalSlug:  r.string(principal.slugSID),
+			RequestedModel: r.string(r.read32(entryBase + 20)),
+			Provider:       r.string(provider.idSID),
+			Model:          r.string(r.model(route.modelID).idSID),
+			SecretRef:      r.string(route.secretSID),
+			Rate:           ratePolicyFromIDs(r, r.rateIDs(principal.rateID)),
+		})
+	}
+	sort.Slice(routes, func(i, j int) bool {
+		if routes[i].PrincipalSlug == routes[j].PrincipalSlug {
+			return routes[i].RequestedModel < routes[j].RequestedModel
+		}
+		return routes[i].PrincipalSlug < routes[j].PrincipalSlug
+	})
+	return routes, true
+}
+
+// MCPPaths returns inspector records for every MCP path in scopeID. The boolean
+// is false when the scope is not present.
+func (r Reader) MCPPaths(scopeID string) ([]MCPPath, bool) {
+	scope, ok := r.findScope(scopeID)
+	if !ok {
+		return nil, false
+	}
+	paths := make([]MCPPath, 0, scope.mcpPathCount)
+	base := int(scope.mcpPathOffset)
+	for i := uint32(0); i < scope.mcpPathCount; i++ {
+		entryBase := base + int(i)*mcpPathLen
+		path := mcpPathRef{
+			pathSID:   r.read32(entryBase + 8),
+			toolsetID: r.read32(entryBase + 12),
+		}
+		result, ok := r.ResolveMCP(scopeID, r.string(path.pathSID))
+		if !ok {
+			continue
+		}
+		paths = append(paths, MCPPath{
+			ScopeID: scopeID,
+			Path:    result.Path,
+			Tools:   result.Tools,
+		})
+	}
+	sort.Slice(paths, func(i, j int) bool {
+		return paths[i].Path < paths[j].Path
+	})
+	return paths, true
+}
+
+func ratePolicyFromIDs(r Reader, ids RatePolicyIDs) RatePolicy {
+	return RatePolicy{
+		USDPerDayCents: ids.USDPerDayCents,
+		RPM:            ids.RPM,
+		OnExceed:       r.string(ids.OnExceedSID),
+	}
+}
+
+// builder interns strings while Build walks normalized input. Binary tables store
+// uint32 string IDs instead of repeating string bytes in every record.
+type builder struct {
+	stringIndex map[string]uint32
+	strings     []string
+}
+
+func newBuilder() *builder {
+	return &builder{stringIndex: map[string]uint32{}, strings: []string{}}
+}
+
+func (b *builder) stringID(value string) uint32 {
+	if id, ok := b.stringIndex[value]; ok {
+		return id
+	}
+	id := uint32(len(b.strings))
+	b.stringIndex[value] = id
+	b.strings = append(b.strings, value)
+	return id
+}
+
+func sortedProviders(values []Provider) []Provider {
+	out := append([]Provider{}, values...)
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+func sortedModels(values []Model) []Model {
+	out := append([]Model{}, values...)
+	sort.Slice(out, func(i, j int) bool {
+		leftHash := hashString(out[i].ID)
+		rightHash := hashString(out[j].ID)
+		if leftHash == rightHash {
+			return out[i].ID < out[j].ID
+		}
+		return leftHash < rightHash
+	})
+	return out
+}
+
+func sortedMCPServers(values []MCPServer) []MCPServer {
+	out := append([]MCPServer{}, values...)
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// canonicalToolset gives semantically identical profile toolsets one stable
+// representation so Build can deduplicate them.
+func canonicalToolset(values []MCPToolBinding) []MCPToolBinding {
+	out := append([]MCPToolBinding{}, values...)
+	sort.Slice(out, func(i, j int) bool { return out[i].ExposedName < out[j].ExposedName })
+	return out
+}
+
+// principalRoutes expands the compatibility Route field into the same shape as
+// ModelRoutes. New callers should prefer ModelRoutes so each requested model can
+// have an explicit final target.
+func principalRoutes(principal Principal) map[string]RoutePlan {
+	if len(principal.ModelRoutes) > 0 {
+		return principal.ModelRoutes
+	}
+	if principal.Route.Model == "" {
+		return map[string]RoutePlan{}
+	}
+	return map[string]RoutePlan{
+		principal.Route.Model: principal.Route,
+	}
+}
+
+type principalEntry struct {
+	slug           string
+	requestedModel string
+	route          RoutePlan
+	rate           RatePolicy
+}
+
+// expandPrincipalEntries flattens principals into the fixed-width records used
+// by the scope-local principal index.
+func expandPrincipalEntries(principals []Principal) []principalEntry {
+	entries := []principalEntry{}
+	for _, principal := range principals {
+		for requestedModel, route := range principalRoutes(principal) {
+			entries = append(entries, principalEntry{
+				slug:           principal.Slug,
+				requestedModel: requestedModel,
+				route:          route,
+				rate:           principal.Rate,
+			})
+		}
+	}
+	return entries
+}
+
+// toolsetKey is a deterministic deduplication key for a canonical MCP toolset.
+// NUL separators avoid ambiguity between adjacent fields.
+func toolsetKey(values []MCPToolBinding) string {
+	var builder strings.Builder
+	for _, value := range values {
+		builder.WriteString(value.ExposedName)
+		builder.WriteByte('\x00')
+		builder.WriteString(value.Server)
+		builder.WriteByte('\x00')
+		builder.WriteString(value.Tool)
+		builder.WriteByte('\x00')
+		builder.WriteString(value.SecretRef)
+		builder.WriteByte('\x00')
+		builder.WriteString(value.AuthType)
+		builder.WriteByte('\x00')
+	}
+	return builder.String()
+}
+
+// writeStrings writes the shared string table as count, data length, offsets,
+// and contiguous string bytes. The offsets array has count+1 entries so string
+// length is derived from adjacent offsets.
+func writeStrings(out *bytes.Buffer, stringsTable []string) {
+	putU32(out, uint32(len(stringsTable)))
+	var data bytes.Buffer
+	offsets := make([]uint32, 0, len(stringsTable)+1)
+	for _, value := range stringsTable {
+		offsets = append(offsets, uint32(data.Len()))
+		data.WriteString(value)
+	}
+	offsets = append(offsets, uint32(data.Len()))
+	putU32(out, uint32(data.Len()))
+	for _, offset := range offsets {
+		putU32(out, offset)
+	}
+	out.Write(data.Bytes())
+}
+
+// writeProviders writes fixed-width provider records in provider ID order.
+func writeProviders(out *bytes.Buffer, b *builder, providers []Provider) {
+	putU32(out, uint32(len(providers)))
+	for _, provider := range providers {
+		putU32(out, b.stringID(provider.ID))
+		putU32(out, b.stringID(provider.Kind))
+		putU32(out, b.stringID(provider.Endpoint))
+		putU32(out, b.stringID(provider.SecretRef))
+	}
+}
+
+// writeModels writes fixed-width model records sorted by lookup hash. The reader
+// binary-searches this table while validating requested models.
+func writeModels(out *bytes.Buffer, b *builder, models []Model, providerIDs map[string]uint32) {
+	putU32(out, uint32(len(models)))
+	for _, model := range models {
+		putU64(out, hashString(model.ID))
+		putU32(out, b.stringID(model.ID))
+		putU32(out, providerIDs[model.Provider])
+		putU32(out, b.stringID(model.Name))
+		putU32(out, 0)
+	}
+}
+
+// writeRoutes writes deduplicated final LLM targets. Principal index records
+// reference this table by route ID.
+func writeRoutes(out *bytes.Buffer, b *builder, routeIDs map[RoutePlan]uint32, providerIDs map[string]uint32, modelIDs map[string]uint32) {
+	putU32(out, uint32(len(routeIDs)))
+	routes := make([]RoutePlan, len(routeIDs))
+	for route, id := range routeIDs {
+		routes[id] = route
+	}
+	for _, route := range routes {
+		putU32(out, providerIDs[route.Provider])
+		putU32(out, modelIDs[route.Model])
+		putU32(out, b.stringID(route.SecretRef))
+	}
+}
+
+// writeRates writes deduplicated immutable rate-limit metadata. Runtime counters
+// are intentionally outside the pack.
+func writeRates(out *bytes.Buffer, b *builder, rateIDs map[RatePolicy]uint32) {
+	putU32(out, uint32(len(rateIDs)))
+	rates := make([]RatePolicy, len(rateIDs))
+	for rate, id := range rateIDs {
+		rates[id] = rate
+	}
+	for _, rate := range rates {
+		putU64(out, rate.USDPerDayCents)
+		putU32(out, rate.RPM)
+		putU32(out, b.stringID(rate.OnExceed))
+	}
+}
+
+// writeMCPServers writes fixed-width upstream MCP server records.
+func writeMCPServers(out *bytes.Buffer, b *builder, servers []MCPServer) {
+	putU32(out, uint32(len(servers)))
+	for _, server := range servers {
+		putU32(out, b.stringID(server.ID))
+		putU32(out, b.stringID(server.Endpoint))
+		putU32(out, b.stringID(server.SecretRef))
+		putU32(out, b.stringID(server.AuthType))
+	}
+}
+
+// writeMCPToolsets writes deduplicated MCP toolsets followed by their contiguous
+// tool binding records.
+func writeMCPToolsets(out *bytes.Buffer, b *builder, toolsets [][]MCPToolBinding, serverIDs map[string]uint32) {
+	putU32(out, uint32(len(toolsets)))
+	records := make([]struct {
+		count  uint32
+		offset uint32
+	}, len(toolsets))
+	var bindings bytes.Buffer
+	baseOffset := uint32(out.Len() + len(toolsets)*mcpToolsetLen)
+	for i, toolset := range toolsets {
+		records[i].count = uint32(len(toolset))
+		records[i].offset = baseOffset + uint32(bindings.Len())
+		for _, binding := range toolset {
+			putU32(&bindings, b.stringID(binding.ExposedName))
+			putU32(&bindings, serverIDs[binding.Server])
+			putU32(&bindings, b.stringID(binding.Tool))
+			putU32(&bindings, b.stringID(binding.SecretRef))
+			putU32(&bindings, b.stringID(binding.AuthType))
+		}
+	}
+	for _, record := range records {
+		putU32(out, record.count)
+		putU32(out, record.offset)
+	}
+	out.Write(bindings.Bytes())
+}
+
+// writeScopes writes scope records plus the two scope-local indexes they point
+// at: principal/model routes and MCP path suffixes.
+func writeScopes(out *bytes.Buffer, b *builder, scopes []Scope, routeIDs map[RoutePlan]uint32, rateIDs map[RatePolicy]uint32, toolsetIDs map[string]uint32) (uint32, uint32) {
+	putU32(out, uint32(len(scopes)))
+	scopeRecords := make([]scopeRef, len(scopes))
+	var principalData bytes.Buffer
+	var mcpPathData bytes.Buffer
+	principalsOff := uint32(out.Len() + len(scopes)*scopeLen)
+
+	for i, scope := range scopes {
+		principalEntries := expandPrincipalEntries(scope.Principals)
+		sort.Slice(principalEntries, func(i, j int) bool {
+			leftHash := principalLookupHash(principalEntries[i].slug, principalEntries[i].requestedModel)
+			rightHash := principalLookupHash(principalEntries[j].slug, principalEntries[j].requestedModel)
+			if leftHash == rightHash {
+				if principalEntries[i].slug == principalEntries[j].slug {
+					return principalEntries[i].requestedModel < principalEntries[j].requestedModel
+				}
+				return principalEntries[i].slug < principalEntries[j].slug
+			}
+			return leftHash < rightHash
+		})
+		scopeRecords[i] = scopeRef{
+			sid:             b.stringID(scope.ID),
+			principalCount:  uint32(len(principalEntries)),
+			principalOffset: principalsOff + uint32(principalData.Len()),
+		}
+		for _, principal := range principalEntries {
+			putU64(&principalData, principalLookupHash(principal.slug, principal.requestedModel))
+			putU32(&principalData, b.stringID(principal.slug))
+			putU32(&principalData, routeIDs[principal.route])
+			putU32(&principalData, rateIDs[principal.rate])
+			putU32(&principalData, b.stringID(principal.requestedModel))
+		}
+	}
+
+	mcpPathsOff := principalsOff + uint32(principalData.Len())
+	for i, scope := range scopes {
+		profiles := append([]MCPProfile{}, scope.MCPProfiles...)
+		sort.Slice(profiles, func(i, j int) bool {
+			leftHash := hashString(profiles[i].Path)
+			rightHash := hashString(profiles[j].Path)
+			if leftHash == rightHash {
+				return profiles[i].Path < profiles[j].Path
+			}
+			return leftHash < rightHash
+		})
+		scopeRecords[i].mcpPathCount = uint32(len(profiles))
+		scopeRecords[i].mcpPathOffset = mcpPathsOff + uint32(mcpPathData.Len())
+		for _, profile := range profiles {
+			putU64(&mcpPathData, hashString(profile.Path))
+			putU32(&mcpPathData, b.stringID(profile.Path))
+			putU32(&mcpPathData, toolsetIDs[toolsetKey(canonicalToolset(profile.Tools))])
+		}
+	}
+
+	for _, record := range scopeRecords {
+		putU32(out, record.sid)
+		putU32(out, record.principalCount)
+		putU32(out, record.principalOffset)
+		putU32(out, record.mcpPathCount)
+		putU32(out, record.mcpPathOffset)
+	}
+	out.Write(principalData.Bytes())
+	out.Write(mcpPathData.Bytes())
+	return principalsOff, mcpPathsOff
+}
+
+type scopeRef struct {
+	sid             uint32
+	principalCount  uint32
+	principalOffset uint32
+	mcpPathCount    uint32
+	mcpPathOffset   uint32
+}
+
+type principalRef struct {
+	slugSID uint32
+	routeID uint32
+	rateID  uint32
+}
+
+type mcpPathRef struct {
+	pathSID   uint32
+	toolsetID uint32
+}
+
+type modelRef struct {
+	idSID      uint32
+	providerID uint32
+	nameSID    uint32
+}
+
+type providerRef struct {
+	idSID       uint32
+	kindSID     uint32
+	endpointSID uint32
+	secretSID   uint32
+}
+
+type routeRef struct {
+	providerID uint32
+	modelID    uint32
+	secretSID  uint32
+}
+
+func (r Reader) findScope(scopeID string) (scopeRef, bool) {
+	count := r.sectionCount(r.scopesOff)
+	base := int(r.scopesOff) + 4
+	for i := uint32(0); i < count; i++ {
+		ref := scopeRef{
+			sid:             r.read32(base + int(i)*scopeLen),
+			principalCount:  r.read32(base + int(i)*scopeLen + 4),
+			principalOffset: r.read32(base + int(i)*scopeLen + 8),
+			mcpPathCount:    r.read32(base + int(i)*scopeLen + 12),
+			mcpPathOffset:   r.read32(base + int(i)*scopeLen + 16),
+		}
+		if r.stringEqual(ref.sid, scopeID) {
+			return ref, true
+		}
+	}
+	return scopeRef{}, false
+}
+
+func (r Reader) findPrincipal(scope scopeRef, slug string, requestedModel string) (principalRef, bool) {
+	targetHash := principalLookupHash(slug, requestedModel)
+	base := int(scope.principalOffset)
+	index := sort.Search(int(scope.principalCount), func(i int) bool {
+		return r.read64(base+i*principalLen) >= targetHash
+	})
+	for i := index; i < int(scope.principalCount); i++ {
+		entryBase := base + i*principalLen
+		hash := r.read64(entryBase)
+		if hash != targetHash {
+			break
+		}
+		sid := r.read32(entryBase + 8)
+		requestedModelID := r.read32(entryBase + 20)
+		if r.stringEqual(sid, slug) && r.stringEqual(requestedModelID, requestedModel) {
+			return principalRef{
+				slugSID: sid,
+				routeID: r.read32(entryBase + 12),
+				rateID:  r.read32(entryBase + 16),
+			}, true
+		}
+	}
+	return principalRef{}, false
+}
+
+func (r Reader) findMCPPath(scope scopeRef, path string) (mcpPathRef, bool) {
+	targetHash := hashString(path)
+	base := int(scope.mcpPathOffset)
+	index := sort.Search(int(scope.mcpPathCount), func(i int) bool {
+		return r.read64(base+i*mcpPathLen) >= targetHash
+	})
+	for i := index; i < int(scope.mcpPathCount); i++ {
+		entryBase := base + i*mcpPathLen
+		hash := r.read64(entryBase)
+		if hash != targetHash {
+			break
+		}
+		sid := r.read32(entryBase + 8)
+		if r.stringEqual(sid, path) {
+			return mcpPathRef{
+				pathSID:   sid,
+				toolsetID: r.read32(entryBase + 12),
+			}, true
+		}
+	}
+	return mcpPathRef{}, false
+}
+
+func (r Reader) findModel(modelID string) (uint32, bool) {
+	targetHash := hashString(modelID)
+	count := r.sectionCount(r.modelsOff)
+	base := int(r.modelsOff) + 4
+	index := sort.Search(int(count), func(i int) bool {
+		return r.read64(base+i*modelLen) >= targetHash
+	})
+	for i := index; i < int(count); i++ {
+		entryBase := base + i*modelLen
+		hash := r.read64(entryBase)
+		if hash != targetHash {
+			break
+		}
+		if r.stringEqual(r.read32(entryBase+8), modelID) {
+			return uint32(i), true
+		}
+	}
+	return 0, false
+}
+
+func (r Reader) model(id uint32) modelRef {
+	base := int(r.modelsOff) + 4 + int(id)*modelLen
+	return modelRef{
+		idSID:      r.read32(base + 8),
+		providerID: r.read32(base + 12),
+		nameSID:    r.read32(base + 16),
+	}
+}
+
+func (r Reader) provider(id uint32) providerRef {
+	base := int(r.providersOff) + 4 + int(id)*providerLen
+	return providerRef{
+		idSID:       r.read32(base),
+		kindSID:     r.read32(base + 4),
+		endpointSID: r.read32(base + 8),
+		secretSID:   r.read32(base + 12),
+	}
+}
+
+func (r Reader) route(id uint32) routeRef {
+	base := int(r.routesOff) + 4 + int(id)*routeLen
+	return routeRef{
+		providerID: r.read32(base),
+		modelID:    r.read32(base + 4),
+		secretSID:  r.read32(base + 8),
+	}
+}
+
+func (r Reader) rateIDs(id uint32) RatePolicyIDs {
+	base := int(r.ratesOff) + 4 + int(id)*rateLen
+	return RatePolicyIDs{
+		USDPerDayCents: r.read64(base),
+		RPM:            r.read32(base + 8),
+		OnExceedSID:    r.read32(base + 12),
+	}
+}
+
+func (r Reader) toolset(id uint32) []MCPToolIDs {
+	count, offset := r.toolsetRecord(id)
+	tools := make([]MCPToolIDs, 0, count)
+	for i := uint32(0); i < count; i++ {
+		entryBase := int(offset) + int(i)*mcpToolBindingLen
+		serverID := r.read32(entryBase + 4)
+		server := r.mcpServer(serverID)
+		tools = append(tools, MCPToolIDs{
+			ExposedNameSID:    r.read32(entryBase),
+			ServerID:          serverID,
+			ServerSID:         server.idSID,
+			ServerEndpointSID: server.endpointSID,
+			ToolSID:           r.read32(entryBase + 8),
+			SecretSID:         r.read32(entryBase + 12),
+			AuthTypeSID:       r.read32(entryBase + 16),
+		})
+	}
+	return tools
+}
+
+func (r Reader) toolsetRecord(id uint32) (uint32, uint32) {
+	base := int(r.mcpToolsetsOff) + 4 + int(id)*mcpToolsetLen
+	return r.read32(base), r.read32(base + 4)
+}
+
+func (r Reader) mcpServer(id uint32) struct {
+	idSID       uint32
+	endpointSID uint32
+	secretSID   uint32
+	authTypeSID uint32
+} {
+	base := int(r.mcpServersOff) + 4 + int(id)*mcpServerLen
+	return struct {
+		idSID       uint32
+		endpointSID uint32
+		secretSID   uint32
+		authTypeSID uint32
+	}{
+		idSID:       r.read32(base),
+		endpointSID: r.read32(base + 4),
+		secretSID:   r.read32(base + 8),
+		authTypeSID: r.read32(base + 12),
+	}
+}
+
+func (r Reader) string(id uint32) string {
+	start, end, ok := r.stringBounds(id)
+	if !ok {
+		return ""
+	}
+	return string(r.blob[start:end])
+}
+
+func (r Reader) stringEqual(id uint32, value string) bool {
+	start, end, ok := r.stringBounds(id)
+	if !ok {
+		return false
+	}
+	if end-start != len(value) {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		if r.blob[start+i] != value[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func (r Reader) stringBounds(id uint32) (int, int, bool) {
+	base := int(r.stringsOff)
+	count := r.read32(base)
+	dataLen := r.read32(base + 4)
+	if id >= count {
+		return 0, 0, false
+	}
+	offsetBase := base + 8
+	start := r.read32(offsetBase + int(id)*4)
+	end := r.read32(offsetBase + int(id+1)*4)
+	dataBase := offsetBase + int(count+1)*4
+	if end > dataLen || start > end {
+		return 0, 0, false
+	}
+	return dataBase + int(start), dataBase + int(end), true
+}
+
+func (r Reader) sectionCount(offset uint32) uint32 {
+	return r.read32(int(offset))
+}
+
+func (r Reader) read32(offset int) uint32 {
+	if offset < 0 || offset+4 > len(r.blob) {
+		return 0
+	}
+	return binary.LittleEndian.Uint32(r.blob[offset : offset+4])
+}
+
+func (r Reader) read64(offset int) uint64 {
+	if offset < 0 || offset+8 > len(r.blob) {
+		return 0
+	}
+	return binary.LittleEndian.Uint64(r.blob[offset : offset+8])
+}
+
+func (r Reader) validateOffsets() error {
+	offsets := []uint32{
+		r.stringsOff,
+		r.providersOff,
+		r.modelsOff,
+		r.routesOff,
+		r.ratesOff,
+		r.mcpServersOff,
+		r.mcpToolsetsOff,
+		r.scopesOff,
+		r.principalsOff,
+		r.mcpPathsOff,
+	}
+	for _, offset := range offsets {
+		if int(offset) < headerSize || int(offset) >= len(r.blob) {
+			return fmt.Errorf("invalid pack offset %d", offset)
+		}
+	}
+	return nil
+}
+
+func hashString(value string) uint64 {
+	var hash uint64 = 14695981039346656037
+	for i := 0; i < len(value); i++ {
+		hash ^= uint64(value[i])
+		hash *= 1099511628211
+	}
+	return hash
+}
+
+func principalLookupHash(slug string, requestedModel string) uint64 {
+	var hash uint64 = 14695981039346656037
+	for i := 0; i < len(slug); i++ {
+		hash ^= uint64(slug[i])
+		hash *= 1099511628211
+	}
+	hash ^= 0
+	hash *= 1099511628211
+	for i := 0; i < len(requestedModel); i++ {
+		hash ^= uint64(requestedModel[i])
+		hash *= 1099511628211
+	}
+	return hash
+}
+
+func checksum(data []byte) uint64 {
+	var hash uint64 = 14695981039346656037
+	for _, value := range data {
+		hash ^= uint64(value)
+		hash *= 1099511628211
+	}
+	return hash
+}
+
+func putU32(out *bytes.Buffer, value uint32) {
+	var buf [4]byte
+	put32(buf[:], value)
+	out.Write(buf[:])
+}
+
+func putU64(out *bytes.Buffer, value uint64) {
+	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], value)
+	out.Write(buf[:])
+}
+
+func put32(dst []byte, value uint32) {
+	binary.LittleEndian.PutUint32(dst, value)
+}
+
+func u32(src []byte) uint32 {
+	return binary.LittleEndian.Uint32(src)
+}
