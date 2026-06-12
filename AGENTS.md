@@ -62,13 +62,25 @@ name.
 - Keep persisted delivery format bundle-based; do not add JSON snapshots as a
   parallel runtime contract.
 - Preserve the hot-path ID-returning APIs:
+  - `ResolveLLMPlanIDs`
   - `ResolveLLMIDs`
   - `ResolveMCPIDs`
+  - `ResolveMCPInitializeIDs`
   - `ResolveMCPToolIDs`
 - Keep string-materializing APIs and inspector APIs available for diagnostics:
+  - `ResolveLLMPlan`
   - `ResolveLLM`
+  - `ResolveProvider`
+  - `Providers`
+  - `ResolveModel`
+  - `Models`
+  - `ModelCapability`
+  - `V1ModelsJSON`
+  - `V1ModelsJSONForProvider`
   - `ResolveMCP`
+  - `ResolveMCPInitialize`
   - `ScopeIDs`
+  - `Principals`
   - `PrincipalRoutes`
   - `MCPPaths`
 - Store secret refs only. Never store secret material in the pack.
@@ -100,6 +112,7 @@ The example transformer is allowed to:
 - select workspace or project scope
 - fan a project selection out to workspace scopes
 - resolve keys/users/tags/profiles from fixture data
+- load seed-style model/provider catalogs and MCP catalogs from testdata
 - produce `cherry.Input`
 
 The root package should only see normalized `cherry.Input`.
@@ -111,6 +124,32 @@ The root package should only see normalized `cherry.Input`.
 - Do not put example-specific command walkthroughs back into the root README.
 - Keep exported root symbols documented with godoc comments.
 
+## Code Quality
+
+Use the repository-pinned `golangci-lint` v2 tool through `go run`; do not
+assume a globally installed binary is available. The Makefile wraps the pinned
+command:
+
+```sh
+make fmt
+make lint
+make lint-fix
+make lint-config
+```
+
+The equivalent direct command is:
+
+```sh
+go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 run ./...
+```
+
+Formatting is owned by `golangci-lint fmt` with `gofmt` and `gci`. Keep imports
+in this order:
+
+1. standard library
+2. external dependencies
+3. `github.com/dio/cherry` module imports
+
 ## Testing
 
 Run before finishing changes:
@@ -119,13 +158,21 @@ Run before finishing changes:
 go test ./...
 ```
 
+For code quality checks, also run:
+
+```sh
+make fmt
+make lint
+```
+
 For behavior smoke checks:
 
 ```sh
 go run ./example
 go run ./example pack project project1 example/source/testdata/example_fixture.yaml /tmp/project1.cherry.zst
-printf 'use workspace1\nllm slug:project1 claude-haiku-4-5\nmcp profile-dev-tools github__list-repos\nquit\n' \
+printf 'use workspace1\nllm slug:project1 claude-haiku-4-5\nmcp initialize profile-kiwi-and-github\nmcp call profile-kiwi-and-github github__list-repos\nquit\n' \
   | go run ./example repl /tmp/project1.cherry.zst
+go run ./example pack --models example/source/testdata/catalogs/models.json --providers example/source/testdata/catalogs/providers.json --mcp-catalog example/source/testdata/catalogs/mcp-catalog-data-with-tools.json project project1 example/source/testdata/example_fixture.yaml /tmp/project1-catalogs.cherry.zst
 ```
 
 For performance checks:
@@ -139,8 +186,10 @@ Use focused tests for:
 
 - manifest/checksum/version validation
 - LLM ID resolution
+- MCP initialize server resolution
 - MCP tool ID resolution
 - inspector enumeration
+- model catalog loading, capability lookup, and `/v1/models` projection
 - project fanout and workspace isolation in the example transformer
 - auth/secret-ref behavior for MCP profile bindings
 

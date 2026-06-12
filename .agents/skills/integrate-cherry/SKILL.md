@@ -38,9 +38,11 @@ encoded bytes in the EP path.
    - `cherry.MCPServer`
    - `cherry.Principal`
    - `cherry.MCPProfile`
-5. Prefer `Principal.ModelRoutes`; each requested model should point to the final selected `RoutePlan`.
-6. Put effective MCP auth and secret refs on `MCPToolBinding`.
-7. Build and encode:
+5. Preserve model catalog fields needed by the EP, such as pricing, limits, and
+   capabilities, in `cherry.Model.MetadataJSON` and `cherry.Model.Capabilities`.
+6. Prefer `Principal.ModelRoutes`; each requested model should point to the compiled `RoutePlan`, which may be a target, chain, or split.
+7. Provide enough MCP profile/server data for Cherry to answer initialize, list, and call routing.
+8. Build and encode:
 
    ```go
    blob, manifest, err := cherry.BuildWithManifest(input)
@@ -75,7 +77,7 @@ encoded bytes in the EP path.
 5. For LLM requests, run key/JWT verification before Cherry and pass the resulting principal slug:
 
    ```go
-   ids, ok := reader.ResolveLLMIDs(scopeID, principalSlug, requestedModel)
+   plan, ok := reader.ResolveLLMPlanIDs(scopeID, principalSlug, requestedModel)
    if !ok {
        return reject()
    }
@@ -90,12 +92,31 @@ encoded bytes in the EP path.
    }
    ```
 
-7. Materialize strings only when needed:
+7. For MCP initialize, resolve the upstream server set:
+
+   ```go
+   init, ok := reader.ResolveMCPInitializeIDs(scopeID, pathSuffix)
+   if !ok {
+       return reject()
+   }
+   ```
+
+8. Materialize strings only when needed:
 
    ```go
    provider := reader.String(ids.ProviderSID)
    secretRef := reader.String(ids.SecretSID)
    upstreamTool := reader.String(tool.ToolSID)
+   ```
+
+9. For model catalog queries, use the loaded reader directly:
+
+   ```go
+   providers := reader.Providers()
+   supportsImages := reader.ModelCapability(modelID, "image_generation")
+   model, ok := reader.ResolveModel(modelID)
+   modelsJSON, err := reader.V1ModelsJSON()
+   providerModelsJSON, err := reader.V1ModelsJSONForProvider(providerID)
    ```
 
 ## Rules Of Thumb
@@ -105,6 +126,10 @@ encoded bytes in the EP path.
 - Do not store secret values; store secret refs.
 - Do not keep stale hot-cache entries across generation swaps.
 - Use ID-returning APIs on the hot path and inspector APIs for diagnostics.
+- Use `ResolveMCPInitializeIDs` for MCP initialize, `ResolveMCPIDs` for tools/list, and `ResolveMCPToolIDs` for tools/call.
+- Use `Providers`, `ResolveModel`, `ModelCapability`, `V1ModelsJSON`, and
+  `V1ModelsJSONForProvider` for provider/model catalog inspection and
+  compatibility endpoints.
 - Keep bundle preparation and EP consumption tests connected by real encoded bytes when possible.
 
 ## Validation Checklist
@@ -115,7 +140,7 @@ Producer:
 - workspace-level principals appear only in their workspace scope
 - keys do not leak across projects
 - final model routes reflect external rule precedence before calling Cherry
-- MCP auth overrides appear in `MCPToolBinding`
+- MCP initialize returns every upstream server behind a path with auth and secret refs
 - `BuildWithManifest` rejects unknown provider/model/server references
 
 Consumer:
@@ -124,7 +149,7 @@ Consumer:
 - unsupported versions fail to open
 - missing scope/principal/model/tool rejects
 - LLM route returns expected provider/model/secret ref
-- MCP route returns expected upstream server/tool/auth/secret ref
+- MCP initialize/list/call return expected upstream server/tool/auth/secret ref
 - generation swap clears or invalidates any wrapper cache
 
 ## Reference

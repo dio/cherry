@@ -15,7 +15,14 @@ input := cherry.Input{
         {ID: "openai", Kind: "openai", Endpoint: "https://api.openai.com", SecretRef: "env://OPENAI_API_KEY"},
     },
     Models: []cherry.Model{
-        {ID: "gpt-4o-mini", Provider: "openai", Name: "gpt-4o-mini"},
+        {
+            ID:           "gpt-4o-mini",
+            Provider:     "openai",
+            Name:         "gpt-4o-mini",
+            Mode:         "chat",
+            Capabilities: []string{"vision", "tool_choice"},
+            MetadataJSON: `{"model":"gpt-4o-mini","inputTokensPricePerMillion":"0.15","capabilities":["vision","tool_choice"]}`,
+        },
     },
     MCPServers: []cherry.MCPServer{
         {ID: "github", Endpoint: "https://api.github.com", AuthType: "bearer", SecretRef: "env://GITHUB_TOKEN"},
@@ -95,20 +102,51 @@ reader := opened.Reader
 For project bundles, choose a concrete enforcement scope from
 `opened.Metadata.Scopes` before querying.
 
-## Consumer: LLM Query
+## Consumer: MCP Initialize
 
 ```go
-ids, ok := reader.ResolveLLMIDs("workspace1", "slug:project1", "gpt-4o-mini")
+init, ok := reader.ResolveMCPInitialize("workspace1", "profile-dev-tools")
 if !ok {
     return reject()
 }
 
-provider := reader.String(ids.ProviderSID)
-model := reader.String(ids.ModelSID)
-secretRef := reader.String(ids.SecretSID)
+for _, server := range init.Servers {
+    endpoint := server.Endpoint
+    authType := server.AuthType
+    secretRef := server.SecretRef
+}
+```
+
+Use this for MCP `initialize`. It returns every upstream server needed by the path.
+
+## Consumer: LLM Query
+
+```go
+plan, ok := reader.ResolveLLMPlanIDs("workspace1", "slug:project1", "gpt-4o-mini")
+if !ok {
+    return reject()
+}
+
+// plan.Plan is target, chain, or split. Use reader.String on target node IDs
+// only when provider, model, endpoint, or secret-ref strings are needed.
 ```
 
 The principal slug should come from a verifier outside Cherry.
+
+## Consumer: Model Catalog Query
+
+```go
+providers := reader.Providers()
+model, ok := reader.ResolveModel("gpt-4o-mini")
+supportsImages := reader.ModelCapability("gpt-5", "image_generation")
+payload, err := reader.V1ModelsJSON()
+openAIModels, err := reader.V1ModelsJSONForProvider("openai")
+```
+
+The producer should normalize external model catalogs into `cherry.Model` rows.
+Keep catalog details needed by the EP, such as pricing and limits, in
+`MetadataJSON`; Cherry packs that metadata and derives `/v1/models` projection
+fields from it.
 
 ## Consumer: MCP Query
 

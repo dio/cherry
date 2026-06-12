@@ -36,8 +36,8 @@ delivery.
 
 The producer is the control-plane-side code that owns source selection and turns
 already-normalized external records into `cherry.Input`. It decides which scopes
-belong in the bundle, which principal slugs are valid in each scope, and which
-final LLM/MCP policies have already won after rule merge.
+belong in the bundle and which principal slugs, models, MCP servers, and MCP
+profiles are valid in each scope.
 
 Cherry expects that work to be done before `BuildWithManifest`:
 
@@ -65,9 +65,12 @@ input := cherry.Input{
     },
     Models: []cherry.Model{
         {
-            ID:       "gpt-4o-mini",
-            Provider: "openai",
-            Name:     "gpt-4o-mini",
+            ID:           "gpt-4o-mini",
+            Provider:     "openai",
+            Name:         "gpt-4o-mini",
+            Mode:         "chat",
+            Capabilities: []string{"vision", "tool_choice"},
+            MetadataJSON: `{"model":"gpt-4o-mini","inputTokensPricePerMillion":"0.15","capabilities":["vision","tool_choice"]}`,
         },
     },
     MCPServers: []cherry.MCPServer{
@@ -138,6 +141,12 @@ if err != nil {
 The resulting `bundleBytes` are what the control plane stores or serves to an
 enforcement point.
 
+Model catalog records can carry opaque normalized metadata. A producer can read
+its raw model catalog, keep pricing, limits, modalities, and capabilities in
+`Model.MetadataJSON`, and pass selected capability names in `Model.Capabilities`.
+Cherry validates and packs that data but does not define the source catalog
+schema.
+
 ## Enforcement Point Consumption
 
 The enforcement point fetches bytes from the control plane, opens the bundle, and
@@ -157,18 +166,22 @@ if err != nil {
 reader := opened.Reader
 ```
 
-LLM request resolution after an external verifier has produced a principal slug:
+LLM request resolution after an external verifier has produced a principal slug.
+Use `ResolveLLMPlanIDs` when the enforcement point needs to execute fallback
+chains or weighted splits:
 
 ```go
-ids, ok := reader.ResolveLLMIDs("workspace1", "slug:project1", "claude-haiku-4-5")
+plan, ok := reader.ResolveLLMPlanIDs("workspace1", "slug:project1", "claude-haiku-4-5")
 if !ok {
     // reject: no route for this scope, principal, and requested model
 }
 
-provider := reader.String(ids.ProviderSID)
-targetModel := reader.String(ids.ModelSID)
-secretRef := reader.String(ids.SecretSID)
+// plan.Plan is target, chain, or split. Target children contain provider,
+// model, endpoint, and effective secret-ref IDs.
 ```
+
+`ResolveLLMIDs` remains available for callers that only need the first
+executable target from the compiled route tree.
 
 MCP tool resolution:
 
@@ -184,13 +197,44 @@ authType := reader.String(tool.AuthTypeSID)
 secretRef := reader.String(tool.SecretSID)
 ```
 
+MCP initialize resolution:
+
+```go
+init, ok := reader.ResolveMCPInitialize("workspace1", "profile-dev-tools")
+if !ok {
+    // reject: no MCP path for this scope
+}
+
+for _, server := range init.Servers {
+    connect(server.Endpoint, server.AuthType, server.SecretRef)
+}
+```
+
 For diagnostics and admin surfaces, the reader also exposes inspector methods:
 
 ```go
 scopes := reader.ScopeIDs()
+llmPrincipals, ok := reader.Principals("workspace1")
 principals, ok := reader.PrincipalRoutes("workspace1")
 mcpPaths, ok := reader.MCPPaths("workspace1")
 ```
+
+Model catalog queries are available from the same loaded bundle:
+
+```go
+model, ok := reader.ResolveModel("gpt-4o-mini")
+supportsImages := reader.ModelCapability("gpt-5", "image_generation")
+providers := reader.Providers()
+modelsJSON, err := reader.V1ModelsJSON()
+openAIModelsJSON, err := reader.V1ModelsJSONForProvider("openai")
+```
+
+`V1ModelsJSON` renders the packed catalog in a `/v1/models` response shape while
+preserving pricing and capability-derived fields from the normalized metadata.
+
+The example directory includes fixture loaders for seed-style model/provider
+catalogs and MCP catalogs. Those loaders are example producer code, not root
+package schema contracts.
 
 ## Boundary
 
