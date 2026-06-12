@@ -4,48 +4,37 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestReaderResolveLLM(t *testing.T) {
 	input := testPackInput(2, 3)
 	blob, err := Build(input)
-	if err != nil {
-		t.Fatalf("Build() error = %v", err)
-	}
+	require.NoError(t, err)
 	reader, err := Open(blob)
-	if err != nil {
-		t.Fatalf("Open() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	got, ok := reader.ResolveLLM("workspace2", "slug:2:3", "gpt-4o-mini")
-	if !ok {
-		t.Fatal("ResolveLLM() ok = false, want true")
-	}
-	if got.Provider != "openai" || got.Model != "gpt-4o-mini" || got.Rate.RPM != 300 {
-		t.Fatalf("ResolveLLM() = %#v, want openai/gpt-4o-mini/rpm=300", got)
-	}
+	require.True(t, ok)
+	assert.Equal(t, "openai", got.Provider)
+	assert.Equal(t, "gpt-4o-mini", got.Model)
+	assert.Equal(t, uint32(300), got.Rate.RPM)
 }
 
 func TestReaderResolveLLMIDs(t *testing.T) {
 	blob, err := Build(testPackInput(1, 2))
-	if err != nil {
-		t.Fatalf("Build() error = %v", err)
-	}
+	require.NoError(t, err)
 	reader, err := Open(blob)
-	if err != nil {
-		t.Fatalf("Open() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	got, ok := reader.ResolveLLMIDs("workspace1", "slug:1:2", "gpt-4o-mini")
-	if !ok {
-		t.Fatal("ResolveLLMIDs() ok = false, want true")
-	}
-	if reader.String(got.ProviderSID) != "openai" || reader.String(got.ModelSID) != "gpt-4o-mini" {
-		t.Fatalf("ResolveLLMIDs() provider/model = %q/%q", reader.String(got.ProviderSID), reader.String(got.ModelSID))
-	}
-	if got.Rate.RPM != 300 || reader.String(got.Rate.OnExceedSID) != "reject" {
-		t.Fatalf("ResolveLLMIDs() rate = %#v", got.Rate)
-	}
+	require.True(t, ok)
+	assert.Equal(t, "openai", reader.String(got.ProviderSID))
+	assert.Equal(t, "gpt-4o-mini", reader.String(got.ModelSID))
+	assert.Equal(t, uint32(300), got.Rate.RPM)
+	assert.Equal(t, "reject", reader.String(got.Rate.OnExceedSID))
 }
 
 func TestReaderResolveLLMPlan(t *testing.T) {
@@ -70,35 +59,46 @@ func TestReaderResolveLLMPlan(t *testing.T) {
 		},
 	}
 	blob, err := Build(input)
-	if err != nil {
-		t.Fatalf("Build() error = %v", err)
-	}
+	require.NoError(t, err)
 	reader, err := Open(blob)
-	if err != nil {
-		t.Fatalf("Open() error = %v", err)
-	}
+	require.NoError(t, err)
 
 	plan, ok := reader.ResolveLLMPlan("workspace1", "slug:1:1", "gpt-4o-mini")
-	if !ok {
-		t.Fatal("ResolveLLMPlan() ok = false, want true")
-	}
-	if plan.Plan.Kind != RouteKindChain || plan.Plan.RetryOn != "401,5xx" || len(plan.Plan.Children) != 2 {
-		t.Fatalf("ResolveLLMPlan() plan = %#v, want two-child chain", plan.Plan)
-	}
-	if got := plan.Plan.Children[0].Plan.SecretRef; got != "env://USER_OPENAI_KEY" {
-		t.Fatalf("first child secret = %q, want user key", got)
-	}
-	if got := plan.Plan.Children[1].Plan.SecretRef; got != "env://FALLBACK_KEY" {
-		t.Fatalf("second child secret = %q, want fallback provider default", got)
-	}
+	require.True(t, ok)
+	require.Equal(t, RouteKindChain, plan.Plan.Kind)
+	require.Equal(t, "401,5xx", plan.Plan.RetryOn)
+	require.Len(t, plan.Plan.Children, 2)
+	assert.Equal(t, "env://USER_OPENAI_KEY", plan.Plan.Children[0].Plan.SecretRef)
+	assert.Equal(t, "env://FALLBACK_KEY", plan.Plan.Children[1].Plan.SecretRef)
 
 	ids, ok := reader.ResolveLLMIDs("workspace1", "slug:1:1", "gpt-4o-mini")
-	if !ok {
-		t.Fatal("ResolveLLMIDs() ok = false, want true")
-	}
-	if got := reader.String(ids.SecretSID); got != "env://USER_OPENAI_KEY" {
-		t.Fatalf("ResolveLLMIDs() primary secret = %q, want first chain target", got)
-	}
+	require.True(t, ok)
+	assert.Equal(t, "env://USER_OPENAI_KEY", reader.String(ids.SecretSID))
+}
+
+func TestReaderManifestAndBoundsHelpers(t *testing.T) {
+	blob, manifest, err := BuildWithManifest(testPackInput(1, 1))
+	require.NoError(t, err)
+
+	gotManifest, err := ReadManifest(blob)
+	require.NoError(t, err)
+	assert.Equal(t, manifest, gotManifest)
+
+	require.NoError(t, ValidateManifest(blob, manifest))
+
+	reader, err := Open(blob)
+	require.NoError(t, err)
+	reader.stringsOff = 0
+	require.Error(t, reader.validateOffsets())
+
+	corrupt := append([]byte{}, blob...)
+	put32(corrupt[headerStringsOff:headerStringsOff+4], 0)
+	binary.LittleEndian.PutUint64(corrupt[headerChecksumOff:headerChecksumOff+8], checksum(corrupt[headerSize:]))
+	_, err = Open(corrupt)
+	require.Error(t, err)
+
+	require.Zero(t, reader.read32(-1))
+	require.Zero(t, reader.read64(-1))
 }
 
 func TestReaderResolveModelMetadata(t *testing.T) {

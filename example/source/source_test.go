@@ -1,15 +1,16 @@
 package source
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
+)
 
 func TestLoadModelCatalogJSON(t *testing.T) {
 	models, err := LoadModelCatalogJSON("testdata/catalogs/models.json")
-	if err != nil {
-		t.Fatalf("LoadModelCatalogJSON() error = %v", err)
-	}
-	if len(models) == 0 {
-		t.Fatal("LoadModelCatalogJSON() returned no enabled models")
-	}
+	require.NoError(t, err)
+	require.NotEmpty(t, models)
 	var gpt5 Model
 	for _, model := range models {
 		if model.ID == "gpt-5" {
@@ -17,25 +18,16 @@ func TestLoadModelCatalogJSON(t *testing.T) {
 			break
 		}
 	}
-	if gpt5.ID == "" {
-		t.Fatal("enabled model gpt-5 not found")
-	}
-	if gpt5.Provider != "openai" || gpt5.MetadataJSON == "" {
-		t.Fatalf("gpt-5 = %#v, want provider and metadata", gpt5)
-	}
-	if !contains(gpt5.Capabilities, "image_generation") {
-		t.Fatalf("gpt-5 capabilities = %#v, want image_generation", gpt5.Capabilities)
-	}
+	require.NotEmpty(t, gpt5.ID)
+	require.Equal(t, "openai", gpt5.Provider)
+	require.NotEmpty(t, gpt5.MetadataJSON)
+	require.Contains(t, gpt5.Capabilities, "image_generation")
 }
 
 func TestLoadProviderCatalogJSON(t *testing.T) {
 	providers, err := LoadProviderCatalogJSON("testdata/catalogs/providers.json")
-	if err != nil {
-		t.Fatalf("LoadProviderCatalogJSON() error = %v", err)
-	}
-	if len(providers) == 0 {
-		t.Fatal("LoadProviderCatalogJSON() returned no providers")
-	}
+	require.NoError(t, err)
+	require.NotEmpty(t, providers)
 	var openai Provider
 	for _, provider := range providers {
 		if provider.ID == "openai" {
@@ -43,16 +35,12 @@ func TestLoadProviderCatalogJSON(t *testing.T) {
 			break
 		}
 	}
-	if openai.Endpoint == "" {
-		t.Fatalf("openai provider = %#v, want endpoint", openai)
-	}
+	require.NotEmpty(t, openai.Endpoint)
 }
 
 func TestLoadMCPCatalogJSON(t *testing.T) {
 	servers, err := LoadMCPCatalogJSON("testdata/catalogs/mcp-catalog-data-with-tools.json")
-	if err != nil {
-		t.Fatalf("LoadMCPCatalogJSON() error = %v", err)
-	}
+	require.NoError(t, err)
 	var aws MCPServer
 	for _, server := range servers {
 		if server.ID == "aws-knowledge" {
@@ -60,22 +48,15 @@ func TestLoadMCPCatalogJSON(t *testing.T) {
 			break
 		}
 	}
-	if aws.Endpoint == "" || aws.AuthType != "none" {
-		t.Fatalf("aws-knowledge = %#v, want open endpoint", aws)
-	}
-	if !contains(aws.Tools, "aws___list_regions") {
-		t.Fatalf("aws-knowledge tools missing aws___list_regions: %#v", aws.Tools)
-	}
+	require.NotEmpty(t, aws.Endpoint)
+	require.Equal(t, "none", aws.AuthType)
+	require.Contains(t, aws.Tools, "aws___list_regions")
 }
 
 func TestLoadMCPCatalogJSONWithoutToolsShape(t *testing.T) {
 	servers, err := LoadMCPCatalogJSON("testdata/catalogs/mcp-catalog-data.json")
-	if err != nil {
-		t.Fatalf("LoadMCPCatalogJSON() error = %v", err)
-	}
-	if len(servers) == 0 {
-		t.Fatal("LoadMCPCatalogJSON() returned no servers")
-	}
+	require.NoError(t, err)
+	require.NotEmpty(t, servers)
 }
 
 func TestMergeProvidersPreservesSecretRefs(t *testing.T) {
@@ -83,16 +64,46 @@ func TestMergeProvidersPreservesSecretRefs(t *testing.T) {
 		[]Provider{{ID: "openai", Kind: "openai", SecretRef: "env://OPENAI_API_KEY"}},
 		[]Provider{{ID: "openai", Kind: "openai", Endpoint: "https://api.openai.com"}},
 	)
-	if len(got) != 1 || got[0].SecretRef != "env://OPENAI_API_KEY" || got[0].Endpoint == "" {
-		t.Fatalf("MergeProviders() = %#v, want endpoint with preserved secret ref", got)
-	}
+	require.Len(t, got, 1)
+	require.Equal(t, "env://OPENAI_API_KEY", got[0].SecretRef)
+	require.NotEmpty(t, got[0].Endpoint)
 }
 
-func contains(values []string, want string) bool {
-	for _, value := range values {
-		if value == want {
-			return true
-		}
-	}
-	return false
+func TestRouteNodeUnmarshalNestedTree(t *testing.T) {
+	const payload = `
+chain:
+  retry:
+    retry_on: "401,5xx"
+    per_try_timeout_ms: 10000
+  children:
+    - target:
+        provider: openai
+        model: gpt-4o-mini
+    - weight: 25
+      split:
+        children:
+          - weight: 80
+            target:
+              provider: fallback
+              model: gpt-fallback
+          - weight: 20
+            chain:
+              retry:
+                retry_on: "connect-failure"
+                per_try_timeout_ms: 2000
+              children:
+                - target:
+                    provider: fallback
+                    model: gpt-fallback
+`
+	var node RouteNode
+	require.NoError(t, yaml.Unmarshal([]byte(payload), &node))
+	require.Equal(t, "chain", node.Kind)
+	require.Len(t, node.Chain, 2)
+	require.Equal(t, "target", node.Chain[0].Kind)
+	require.Equal(t, "split", node.Chain[1].Kind)
+	require.Len(t, node.Chain[1].Split, 2)
+	require.Equal(t, 80, node.Chain[1].Split[0].Weight)
+	require.Equal(t, "target", node.Chain[1].Split[0].Node.Kind)
+	require.Equal(t, "chain", node.Chain[1].Split[1].Node.Kind)
 }

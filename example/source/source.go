@@ -235,11 +235,11 @@ func (n *routeChildrenNode) UnmarshalYAML(value *yaml.Node) error {
 
 func (n *WeightedRouteNode) UnmarshalYAML(value *yaml.Node) error {
 	var aux struct {
-		Weight int        `yaml:"weight"`
-		Node   *RouteNode `yaml:"node"`
-		Target *Target    `yaml:"target"`
-		Chain  *RouteNode `yaml:"chain"`
-		Split  *RouteNode `yaml:"split"`
+		Weight int                `yaml:"weight"`
+		Node   *RouteNode         `yaml:"node"`
+		Target *Target            `yaml:"target"`
+		Chain  *routeChildrenNode `yaml:"chain"`
+		Split  *routeChildrenNode `yaml:"split"`
 	}
 	if err := value.Decode(&aux); err != nil {
 		return err
@@ -251,11 +251,17 @@ func (n *WeightedRouteNode) UnmarshalYAML(value *yaml.Node) error {
 	case aux.Target != nil:
 		n.Node = RouteNode{Kind: "target", Target: aux.Target}
 	case aux.Chain != nil:
-		n.Node = *aux.Chain
-		n.Node.Kind = firstNonEmpty(n.Node.Kind, "chain")
+		n.Node = RouteNode{
+			Kind:  "chain",
+			Retry: aux.Chain.Retry,
+			Chain: aux.Chain.RouteChildren,
+		}
 	case aux.Split != nil:
-		n.Node = *aux.Split
-		n.Node.Kind = firstNonEmpty(n.Node.Kind, "split")
+		n.Node = RouteNode{
+			Kind:  "split",
+			Retry: aux.Split.Retry,
+			Split: aux.Split.WeightedChildren,
+		}
 	default:
 		return fmt.Errorf("weighted route node requires node, target, chain, or split")
 	}

@@ -131,6 +131,7 @@ assume a globally installed binary is available. The Makefile wraps the pinned
 command:
 
 ```sh
+make format
 make fmt
 make lint
 make lint-fix

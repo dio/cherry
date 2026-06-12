@@ -1,8 +1,8 @@
 GOLANGCI_LINT := go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
 
-.PHONY: fmt lint lint-fix lint-config test
+.PHONY: format lint lint-fix lint-config test
 
-fmt:
+format:
 	$(GOLANGCI_LINT) fmt ./...
 
 lint:
