@@ -1441,3 +1441,491 @@ Interpretation:
 - Full `-benchtime=3s -count=30` characterization is still pending.
 - CPU and allocation profiles for the remaining BYOK-heavy case are still
   pending.
+
+## Cadence Read
+
+A 5-second update cadence is acceptable at the current 1M-route scale for a
+single rebuild stream.
+
+Representative post-chunk numbers:
+
+```text
+byok-provider-secret-always, 1M route entries:
+  time: ~0.67-0.78 s/op
+
+byok-provider-secret-prefer, 1M route entries:
+  time: ~0.95-1.08 s/op
+```
+
+That leaves material headroom inside a 5-second cadence. The main risk is not a
+single rebuild exceeding the tick; it is overlapping rebuilds or many scopes
+updating at once.
+
+## Next Hypotheses
+
+Likely next optimization candidates, in order:
+
+1. Reduce `builder.stringID` pressure during table emission.
+   The current profile shows string-table work still dominates CPU and a large
+   share of allocation space. A narrower change could pre-intern more IDs before
+   the emission pass or reduce repeated lookups for repeated secret refs and
+   scope strings.
+2. Remove remaining `bytes.Buffer` growth in string and final pack emission.
+   `bytes.growSlice` is still the largest flat allocation-space source. The
+   direct scope writer fixed the major case, but the string table and final pack
+   still grow buffers incrementally.
+3. Revisit weighted split route emission if that shape becomes a production
+   bottleneck.
+   The split stress case still carries millions of allocs/op at 1M entries.
+   That is a distinct shape from the common provider-level BYOK case and may
+   need its own compact encoding or child-ID reuse pass.
+4. Consider scope-level sharding only if rebuild concurrency becomes the real
+   problem.
+   Sharding helps if many scopes update independently, but it adds deterministic
+   merge complexity and should be justified by workload shape, not by the
+   current single-stream benchmark.
+
+## Real-Use-Case Split Plan
+
+The next optimization should model production churn more closely before changing
+the persisted format again. The current pack already separates LLM hot-path APIs
+from MCP hot-path APIs, but the delivered artifact is still one combined pack:
+
+```text
+shared strings
+provider/model catalog
+LLM route shapes/rates/principal indexes
+MCP server catalog/toolsets/path indexes
+scope records that point at both LLM and MCP indexes
+```
+
+That combined layout means an LLM-only route or BYOK change still rebuilds and
+redelivers MCP sections, and an MCP-only profile/tool/auth change still rebuilds
+and redelivers LLM sections. This is acceptable for a single rebuild stream, but
+it is not the closest model for a real enforcement point where LLM policy churn
+and MCP profile churn can be independent.
+
+### Proposed Clusters
+
+Use three conceptual clusters for measurement and, if justified, a future bundle
+split:
+
+```text
+catalog cluster:
+  providers, models, MCP server catalog, mostly static metadata
+
+llm policy cluster:
+  scopes, principals, route bindings, route shapes, credential slots,
+  rate policies
+
+mcp policy cluster:
+  scopes, MCP paths, MCP toolsets, tool bindings, effective MCP auth refs
+```
+
+The clusters should remain at the normalized `cherry.Input` boundary. Cherry
+must not infer tenancy, ownership, source reachability, or secret material. The
+producer decides which scopes and records belong in each cluster.
+
+### Opaque Secret Refs
+
+Secret references may carry resolver-specific structure, for example:
+
+```text
+env://OPENAI_API_KEY
+file:///run/secrets/openai
+literal://...
+sm://YthMP/api-keys/ANTHROPIC_API_KEY
+```
+
+The real resolver may parse those strings into scheme, realm, and ref name. For
+example, it may treat `sm://YthMP/api-keys/ANTHROPIC_API_KEY` as:
+
+```text
+scheme: sm
+realm: YthMP/api-keys
+ref:    ANTHROPIC_API_KEY
+```
+
+Cherry should not parse that structure or persist a separate realm field. The
+root package stores and returns only the opaque `SecretRef` string that the
+external system selected.
+
+This keeps the boundary simple:
+
+```text
+producer/resolver:
+  owns provider-vs-BYOK-vs-profile identity, secret-store routing, and parsing
+
+Cherry:
+  stores refs only, never secret material, and never interprets ref internals
+```
+
+For flat schemes such as `env://`, `file://`, or `literal://`, the resolver can
+ignore any higher-level realm decision or encode it inside the opaque ref if it
+needs to. Cherry does not need new public fields or a pack version bump for this.
+
+Decision: do not add a separate secret-realm field to Cherry. Keep `SecretRef`
+opaque.
+
+### Bundle Split Options
+
+Do not jump directly to multiple wire formats. Verify in this order:
+
+1. Measurement-only clustering:
+   Add benchmark metrics that report estimated bytes and rebuild time by
+   catalog, LLM, and MCP sections using the current combined pack. This gives a
+   no-format-change read on how much waste bundle splitting can remove.
+2. API-level filtered builds:
+   Add producer-side helpers or benchmark-only inputs for LLM-only and MCP-only
+   bundles without changing the envelope. This tests whether independent rebuild
+   streams help enough when loaded as separate `Reader` values.
+3. Multi-pack EP view:
+   If measurements justify it, introduce a higher-level immutable EP view that
+   holds one catalog reader plus one LLM policy reader plus one MCP policy
+   reader. Keep individual `Reader` values immutable and swap the composed view
+   atomically.
+4. Envelope v2:
+   Only after the EP view is proven, consider a bundle envelope containing named
+   pack blobs and manifests. The envelope version should change independently
+   from the internal pack version.
+
+The key constraint is generation safety: old views must remain valid for
+in-flight requests, and a new view must not mix an incompatible catalog with a
+policy pack that references missing provider, model, or MCP server IDs.
+
+### Verification Plan
+
+Add benchmark shapes before code-format changes:
+
+```text
+real-mixed/workspaces=100/routes=100k/mcp_profiles=10k
+llm-churn-only/byok_provider_prefer/routes=1M
+mcp-churn-only/unique_toolsets/profiles=10k/tools=10
+split-candidate/catalog-static/policy-changing
+```
+
+Run the current full-build baseline:
+
+```sh
+go test -run '^$' \
+  -bench '^BenchmarkCherryPack(RouteScale|MCPProfileScale)$' \
+  -benchmem \
+  -benchtime=3s \
+  -count=10 \
+  . | tee /tmp/cherry-cluster-baseline.txt
+```
+
+Profile the mixed and churn-only cases:
+
+```sh
+go test -run '^$' \
+  -bench '^BenchmarkCherryPack(RealMixed|LLMChurnOnly|MCPChurnOnly)' \
+  -benchmem \
+  -benchtime=10s \
+  -memprofile=/tmp/cherry-cluster.mem \
+  -cpuprofile=/tmp/cherry-cluster.cpu \
+  .
+
+go tool pprof -top /tmp/cherry-cluster.cpu
+go tool pprof -alloc_space -top /tmp/cherry-cluster.mem
+go tool pprof -alloc_objects -top /tmp/cherry-cluster.mem
+```
+
+Add correctness tests before a bundle split:
+
+```text
+LLM provider defaults preserve opaque SecretRef
+LLM BYOK overrides preserve opaque SecretRef per target ordinal
+MCP server defaults preserve opaque SecretRef
+MCP profile/tool overrides preserve opaque SecretRef
+Open rejects packs whose policy cluster references missing catalog IDs
+bundle/view swap keeps old generation readable
+```
+
+Decision gates:
+
+```text
+Add a Cherry secret-realm field:
+  no; Cherry should treat SecretRef as opaque and leave realm parsing to the
+  external resolver.
+
+Split LLM and MCP clusters:
+  yes only if mixed/churn benchmarks show at least 25% reduction in rebuild
+  bytes or wall time for realistic independent-change scenarios.
+
+Split bundle envelope:
+  yes only after an in-process multi-reader EP view proves the compatibility
+  and generation-swap model without changing the wire envelope.
+
+Scope sharding:
+  yes only if overlapping rebuilds or many-scope updates are the measured
+  bottleneck.
+```
+
+### Cluster Experiment: 2026-06-14
+
+Status: measured.
+
+Change:
+
+- added `BenchmarkCherryPackRealMixed`
+- added `BenchmarkCherryPackLLMChurnOnly`
+- added `BenchmarkCherryPackMCPChurnOnly`
+- added `BenchmarkCherryPackClusterSplitCandidate`
+- benchmark output now includes approximate current-pack byte buckets:
+  `strings_bytes`, `catalog_bytes`, `llm_policy_bytes`,
+  `mcp_policy_bytes`, and `scope_index_bytes`
+
+The byte buckets are measurement-only. They do not imply the current pack can be
+split cleanly at those boundaries because the string table is shared.
+
+Focused benchmark command:
+
+```sh
+go test -run '^$' \
+  -bench '^BenchmarkCherryPack(RealMixed|LLMChurnOnly|MCPChurnOnly|ClusterSplitCandidate)$' \
+  -benchmem \
+  -benchtime=3s \
+  -count=3 \
+  . | tee /tmp/cherry-cluster-experiment-20260614053125.txt
+```
+
+Representative p50 results:
+
+```text
+real-mixed, 100 workspaces, 100k LLM route entries, 10k MCP profiles:
+  time:    140.9 ms/op
+  alloc:   157.7 MB/op
+  allocs:  132k/op
+  blob:    11.4 MB raw, 2.33 MB zstd
+  buckets: 5.20 MB strings, 4.00 MB LLM policy, 2.24 MB MCP policy
+
+llm-churn-only, 1M provider-level BYOK PREFER route entries:
+  time:    1.30 s/op
+  alloc:   309.0 MB/op
+  allocs:  2.2k/op
+  blob:    54.0 MB raw, 15.8 MB zstd
+  buckets: 14.0 MB strings, 40.0 MB LLM policy
+
+mcp-churn-only, 10k profiles x 10 unique tools:
+  time:    64.9 ms/op
+  alloc:   98.9 MB/op
+  allocs:  131k/op
+  blob:    6.09 MB raw, 0.80 MB zstd
+  buckets: 3.85 MB strings, 2.24 MB MCP policy
+```
+
+Split-candidate comparison for the same 100-workspace mixed shape:
+
+```text
+combined:
+  time: 137.2 ms/op
+  alloc: 157.7 MB/op
+  blob: 11.4 MB raw, 2.33 MB zstd
+
+llm-only:
+  time: 63.8 ms/op
+  alloc: 32.3 MB/op
+  blob: 5.35 MB raw, 1.52 MB zstd
+
+mcp-only:
+  time: 62.4 ms/op
+  alloc: 98.8 MB/op
+  blob: 6.09 MB raw, 0.80 MB zstd
+```
+
+Interpretation:
+
+- Splitting LLM and MCP rebuild streams is directionally useful for independent
+  churn: LLM-only and MCP-only each rebuild in less than half the combined
+  mixed wall time for this shape.
+- Splitting the delivered bytes is less compelling than the raw pack sizes
+  suggest because the string table is the largest shared bucket in mixed and MCP
+  cases. Naively shipping separate packs duplicates some string/catalog data.
+- MCP unique-toolset churn has much higher allocation count than LLM BYOK churn
+  after chunks 6-8. MCP is now the clearer local optimization target.
+- A bundle-envelope split is still premature. The next no-format-change
+  optimization should focus on MCP toolset canonicalization/key construction,
+  then rerun this experiment.
+
+Focused profile command:
+
+```sh
+go test -run '^$' \
+  -bench '^BenchmarkCherryPack(RealMixed|LLMChurnOnly|MCPChurnOnly)$' \
+  -benchmem \
+  -benchtime=10s \
+  -memprofile=/tmp/cherry-cluster.mem \
+  -cpuprofile=/tmp/cherry-cluster.cpu \
+  .
+```
+
+Profile summary:
+
+```text
+CPU:
+  Build:                  61.9% cumulative
+  builder.stringID:       16.5% cumulative
+  writeScopes:            14.2% cumulative
+  internShortChainRoute:   7.9% cumulative
+  writeMCPToolsets:        5.0% cumulative
+
+alloc_space:
+  Build:                  94.3% cumulative
+  bytes.growSlice:        28.9% flat
+  strings.Builder write:  18.2% flat
+  builder.stringID:       16.7% flat
+  canonicalToolset:        7.5% cumulative
+  writeMCPToolsets:        9.2% cumulative
+
+alloc_objects:
+  Build:                  71.2% cumulative
+  strings.Builder write:  31.9% flat
+  canonicalToolset:       21.2% cumulative
+  toolsetKey:             32.3% cumulative
+  benchmark input setup:  visible but not the only MCP allocation source
+```
+
+Decision read:
+
+```text
+Add a Cherry secret-realm field:
+  no; this is resolver-owned structure and does not belong in Cherry's pack.
+
+Split LLM and MCP clusters:
+  continue prototyping at the API/view level; the independent rebuild numbers
+  clear the 25% wall-time gate for this synthetic real-mixed shape.
+
+Split bundle envelope:
+  not yet; shared string bytes and catalog compatibility need an EP view
+  prototype first.
+
+Next optimization:
+  MCP toolset canonicalization/key construction before any envelope change.
+```
+
+### Opaque Secret Ref Decision: 2026-06-14
+
+Status: implemented by not changing the pack format.
+
+Change:
+
+- removed the separate secret-realm format-bump candidate before keeping it
+- pack format remains version 6
+- public resolver structs continue returning `SecretSID` only
+- materialized diagnostic structs continue returning `SecretRef` only
+- MCP toolset dedupe and conflicting-auth validation compare opaque `SecretRef`
+  and `AuthType`
+
+Interpretation:
+
+- this is a boundary decision, not a performance optimization
+- refs such as `env://TOKEN`, `file://...`, `literal://...`, or
+  `sm://YthMP/api-keys/ANTHROPIC_API_KEY` are opaque to Cherry
+- the external resolver may parse scheme, realm, and ref name as needed
+- Cherry stores refs only and does not read env vars, files, literal values, or
+  secret stores
+
+Validation:
+
+```sh
+go test ./...
+make format
+make lint
+go run ./example
+go run ./example pack project project1 example/source/testdata/example_fixture.yaml /tmp/project1.cherry.zst
+printf 'use workspace1\nllm slug:project1 claude-haiku-4-5\nmcp initialize profile-kiwi-and-github\nmcp call profile-kiwi-and-github github__list-repos\nquit\n' \
+  | go run ./example repl /tmp/project1.cherry.zst
+go run ./example pack --models example/source/testdata/catalogs/models.json --providers example/source/testdata/catalogs/providers.json --mcp-catalog example/source/testdata/catalogs/mcp-catalog-data-with-tools.json project project1 example/source/testdata/example_fixture.yaml /tmp/project1-catalogs.cherry.zst
+```
+
+### Chunk 9: MCP Toolset Key Allocation Reduction
+
+Status: implemented.
+
+Change:
+
+- `canonicalToolset` now returns the input slice unchanged when it is already in
+  canonical order, avoiding a per-profile tool binding slice copy for common
+  producer output
+- MCP toolset dedupe no longer builds one large string key per profile
+- Build computes a compact `uint64` hash from already-interned field IDs while
+  validating each tool binding
+- hash buckets still verify full toolset equality before deduping, so hash
+  collisions cannot merge distinct toolsets
+- per-profile MCP server auth maps are pre-sized from the tool count
+- persisted pack format and public APIs are unchanged from version 6
+
+Focused before benchmark:
+
+```sh
+go test -run '^$' \
+  -bench '^BenchmarkCherryPack(MCPChurnOnly|MCPProfileScale|RealMixed|ClusterSplitCandidate)$' \
+  -benchmem \
+  -benchtime=3s \
+  -count=3 \
+  . | tee /tmp/cherry-mcp-toolset-before-20260614054420.txt
+```
+
+Focused after benchmarks:
+
+```sh
+go test -run '^$' \
+  -bench '^BenchmarkCherryPack(MCPChurnOnly|RealMixed)$|^BenchmarkCherryPackMCPProfileScale/(shared-toolsets|unique-toolsets|unique-secret-refs)/profiles=10000/tools_per_profile=10$' \
+  -benchmem \
+  -benchtime=3s \
+  -count=3 \
+  . | tee /tmp/cherry-mcp-toolset-after-id-hash-20260614055305.txt
+
+go test -run '^$' \
+  -bench '^BenchmarkCherryPackMCPChurnOnly$' \
+  -benchmem \
+  -benchtime=3s \
+  -count=7 \
+  . | tee /tmp/cherry-mcp-churn-after-id-hash-20260614055441.txt
+```
+
+Representative before -> after:
+
+```text
+shared-toolsets, 10k profiles x 10 tools:
+  alloc:  61.6 MB/op -> 23.6 MB/op
+  allocs: 140k/op -> 30k/op
+  time:   ~34-35 ms/op -> ~33-52 ms/op
+  blob:   unchanged
+
+unique-toolsets, 10k profiles x 10 tools:
+  alloc:  108.5 MB/op -> 70.6 MB/op
+  allocs: 132k/op -> 40.8k/op
+  time:   ~86-90 ms/op -> ~78-94 ms/op in focused samples
+  blob:   unchanged
+
+unique-secret-refs, 10k profiles x 10 tools:
+  alloc:  84.1 MB/op -> 46.7 MB/op
+  allocs: 140k/op -> 40.3k/op
+  time:   noisy before; after focused samples around 46-55 ms/op
+  blob:   unchanged
+
+MCPChurnOnly, 10k unique profiles x 10 tools:
+  alloc:  108.5 MB/op -> 70.6 MB/op
+  allocs: 132k/op -> 40.8k/op
+  time:   noisy; 7-sample after p50 around 91.9 ms/op
+```
+
+Interpretation:
+
+- this is a clear allocation and GC-pressure reduction for MCP profile churn
+- elapsed time remains noisy on the local workstation; treat it as roughly
+  neutral rather than a proven latency win
+- raw and zstd blob sizes are unchanged, as expected for a builder-only
+  optimization
+- the next MCP optimization should target remaining `builder.stringID` and
+  table emission work rather than toolset key construction
+
+Validation:
+
+```sh
+go test ./...
+make format
+make lint
+```

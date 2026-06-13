@@ -116,6 +116,57 @@ func BenchmarkCherryPackMCPProfileScale(b *testing.B) {
 	}
 }
 
+func BenchmarkCherryPackRealMixed(b *testing.B) {
+	benchmarkBuild(b, benchmarkRealMixedInput(
+		100, // workspaces
+		100, // principals per workspace
+		10,  // models per principal
+		100, // MCP profiles per workspace
+		10,  // tools per profile
+	))
+}
+
+func BenchmarkCherryPackLLMChurnOnly(b *testing.B) {
+	benchmarkBuild(b, benchmarkRouteInput(100000, 10, routeScaleBYOKProviderSecretPrefer))
+}
+
+func BenchmarkCherryPackMCPChurnOnly(b *testing.B) {
+	benchmarkBuild(b, benchmarkMCPProfileInput(10000, 10, mcpProfileScaleUniqueToolsets))
+}
+
+func BenchmarkCherryPackClusterSplitCandidate(b *testing.B) {
+	const (
+		workspaces             = 100
+		principalsPerWorkspace = 100
+		modelsPerPrincipal     = 10
+		mcpProfilesPerScope    = 100
+		toolsPerProfile        = 10
+	)
+	b.Run("combined/workspaces=100/routes=100000/mcp_profiles=10000/tools=10", func(b *testing.B) {
+		benchmarkBuild(b, benchmarkRealMixedInput(
+			workspaces,
+			principalsPerWorkspace,
+			modelsPerPrincipal,
+			mcpProfilesPerScope,
+			toolsPerProfile,
+		))
+	})
+	b.Run("llm-only/workspaces=100/routes=100000", func(b *testing.B) {
+		benchmarkBuild(b, benchmarkRealLLMInput(
+			workspaces,
+			principalsPerWorkspace,
+			modelsPerPrincipal,
+		))
+	})
+	b.Run("mcp-only/workspaces=100/mcp_profiles=10000/tools=10", func(b *testing.B) {
+		benchmarkBuild(b, benchmarkRealMCPInput(
+			workspaces,
+			mcpProfilesPerScope,
+			toolsPerProfile,
+		))
+	})
+}
+
 func benchmarkBuild(b *testing.B, input Input) {
 	b.Helper()
 	setupBlob, err := Build(input)
@@ -144,6 +195,25 @@ func benchmarkBuild(b *testing.B, input Input) {
 	packBuildSink = blob
 	b.ReportMetric(float64(len(setupBlob)), "blob_bytes")
 	b.ReportMetric(float64(len(bundleBytes)), "zstd_bundle_bytes")
+	reportPackClusterMetrics(b, setupBlob)
+}
+
+func reportPackClusterMetrics(b *testing.B, blob []byte) {
+	b.Helper()
+	b.ReportMetric(float64(sectionBytes(blob, headerStringsOff, headerProvidersOff)), "strings_bytes")
+	b.ReportMetric(float64(sectionBytes(blob, headerProvidersOff, headerRoutesOff)+sectionBytes(blob, headerMCPServersOff, headerMCPToolsetsOff)), "catalog_bytes")
+	b.ReportMetric(float64(sectionBytes(blob, headerRoutesOff, headerMCPServersOff)+sectionBytes(blob, headerPrincipalsOff, headerMCPPathsOff)), "llm_policy_bytes")
+	b.ReportMetric(float64(sectionBytes(blob, headerMCPToolsetsOff, headerScopesOff)+sectionBytes(blob, headerMCPPathsOff, 0)), "mcp_policy_bytes")
+	b.ReportMetric(float64(sectionBytes(blob, headerScopesOff, headerPrincipalsOff)), "scope_index_bytes")
+}
+
+func sectionBytes(blob []byte, startHeaderOff int, endHeaderOff int) int {
+	start := int(u32(blob[startHeaderOff : startHeaderOff+4]))
+	end := len(blob)
+	if endHeaderOff != 0 {
+		end = int(u32(blob[endHeaderOff : endHeaderOff+4]))
+	}
+	return end - start
 }
 
 type routeScaleShape int
@@ -334,8 +404,109 @@ func benchmarkProviderSecretRef(principalIndex int, providerID string) string {
 
 func benchmarkMCPProfileInput(profileCount int, toolsPerProfile int, shape mcpProfileScaleShape) Input {
 	const providerCount = 1
-	servers := make([]MCPServer, 0, toolsPerProfile)
-	for i := range toolsPerProfile {
+	return Input{
+		Providers:  benchmarkProviders(providerCount),
+		Models:     benchmarkModels(providerCount, 1),
+		MCPServers: benchmarkMCPServers(toolsPerProfile),
+		Scopes: []Scope{{
+			ID: "workspace1",
+			Principals: []Principal{{
+				Slug: "slug:mcp",
+				Route: RoutePlan{
+					Provider: benchmarkProviderID(0),
+					Model:    benchmarkModelID(0),
+				},
+				Rate: benchmarkSharedRatePolicy(),
+			}},
+			MCPProfiles: benchmarkMCPProfiles(0, profileCount, toolsPerProfile, shape),
+		}},
+	}
+}
+
+func benchmarkRealMixedInput(workspaceCount int, principalsPerWorkspace int, modelCount int, profilesPerWorkspace int, toolsPerProfile int) Input {
+	return Input{
+		Providers:  benchmarkProviders(3),
+		Models:     benchmarkModels(3, modelCount),
+		MCPServers: benchmarkMCPServers(toolsPerProfile),
+		Scopes: benchmarkRealScopes(
+			workspaceCount,
+			principalsPerWorkspace,
+			modelCount,
+			profilesPerWorkspace,
+			toolsPerProfile,
+			true,
+			true,
+		),
+	}
+}
+
+func benchmarkRealLLMInput(workspaceCount int, principalsPerWorkspace int, modelCount int) Input {
+	return Input{
+		Providers: benchmarkProviders(3),
+		Models:    benchmarkModels(3, modelCount),
+		Scopes: benchmarkRealScopes(
+			workspaceCount,
+			principalsPerWorkspace,
+			modelCount,
+			0,
+			0,
+			true,
+			false,
+		),
+	}
+}
+
+func benchmarkRealMCPInput(workspaceCount int, profilesPerWorkspace int, toolsPerProfile int) Input {
+	return Input{
+		MCPServers: benchmarkMCPServers(toolsPerProfile),
+		Scopes: benchmarkRealScopes(
+			workspaceCount,
+			0,
+			0,
+			profilesPerWorkspace,
+			toolsPerProfile,
+			false,
+			true,
+		),
+	}
+}
+
+func benchmarkRealScopes(workspaceCount int, principalsPerWorkspace int, modelCount int, profilesPerWorkspace int, toolsPerProfile int, includeLLM bool, includeMCP bool) []Scope {
+	scopes := make([]Scope, 0, workspaceCount)
+	for workspaceIndex := range workspaceCount {
+		scope := Scope{ID: "workspace-" + itoa(workspaceIndex)}
+		if includeLLM {
+			scope.Principals = benchmarkRealPrincipals(workspaceIndex*principalsPerWorkspace, principalsPerWorkspace, modelCount)
+		}
+		if includeMCP {
+			scope.MCPProfiles = benchmarkMCPProfiles(workspaceIndex*profilesPerWorkspace, profilesPerWorkspace, toolsPerProfile, mcpProfileScaleUniqueToolsets)
+		}
+		scopes = append(scopes, scope)
+	}
+	return scopes
+}
+
+func benchmarkRealPrincipals(principalBase int, principalCount int, modelCount int) []Principal {
+	principals := make([]Principal, 0, principalCount)
+	for i := range principalCount {
+		principalIndex := principalBase + i
+		modelRoutes := make(map[string]RoutePlan, modelCount)
+		for modelIndex := range modelCount {
+			modelID := benchmarkModelID(modelIndex)
+			modelRoutes[modelID] = benchmarkRoutePlan(modelIndex, principalIndex, routeScaleBYOKProviderSecretPrefer)
+		}
+		principals = append(principals, Principal{
+			Slug:        "slug:real:" + itoa(principalIndex),
+			ModelRoutes: modelRoutes,
+			Rate:        benchmarkSharedRatePolicy(),
+		})
+	}
+	return principals
+}
+
+func benchmarkMCPServers(count int) []MCPServer {
+	servers := make([]MCPServer, 0, count)
+	for i := range count {
 		serverID := benchmarkMCPServerID(i)
 		servers = append(servers, MCPServer{
 			ID:        serverID,
@@ -344,8 +515,13 @@ func benchmarkMCPProfileInput(profileCount int, toolsPerProfile int, shape mcpPr
 			SecretRef: "env://MCP_" + itoa(i),
 		})
 	}
+	return servers
+}
+
+func benchmarkMCPProfiles(profileBase int, profileCount int, toolsPerProfile int, shape mcpProfileScaleShape) []MCPProfile {
 	profiles := make([]MCPProfile, 0, profileCount)
-	for profileIndex := range profileCount {
+	for i := range profileCount {
+		profileIndex := profileBase + i
 		tools := make([]MCPToolBinding, 0, toolsPerProfile)
 		for toolIndex := range toolsPerProfile {
 			serverID := benchmarkMCPServerID(toolIndex)
@@ -371,23 +547,7 @@ func benchmarkMCPProfileInput(profileCount int, toolsPerProfile int, shape mcpPr
 			Tools: tools,
 		})
 	}
-	return Input{
-		Providers:  benchmarkProviders(providerCount),
-		Models:     benchmarkModels(providerCount, 1),
-		MCPServers: servers,
-		Scopes: []Scope{{
-			ID: "workspace1",
-			Principals: []Principal{{
-				Slug: "slug:mcp",
-				Route: RoutePlan{
-					Provider: benchmarkProviderID(0),
-					Model:    benchmarkModelID(0),
-				},
-				Rate: benchmarkSharedRatePolicy(),
-			}},
-			MCPProfiles: profiles,
-		}},
-	}
+	return profiles
 }
 
 func benchmarkProviders(count int) []Provider {

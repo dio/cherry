@@ -563,6 +563,30 @@ func TestReaderResolveMCPProfile(t *testing.T) {
 	}
 }
 
+func TestReaderDedupesMCPToolsetsAcrossInputOrder(t *testing.T) {
+	input := testPackInput(1, 1)
+	tools := input.Scopes[0].MCPProfiles[0].Tools
+	input.Scopes[0].MCPProfiles = append(input.Scopes[0].MCPProfiles, MCPProfile{
+		Path: "profile-dev-tools-reordered",
+		Tools: []MCPToolBinding{
+			tools[1],
+			tools[0],
+		},
+	})
+
+	blob, err := Build(input)
+	require.NoError(t, err)
+	reader, err := Open(blob)
+	require.NoError(t, err)
+
+	assert.Equal(t, uint32(1), reader.sectionCount(reader.mcpToolsetsOff))
+
+	got, ok := reader.ResolveMCPToolIDs("workspace1", "profile-dev-tools-reordered", "github__list-repos")
+	require.True(t, ok)
+	assert.Equal(t, "github", reader.String(got.ServerSID))
+	assert.Equal(t, "list-repos", reader.String(got.ToolSID))
+}
+
 func TestReaderResolveMCPInitialize(t *testing.T) {
 	blob, err := Build(testPackInput(1, 1))
 	if err != nil {

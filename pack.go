@@ -506,7 +506,7 @@ func Build(input Input) ([]byte, error) {
 	routeIDs := newRouteInterner()
 	routes := []compiledRoute{}
 	rateIDs := map[RatePolicy]uint32{}
-	toolsetIDs := map[string]uint32{}
+	toolsetIDs := map[uint64][]uint32{}
 	toolsets := [][]MCPToolBinding{}
 	compiledScopes := make([]compiledScope, 0, len(input.Scopes))
 
@@ -590,30 +590,31 @@ func Build(input Input) ([]byte, error) {
 		for _, profile := range scope.MCPProfiles {
 			builder.stringID(profile.Path)
 			canonicalTools := canonicalToolset(profile.Tools)
-			serverAuth := map[string]MCPToolBinding{}
+			serverAuth := make(map[string]MCPToolBinding, len(canonicalTools))
+			toolsetHash := newToolsetHash()
 			for _, tool := range canonicalTools {
-				if _, ok := mcpServerIDs[tool.Server]; !ok {
+				serverID, ok := mcpServerIDs[tool.Server]
+				if !ok {
 					return nil, fmt.Errorf("mcp profile %q references unknown server %q", profile.Path, tool.Server)
 				}
-				if existing, ok := serverAuth[tool.Server]; ok && (existing.SecretRef != tool.SecretRef || existing.AuthType != tool.AuthType) {
+				if existing, ok := serverAuth[tool.Server]; ok &&
+					(existing.SecretRef != tool.SecretRef ||
+						existing.AuthType != tool.AuthType) {
 					return nil, fmt.Errorf("mcp profile %q has conflicting auth for server %q", profile.Path, tool.Server)
 				}
 				serverAuth[tool.Server] = tool
-				builder.stringID(tool.ExposedName)
-				builder.stringID(tool.Tool)
-				builder.stringID(tool.SecretRef)
-				builder.stringID(tool.AuthType)
+				toolsetHash = hashToolsetID(toolsetHash, builder.stringID(tool.ExposedName))
+				toolsetHash = hashToolsetID(toolsetHash, serverID)
+				toolsetHash = hashToolsetID(toolsetHash, builder.stringID(tool.Tool))
+				toolsetHash = hashToolsetID(toolsetHash, builder.stringID(tool.SecretRef))
+				toolsetHash = hashToolsetID(toolsetHash, builder.stringID(tool.AuthType))
 			}
-			key := toolsetKey(canonicalTools)
-			if _, ok := toolsetIDs[key]; !ok {
-				toolsetIDs[key] = uint32(len(toolsets))
-				toolsets = append(toolsets, canonicalTools)
-			}
+			toolsetID := internMCPToolset(toolsetHash, canonicalTools, toolsetIDs, &toolsets)
 			pathHash := hashString(profile.Path)
 			compiled.mcpProfiles = append(compiled.mcpProfiles, compiledMCPProfile{
 				path:      profile.Path,
 				pathHash:  pathHash,
-				toolsetID: toolsetIDs[key],
+				toolsetID: toolsetID,
 			})
 		}
 		compiledScopes = append(compiledScopes, compiled)
@@ -1354,7 +1355,10 @@ type chainRouteKey struct {
 }
 
 func newBuilder() *builder {
-	return &builder{stringIndex: map[string]uint32{}, strings: []string{}}
+	return &builder{
+		stringIndex: map[string]uint32{"": 0},
+		strings:     []string{""},
+	}
 }
 
 func newRouteInterner() *routeInterner {
@@ -1403,9 +1407,37 @@ func sortedMCPServers(values []MCPServer) []MCPServer {
 // canonicalToolset gives semantically identical profile toolsets one stable
 // representation so Build can deduplicate them.
 func canonicalToolset(values []MCPToolBinding) []MCPToolBinding {
+	if mcpToolsetSorted(values) {
+		return values
+	}
 	out := append([]MCPToolBinding{}, values...)
-	sort.Slice(out, func(i, j int) bool { return out[i].ExposedName < out[j].ExposedName })
+	sort.Slice(out, func(i, j int) bool { return mcpToolBindingLess(out[i], out[j]) })
 	return out
+}
+
+func mcpToolsetSorted(values []MCPToolBinding) bool {
+	for i := 1; i < len(values); i++ {
+		if mcpToolBindingLess(values[i], values[i-1]) {
+			return false
+		}
+	}
+	return true
+}
+
+func mcpToolBindingLess(left MCPToolBinding, right MCPToolBinding) bool {
+	if left.ExposedName != right.ExposedName {
+		return left.ExposedName < right.ExposedName
+	}
+	if left.Server != right.Server {
+		return left.Server < right.Server
+	}
+	if left.Tool != right.Tool {
+		return left.Tool < right.Tool
+	}
+	if left.SecretRef != right.SecretRef {
+		return left.SecretRef < right.SecretRef
+	}
+	return left.AuthType < right.AuthType
 }
 
 // principalRoutes expands the compatibility Route field into the same shape as
@@ -1668,23 +1700,55 @@ func splitCapabilities(value string) []string {
 	return strings.Split(value, "\x00")
 }
 
-// toolsetKey is a deterministic deduplication key for a canonical MCP toolset.
-// NUL separators avoid ambiguity between adjacent fields.
-func toolsetKey(values []MCPToolBinding) string {
-	var builder strings.Builder
-	for _, value := range values {
-		builder.WriteString(value.ExposedName)
-		builder.WriteByte('\x00')
-		builder.WriteString(value.Server)
-		builder.WriteByte('\x00')
-		builder.WriteString(value.Tool)
-		builder.WriteByte('\x00')
-		builder.WriteString(value.SecretRef)
-		builder.WriteByte('\x00')
-		builder.WriteString(value.AuthType)
-		builder.WriteByte('\x00')
+func internMCPToolset(
+	hash uint64,
+	canonicalTools []MCPToolBinding,
+	toolsetIDs map[uint64][]uint32,
+	toolsets *[][]MCPToolBinding,
+) uint32 {
+	for _, id := range toolsetIDs[hash] {
+		if mcpToolsetsEqual(canonicalTools, (*toolsets)[id]) {
+			return id
+		}
 	}
-	return builder.String()
+	id := uint32(len(*toolsets))
+	toolsetIDs[hash] = append(toolsetIDs[hash], id)
+	*toolsets = append(*toolsets, canonicalTools)
+	return id
+}
+
+func newToolsetHash() uint64 {
+	return 14695981039346656037
+}
+
+func hashToolsetID(hash uint64, id uint32) uint64 {
+	hash ^= uint64(id)
+	hash *= 1099511628211
+	hash ^= uint64(id >> 8)
+	hash *= 1099511628211
+	hash ^= uint64(id >> 16)
+	hash *= 1099511628211
+	hash ^= uint64(id >> 24)
+	hash *= 1099511628211
+	hash ^= 0
+	hash *= 1099511628211
+	return hash
+}
+
+func mcpToolsetsEqual(left []MCPToolBinding, right []MCPToolBinding) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i].ExposedName != right[i].ExposedName ||
+			left[i].Server != right[i].Server ||
+			left[i].Tool != right[i].Tool ||
+			left[i].SecretRef != right[i].SecretRef ||
+			left[i].AuthType != right[i].AuthType {
+			return false
+		}
+	}
+	return true
 }
 
 // writeStrings writes the shared string table as count, data length, offsets,
