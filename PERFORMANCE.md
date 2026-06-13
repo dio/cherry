@@ -733,6 +733,136 @@ Interpretation:
   temporary storage: compiled principal entries, credential slot slices, string
   interning for secret refs, table buffer growth, and sorting copies
 
+### BYOK Provider Profile: 2026-06-13 After Chunk 4
+
+Status: measured.
+
+Focused profile command:
+
+```sh
+go test -run '^$' \
+  -bench '^BenchmarkCherryPackRouteScale/byok-provider-secret-(always|prefer)/route_entries=1000000' \
+  -benchmem \
+  -benchtime=10s \
+  -memprofile=/tmp/cherry-byok-provider-after-chunk4.mem \
+  -cpuprofile=/tmp/cherry-byok-provider-after-chunk4.cpu \
+  .
+```
+
+Benchmark sample from the profile run:
+
+```text
+byok-provider-secret-always, 1M route entries:
+  time: 0.881 s/op
+  alloc: 652.8 MB/op
+  allocs: 4.0M/op
+  blob: 54.0 MB raw, 15.8 MB zstd
+
+byok-provider-secret-prefer, 1M route entries:
+  time: 1.34 s/op
+  alloc: 732.8 MB/op
+  allocs: 5.0M/op
+  blob: 54.0 MB raw, 15.8 MB zstd
+```
+
+Allocation object profile:
+
+```text
+Build:                       84.6% cumulative objects
+routeKey/writeRouteKey:      63.3% cumulative objects
+internRoute:                 63.3% cumulative objects
+appendRouteCredentialSlots:  21.3% flat objects
+benchmarkRouteInput:         15.4% cumulative objects
+```
+
+Allocation space profile:
+
+```text
+Build:                  88.0% cumulative bytes
+writeScopes:            41.5% cumulative bytes
+bytes.growSlice:        36.1% flat bytes
+routeKey/writeRouteKey: 15.2% cumulative bytes
+internRoute:            15.2% cumulative bytes
+builder.stringID:        8.2% flat bytes
+```
+
+Line-level allocation space:
+
+```text
+Build compiled principal entry slice:      2.62 GB flat
+writeScopes copied principal entry slice:  2.62 GB flat
+writeScopes principalData writes/growth:   1.68 GB cumulative at putU64
+writeScopes credentialData writes/growth:  432 MB cumulative at credential putU32
+```
+
+Interpretation:
+
+- route-key construction remains the largest allocation-count source, but a
+  route-key redesign is structurally broader than the next available fix
+- `writeScopes` copies all compiled principal entries before sorting even though
+  compiled scopes are temporary and are not used after table writing
+- scope-local table buffers also grow incrementally despite known fixed record
+  widths
+- the next focused optimization is to sort compiled scope entries in place and
+  pre-grow principal, credential, and MCP path table buffers
+
+### Chunk 5: Sort Scope Writer Tables In Place
+
+Status: implemented.
+
+Change:
+
+- `writeScopes` sorts compiled principal route entries in place instead of
+  allocating a copied slice for each scope.
+- `writeScopes` sorts compiled MCP profile entries in place for the same reason.
+- principal, credential, and MCP path table buffers are pre-grown from known
+  fixed record counts.
+- this preserves the binary format and public API; compiled scope data is
+  temporary and is not used after table emission.
+
+Focused benchmark command:
+
+```sh
+go test -run '^$' \
+  -bench '^BenchmarkCherryPackRouteScale/byok-provider-secret-(always|prefer)/route_entries=1000000' \
+  -benchmem \
+  -benchtime=3s \
+  -count=3 \
+  .
+```
+
+Raw output:
+
+```text
+/tmp/cherry-byok-provider-after-scope-writer-20260613213000.txt
+```
+
+Representative p50 before -> after:
+
+```text
+byok-provider-secret-always, 1M route entries:
+  time:   0.953 s/op -> 0.825 s/op
+  alloc:  652.8 MB/op -> 504.9 MB/op
+  allocs: 4.0M/op -> 4.0M/op
+  blob:   54.0 MB raw -> 54.0 MB raw
+
+byok-provider-secret-prefer, 1M route entries:
+  time:   1.51 s/op -> 1.20 s/op
+  alloc:  732.8 MB/op -> 584.9 MB/op
+  allocs: 5.0M/op -> 5.0M/op
+  blob:   54.0 MB raw -> 54.0 MB raw
+```
+
+Interpretation:
+
+- sorting in place removed the largest avoidable allocation-space source from
+  `writeScopes`
+- exact table buffer growth reduced bytes allocated without changing allocation
+  count materially
+- the next remaining allocation-count target is route-key construction in
+  `internRoute`, but that needs a more careful route-shape key redesign and is
+  not part of this chunk
+
 ## Optimization Log
 
 ### Chunk 1: Carry Compiled IDs Into Table Writers

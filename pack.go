@@ -1764,10 +1764,11 @@ func writeMCPToolsets(out *bytes.Buffer, b *builder, toolsets [][]MCPToolBinding
 func writeScopes(out *bytes.Buffer, b *builder, scopes []compiledScope, rateIDs map[RatePolicy]uint32) (uint32, uint32) {
 	putU32(out, uint32(len(scopes)))
 	scopeRecords := make([]scopeRef, len(scopes))
-	sortedPrincipalEntries := make([][]compiledPrincipalEntry, len(scopes))
 	totalPrincipalRecords := 0
-	for i, scope := range scopes {
-		principalEntries := append([]compiledPrincipalEntry{}, scope.principalEntries...)
+	totalCredentialRecords := 0
+	totalMCPPathRecords := 0
+	for i := range scopes {
+		principalEntries := scopes[i].principalEntries
 		sort.Slice(principalEntries, func(i, j int) bool {
 			if principalEntries[i].lookupHash == principalEntries[j].lookupHash {
 				if principalEntries[i].slug == principalEntries[j].slug {
@@ -1777,19 +1778,25 @@ func writeScopes(out *bytes.Buffer, b *builder, scopes []compiledScope, rateIDs 
 			}
 			return principalEntries[i].lookupHash < principalEntries[j].lookupHash
 		})
-		sortedPrincipalEntries[i] = principalEntries
 		totalPrincipalRecords += len(principalEntries)
+		for _, principal := range principalEntries {
+			totalCredentialRecords += len(principal.credentialSlots)
+		}
+		totalMCPPathRecords += len(scopes[i].mcpProfiles)
 	}
 	var principalData bytes.Buffer
 	var credentialData bytes.Buffer
 	var mcpPathData bytes.Buffer
+	principalData.Grow(totalPrincipalRecords * principalLen)
+	credentialData.Grow(totalCredentialRecords * credentialLen)
+	mcpPathData.Grow(totalMCPPathRecords * mcpPathLen)
 	principalsOff := uint32(out.Len() + len(scopes)*scopeLen)
 	credentialsOff := principalsOff + uint32(totalPrincipalRecords*principalLen)
 
-	for i, scope := range scopes {
-		principalEntries := sortedPrincipalEntries[i]
+	for i := range scopes {
+		principalEntries := scopes[i].principalEntries
 		scopeRecords[i] = scopeRef{
-			sid:             b.stringID(scope.id),
+			sid:             b.stringID(scopes[i].id),
 			principalCount:  uint32(len(principalEntries)),
 			principalOffset: principalsOff + uint32(principalData.Len()),
 		}
@@ -1809,8 +1816,8 @@ func writeScopes(out *bytes.Buffer, b *builder, scopes []compiledScope, rateIDs 
 	}
 
 	mcpPathsOff := credentialsOff + uint32(credentialData.Len())
-	for i, scope := range scopes {
-		profiles := append([]compiledMCPProfile{}, scope.mcpProfiles...)
+	for i := range scopes {
+		profiles := scopes[i].mcpProfiles
 		sort.Slice(profiles, func(i, j int) bool {
 			if profiles[i].pathHash == profiles[j].pathHash {
 				return profiles[i].path < profiles[j].path
