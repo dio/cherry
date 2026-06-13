@@ -503,7 +503,7 @@ func Build(input Input) ([]byte, error) {
 	providerIDs := map[string]uint32{}
 	modelIDs := map[string]uint32{}
 	mcpServerIDs := map[string]uint32{}
-	routeIDs := map[string]uint32{}
+	routeIDs := newRouteInterner()
 	routes := []compiledRoute{}
 	rateIDs := map[RatePolicy]uint32{}
 	toolsetIDs := map[string]uint32{}
@@ -1319,8 +1319,37 @@ type compiledMCPProfile struct {
 	toolsetID uint32
 }
 
+type routeInterner struct {
+	targetIDs map[targetRouteKey]uint32
+	chainIDs  map[chainRouteKey]uint32
+	routeIDs  map[string]uint32
+}
+
+type targetRouteKey struct {
+	providerID uint32
+	modelID    uint32
+}
+
+type chainRouteKey struct {
+	retrySID   uint32
+	timeoutMS  uint32
+	child0     uint32
+	child1     uint32
+	child2     uint32
+	childCount uint8
+	hasRetry   bool
+}
+
 func newBuilder() *builder {
 	return &builder{stringIndex: map[string]uint32{}, strings: []string{}}
+}
+
+func newRouteInterner() *routeInterner {
+	return &routeInterner{
+		targetIDs: map[targetRouteKey]uint32{},
+		chainIDs:  map[chainRouteKey]uint32{},
+		routeIDs:  map[string]uint32{},
+	}
 }
 
 func (b *builder) stringID(value string) uint32 {
@@ -1406,24 +1435,41 @@ func internRoute(
 	b *builder,
 	providerIDs map[string]uint32,
 	modelIDs map[string]uint32,
-	routeIDs map[string]uint32,
+	routeIDs *routeInterner,
 	routes *[]compiledRoute,
 ) (uint32, error) {
 	normalized := normalizeRoutePlan(route)
+	if normalized.Kind == RouteKindTarget {
+		modelID, ok := modelIDs[normalized.Model]
+		if !ok {
+			return 0, fmt.Errorf("references unknown target model %q", normalized.Model)
+		}
+		providerID, ok := providerIDs[normalized.Provider]
+		if !ok {
+			return 0, fmt.Errorf("references unknown provider %q", normalized.Provider)
+		}
+		key := targetRouteKey{providerID: providerID, modelID: modelID}
+		if id, ok := routeIDs.targetIDs[key]; ok {
+			return id, nil
+		}
+		compiled := compiledRoute{plan: normalized}
+		compiled.plan.SecretRef = ""
+		id := uint32(len(*routes))
+		routeIDs.targetIDs[key] = id
+		*routes = append(*routes, compiled)
+		return id, nil
+	}
+
+	if normalized.Kind == RouteKindChain && len(normalized.Children) <= 3 {
+		return internShortChainRoute(normalized, b, providerIDs, modelIDs, routeIDs, routes)
+	}
+
 	key := routeKey(normalized)
-	if id, ok := routeIDs[key]; ok {
+	if id, ok := routeIDs.routeIDs[key]; ok {
 		return id, nil
 	}
 	compiled := compiledRoute{plan: normalized}
 	switch normalized.Kind {
-	case RouteKindTarget:
-		if _, ok := modelIDs[normalized.Model]; !ok {
-			return 0, fmt.Errorf("references unknown target model %q", normalized.Model)
-		}
-		if _, ok := providerIDs[normalized.Provider]; !ok {
-			return 0, fmt.Errorf("references unknown provider %q", normalized.Provider)
-		}
-		compiled.plan.SecretRef = ""
 	case RouteKindChain:
 		if len(normalized.Children) == 0 {
 			return 0, errors.New("chain route node must not be empty")
@@ -1458,7 +1504,50 @@ func internRoute(
 		return 0, fmt.Errorf("unsupported route node kind %q", normalized.Kind)
 	}
 	id := uint32(len(*routes))
-	routeIDs[key] = id
+	routeIDs.routeIDs[key] = id
+	*routes = append(*routes, compiled)
+	return id, nil
+}
+
+func internShortChainRoute(
+	route RoutePlan,
+	b *builder,
+	providerIDs map[string]uint32,
+	modelIDs map[string]uint32,
+	routeIDs *routeInterner,
+	routes *[]compiledRoute,
+) (uint32, error) {
+	if len(route.Children) == 0 {
+		return 0, errors.New("chain route node must not be empty")
+	}
+	key := chainRouteKey{childCount: uint8(len(route.Children))}
+	if route.Retry != nil {
+		key.hasRetry = true
+		key.retrySID = b.stringID(route.Retry.RetryOn)
+		key.timeoutMS = route.Retry.PerTryTimeoutMS
+	}
+
+	var childIDs [3]uint32
+	for index, child := range route.Children {
+		childID, err := internRoute(child, b, providerIDs, modelIDs, routeIDs, routes)
+		if err != nil {
+			return 0, fmt.Errorf("chain[%d]: %w", index, err)
+		}
+		childIDs[index] = childID
+	}
+	key.child0 = childIDs[0]
+	key.child1 = childIDs[1]
+	key.child2 = childIDs[2]
+	if id, ok := routeIDs.chainIDs[key]; ok {
+		return id, nil
+	}
+
+	compiled := compiledRoute{
+		plan:          route,
+		chainChildIDs: append([]uint32(nil), childIDs[:len(route.Children)]...),
+	}
+	id := uint32(len(*routes))
+	routeIDs.chainIDs[key] = id
 	*routes = append(*routes, compiled)
 	return id, nil
 }

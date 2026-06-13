@@ -863,6 +863,138 @@ Interpretation:
   `internRoute`, but that needs a more careful route-shape key redesign and is
   not part of this chunk
 
+### BYOK Provider Profile: 2026-06-13 After Chunk 5
+
+Status: measured.
+
+Focused profile command:
+
+```sh
+go test -run '^$' \
+  -bench '^BenchmarkCherryPackRouteScale/byok-provider-secret-(always|prefer)/route_entries=1000000' \
+  -benchmem \
+  -benchtime=10s \
+  -memprofile=/tmp/cherry-byok-provider-after-chunk5.mem \
+  -cpuprofile=/tmp/cherry-byok-provider-after-chunk5.cpu \
+  .
+```
+
+Benchmark sample from the profile run:
+
+```text
+byok-provider-secret-always, 1M route entries:
+  time: 0.818 s/op
+  alloc: 504.9 MB/op
+  allocs: 4.0M/op
+  blob: 54.0 MB raw, 15.8 MB zstd
+
+byok-provider-secret-prefer, 1M route entries:
+  time: 1.04 s/op
+  alloc: 584.9 MB/op
+  allocs: 5.0M/op
+  blob: 54.0 MB raw, 15.8 MB zstd
+```
+
+Allocation object profile:
+
+```text
+Build:                       86.1% cumulative objects
+routeKey/writeRouteKey:      62.8% cumulative objects
+internRoute:                 62.8% cumulative objects
+appendRouteCredentialSlots:  23.2% flat objects
+benchmarkRouteInput:         13.9% cumulative objects
+```
+
+Allocation space profile:
+
+```text
+Build:                  85.9% cumulative bytes
+bytes.growSlice:        38.0% flat bytes
+writeScopes:            28.2% cumulative bytes
+routeKey/writeRouteKey: 18.6% cumulative bytes
+internRoute:            18.6% cumulative bytes
+builder.stringID:        9.9% flat bytes
+```
+
+CPU profile:
+
+```text
+Build:                  68.1% cumulative samples
+writeScopes:            25.7% cumulative samples
+internRoute:            12.7% cumulative samples
+routeKey/writeRouteKey: 12.4% cumulative samples
+sort.Slice:             11.2% cumulative samples
+```
+
+Interpretation:
+
+- parallelizing the current shape would reduce some wall time but retain the
+  dominant allocation pattern and add synchronization or merge complexity around
+  route dedupe and string interning
+- the smallest route-key fix is target-route dedupe by numeric provider/model
+  IDs, because target shape identity is fixed-width after provider/model
+  validation and does not require recursive string construction
+- chain and split route keys can stay string-based for this chunk; a full
+  variable-length structural key needs a separate design
+
+### Chunk 6: Numeric Target And Short Chain Route Keys
+
+Status: implemented.
+
+Change:
+
+- target route shapes now dedupe with a compact numeric key:
+  `providerID + modelID`
+- short chain route shapes with up to three children now dedupe with a compact
+  numeric key:
+  `retry SID + timeout + child route IDs`
+- longer chain and split routes keep the existing string route-key path
+- this preserves the persisted format and public API; it only changes temporary
+  builder dedupe keys
+
+Focused benchmark command:
+
+```sh
+go test -run '^$' \
+  -bench '^BenchmarkCherryPackRouteScale/byok-provider-secret-(always|prefer)/route_entries=1000000' \
+  -benchmem \
+  -benchtime=3s \
+  -count=3 \
+  .
+```
+
+Raw output:
+
+```text
+/tmp/cherry-byok-provider-after-target-chain-interner-20260613214500.txt
+```
+
+Representative p50 before -> after:
+
+```text
+byok-provider-secret-always, 1M route entries:
+  time:   0.825 s/op -> 0.726 s/op
+  alloc:  504.9 MB/op -> 424.9 MB/op
+  allocs: 4.0M/op -> 1.0M/op
+  blob:   54.0 MB raw -> 54.0 MB raw
+
+byok-provider-secret-prefer, 1M route entries:
+  time:   1.20 s/op -> 1.06 s/op
+  alloc:  584.9 MB/op -> 424.9 MB/op
+  allocs: 5.0M/op -> 1.0M/op
+  blob:   54.0 MB raw -> 54.0 MB raw
+```
+
+Interpretation:
+
+- target route keys were the dominant allocation-count source for `ALWAYS`
+- recursive chain route keys kept `PREFER` expensive after the target-only
+  change; using child route IDs for short chain identity fixes that realistic
+  provider-BYOK fallback shape
+- parallelization is still secondary: the serial builder now avoids the largest
+  route-key allocation pattern, and concurrency would need deterministic merge
+  rules for route IDs, string IDs, and scope-local indexes
+
 ## Optimization Log
 
 ### Chunk 1: Carry Compiled IDs Into Table Writers
