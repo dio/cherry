@@ -1930,6 +1930,73 @@ make format
 make lint
 ```
 
+### Chunk 13: Short Weighted Split Route Interning
+
+Status: implemented.
+
+Change:
+
+- added a typed interning key for split routes with up to three weighted
+  children
+- common weighted split shapes now dedupe by child route IDs and weights instead
+  of building recursive string route keys
+- generic `routeKey` remains for larger or less common route trees
+- persisted pack format and public APIs are unchanged from version 6
+
+Focused before/after benchmark command:
+
+```sh
+go test -run '^$' \
+  -bench '^BenchmarkCherryPackRouteScale/weighted-split-2-shared/route_entries=1000000' \
+  -benchmem \
+  -benchtime=3s \
+  -count=6 \
+  . | tee /tmp/cherry-weighted-split-before.txt
+
+go test -run '^$' \
+  -bench '^BenchmarkCherryPackRouteScale/weighted-split-2-shared/route_entries=1000000' \
+  -benchmem \
+  -benchtime=3s \
+  -count=6 \
+  . | tee /tmp/cherry-weighted-split-after.txt
+
+benchstat /tmp/cherry-weighted-split-before.txt /tmp/cherry-weighted-split-after.txt
+```
+
+Benchstat result:
+
+```text
+time:     994.3 ms/op -> 789.0 ms/op, -20.64% (p=0.002 n=6)
+alloc:    297.5 MiB/op -> 183.0 MiB/op, -38.47% (p=0.002 n=6)
+allocs:   4,000,630/op -> 630/op, -99.98% (p=0.002 n=6)
+blob:     unchanged
+```
+
+Profile read before the change:
+
+```text
+alloc_objects:
+  strings.Builder.WriteString: 57.0% flat
+  strings.Builder.WriteByte:   21.6% flat
+  Build -> internRoute -> routeKey/writeRouteKey: 78.6% cumulative
+```
+
+Interpretation:
+
+- route-key construction was the weighted split allocation-count bottleneck
+- this mirrors the earlier short-chain typed key optimization but keeps scope
+  limited to small split route nodes
+- the target shape now has allocation count comparable to simple shared-route
+  shapes while preserving identical output bytes
+
+Validation:
+
+```sh
+go test ./...
+make format
+make lint
+```
+
 Split-view query/open benchmark:
 
 ```sh

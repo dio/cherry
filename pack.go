@@ -1336,6 +1336,7 @@ type compiledMCPProfile struct {
 type routeInterner struct {
 	targetIDs map[targetRouteKey]uint32
 	chainIDs  map[chainRouteKey]uint32
+	splitIDs  map[splitRouteKey]uint32
 	routeIDs  map[string]uint32
 }
 
@@ -1354,6 +1355,16 @@ type chainRouteKey struct {
 	hasRetry   bool
 }
 
+type splitRouteKey struct {
+	child0     uint32
+	child1     uint32
+	child2     uint32
+	weight0    uint32
+	weight1    uint32
+	weight2    uint32
+	childCount uint8
+}
+
 func newBuilder() *builder {
 	return &builder{
 		stringIndex: map[string]uint32{"": 0},
@@ -1365,6 +1376,7 @@ func newRouteInterner() *routeInterner {
 	return &routeInterner{
 		targetIDs: map[targetRouteKey]uint32{},
 		chainIDs:  map[chainRouteKey]uint32{},
+		splitIDs:  map[splitRouteKey]uint32{},
 		routeIDs:  map[string]uint32{},
 	}
 }
@@ -1508,6 +1520,9 @@ func internRoute(
 	if normalized.Kind == RouteKindChain && len(normalized.Children) <= 3 {
 		return internShortChainRoute(normalized, b, providerIDs, modelIDs, routeIDs, routes)
 	}
+	if normalized.Kind == RouteKindSplit && len(normalized.Split) <= 3 {
+		return internShortSplitRoute(normalized, b, providerIDs, modelIDs, routeIDs, routes)
+	}
 
 	key := routeKey(normalized)
 	if id, ok := routeIDs.routeIDs[key]; ok {
@@ -1593,6 +1608,51 @@ func internShortChainRoute(
 	}
 	id := uint32(len(*routes))
 	routeIDs.chainIDs[key] = id
+	*routes = append(*routes, compiled)
+	return id, nil
+}
+
+func internShortSplitRoute(
+	route RoutePlan,
+	b *builder,
+	providerIDs map[string]uint32,
+	modelIDs map[string]uint32,
+	routeIDs *routeInterner,
+	routes *[]compiledRoute,
+) (uint32, error) {
+	if len(route.Split) == 0 {
+		return 0, errors.New("split route node must not be empty")
+	}
+	key := splitRouteKey{childCount: uint8(len(route.Split))}
+	var childIDs [3]uint32
+	var weights [3]uint32
+	for index, child := range route.Split {
+		if child.Weight == 0 {
+			return 0, fmt.Errorf("split[%d]: weight must be positive", index)
+		}
+		childID, err := internRoute(child.Plan, b, providerIDs, modelIDs, routeIDs, routes)
+		if err != nil {
+			return 0, fmt.Errorf("split[%d]: %w", index, err)
+		}
+		childIDs[index] = childID
+		weights[index] = child.Weight
+	}
+	key.child0 = childIDs[0]
+	key.child1 = childIDs[1]
+	key.child2 = childIDs[2]
+	key.weight0 = weights[0]
+	key.weight1 = weights[1]
+	key.weight2 = weights[2]
+	if id, ok := routeIDs.splitIDs[key]; ok {
+		return id, nil
+	}
+
+	compiled := compiledRoute{
+		plan:          route,
+		splitChildIDs: append([]uint32(nil), childIDs[:len(route.Split)]...),
+	}
+	id := uint32(len(*routes))
+	routeIDs.splitIDs[key] = id
 	*routes = append(*routes, compiled)
 	return id, nil
 }
