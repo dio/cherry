@@ -1,5 +1,3 @@
-// Package repl provides an embeddable diagnostic command executor for Cherry
-// bundles.
 package repl
 
 import (
