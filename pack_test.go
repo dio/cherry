@@ -76,6 +76,109 @@ func TestReaderResolveLLMPlan(t *testing.T) {
 	assert.Equal(t, "env://USER_OPENAI_KEY", reader.String(ids.SecretSID))
 }
 
+func TestReaderProviderBYOKAlwaysDedupesRouteShape(t *testing.T) {
+	input := testPackInput(1, 1)
+	input.Scopes[0].Principals = []Principal{
+		{
+			Slug: "slug:user-a",
+			ModelRoutes: map[string]RoutePlan{
+				"gpt-4o-mini": {
+					Kind:      RouteKindTarget,
+					Provider:  "openai",
+					Model:     "gpt-4o-mini",
+					SecretRef: "env://USER_A_OPENAI",
+				},
+			},
+		},
+		{
+			Slug: "slug:user-b",
+			ModelRoutes: map[string]RoutePlan{
+				"gpt-4o-mini": {
+					Kind:      RouteKindTarget,
+					Provider:  "openai",
+					Model:     "gpt-4o-mini",
+					SecretRef: "env://USER_B_OPENAI",
+				},
+			},
+		},
+	}
+
+	blob, err := Build(input)
+	require.NoError(t, err)
+	reader, err := Open(blob)
+	require.NoError(t, err)
+
+	assert.Equal(t, uint32(1), reader.sectionCount(reader.routesOff))
+
+	userA, ok := reader.ResolveLLMIDs("workspace1", "slug:user-a", "gpt-4o-mini")
+	require.True(t, ok)
+	assert.Equal(t, "env://USER_A_OPENAI", reader.String(userA.SecretSID))
+
+	userB, ok := reader.ResolveLLMIDs("workspace1", "slug:user-b", "gpt-4o-mini")
+	require.True(t, ok)
+	assert.Equal(t, "env://USER_B_OPENAI", reader.String(userB.SecretSID))
+}
+
+func TestReaderProviderBYOKPreferDedupesRouteShapeAndKeepsPlatformFallback(t *testing.T) {
+	input := testPackInput(1, 1)
+	input.Scopes[0].Principals = []Principal{
+		{
+			Slug: "slug:user-a",
+			ModelRoutes: map[string]RoutePlan{
+				"gpt-4o-mini": providerBYOKPreferRoute("env://USER_A_OPENAI"),
+			},
+		},
+		{
+			Slug: "slug:user-b",
+			ModelRoutes: map[string]RoutePlan{
+				"gpt-4o-mini": providerBYOKPreferRoute("env://USER_B_OPENAI"),
+			},
+		},
+	}
+
+	blob, err := Build(input)
+	require.NoError(t, err)
+	reader, err := Open(blob)
+	require.NoError(t, err)
+
+	assert.Equal(t, uint32(2), reader.sectionCount(reader.routesOff))
+
+	userA, ok := reader.ResolveLLMPlan("workspace1", "slug:user-a", "gpt-4o-mini")
+	require.True(t, ok)
+	require.Len(t, userA.Plan.Children, 2)
+	assert.Equal(t, "env://USER_A_OPENAI", userA.Plan.Children[0].Plan.SecretRef)
+	assert.Equal(t, "env://OPENAI_API_KEY", userA.Plan.Children[1].Plan.SecretRef)
+
+	userB, ok := reader.ResolveLLMPlan("workspace1", "slug:user-b", "gpt-4o-mini")
+	require.True(t, ok)
+	require.Len(t, userB.Plan.Children, 2)
+	assert.Equal(t, "env://USER_B_OPENAI", userB.Plan.Children[0].Plan.SecretRef)
+	assert.Equal(t, "env://OPENAI_API_KEY", userB.Plan.Children[1].Plan.SecretRef)
+}
+
+func providerBYOKPreferRoute(secretRef string) RoutePlan {
+	return RoutePlan{
+		Kind: RouteKindChain,
+		Retry: &RetryPolicy{
+			RetryOn:         "401,connect-failure,reset,5xx",
+			PerTryTimeoutMS: 1000,
+		},
+		Children: []RoutePlan{
+			{
+				Kind:      RouteKindTarget,
+				Provider:  "openai",
+				Model:     "gpt-4o-mini",
+				SecretRef: secretRef,
+			},
+			{
+				Kind:     RouteKindTarget,
+				Provider: "openai",
+				Model:    "gpt-4o-mini",
+			},
+		},
+	}
+}
+
 func TestReaderManifestAndBoundsHelpers(t *testing.T) {
 	blob, manifest, err := BuildWithManifest(testPackInput(1, 1))
 	require.NoError(t, err)

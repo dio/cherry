@@ -76,6 +76,8 @@ func BenchmarkCherryPackRouteScale(b *testing.B) {
 		routeScaleFallbackChain3,
 		routeScaleWeightedSplit2,
 		routeScaleBYOKUniqueSecret,
+		routeScaleBYOKProviderSecretAlways,
+		routeScaleBYOKProviderSecretPrefer,
 		routeScaleSharedRatePolicy,
 		routeScaleUniqueRatePolicy,
 	} {
@@ -152,6 +154,8 @@ const (
 	routeScaleFallbackChain3
 	routeScaleWeightedSplit2
 	routeScaleBYOKUniqueSecret
+	routeScaleBYOKProviderSecretAlways
+	routeScaleBYOKProviderSecretPrefer
 	routeScaleSharedRatePolicy
 	routeScaleUniqueRatePolicy
 )
@@ -168,6 +172,10 @@ func (s routeScaleShape) String() string {
 		return "weighted-split-2-shared"
 	case routeScaleBYOKUniqueSecret:
 		return "byok-target-unique-secret"
+	case routeScaleBYOKProviderSecretAlways:
+		return "byok-provider-secret-always"
+	case routeScaleBYOKProviderSecretPrefer:
+		return "byok-provider-secret-prefer"
 	case routeScaleSharedRatePolicy:
 		return "rate-policy-shared"
 	case routeScaleUniqueRatePolicy:
@@ -299,9 +307,29 @@ func benchmarkRoutePlan(modelIndex int, principalIndex int, shape routeScaleShap
 	case routeScaleBYOKUniqueSecret:
 		target.SecretRef = "env://USER_" + itoa(principalIndex) + "_MODEL_" + itoa(modelIndex)
 		return target
+	case routeScaleBYOKProviderSecretAlways:
+		target.SecretRef = benchmarkProviderSecretRef(principalIndex, providerID)
+		return target
+	case routeScaleBYOKProviderSecretPrefer:
+		target.SecretRef = benchmarkProviderSecretRef(principalIndex, providerID)
+		return RoutePlan{
+			Kind: RouteKindChain,
+			Retry: &RetryPolicy{
+				RetryOn:         "401,connect-failure,reset,5xx",
+				PerTryTimeoutMS: 1000,
+			},
+			Children: []RoutePlan{
+				target,
+				{Kind: RouteKindTarget, Provider: providerID, Model: modelID},
+			},
+		}
 	default:
 		return target
 	}
+}
+
+func benchmarkProviderSecretRef(principalIndex int, providerID string) string {
+	return "env://USER_" + itoa(principalIndex) + "_PROVIDER_" + providerID
 }
 
 func benchmarkMCPProfileInput(profileCount int, toolsPerProfile int, shape mcpProfileScaleShape) Input {

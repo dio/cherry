@@ -281,6 +281,306 @@ Expected benefits:
 - generation swap remains atomic
 - old generations can still be safely held by in-flight requests
 
+### Reactive Snapshot Scenario
+
+The current production cadence may remain periodic, but high-priority mutable
+events should interrupt that cadence and publish a fresh immutable generation.
+Cherry should still start after the external source system has normalized the
+event:
+
+```text
+source key/secret/profile event
+  -> external watcher/verifier/transformer
+  -> normalized SnapshotChange
+  -> SnapshotPolicy.Decide
+  -> rebuild affected bundle or future overlay shard
+  -> encode/open/validate
+  -> atomic generation swap
+```
+
+For example, if key material changes, Cherry must not watch, verify, or store
+that material. The upstream system should map the event to a normalized mutable
+change such as `SnapshotChangePrincipalBinding` when the verified principal
+membership changes, or `SnapshotChangeSecretRef` when the effective credential
+reference changes. Under `DefaultSnapshotPolicy`, those changes request an
+immediate snapshot even when the normal cadence is `periodic`.
+
+Static catalog events, such as provider/model metadata refreshes, can wait for
+the next periodic snapshot unless the caller opts into `SnapshotCadenceReactive`
+or adds that kind to `ReactiveKinds`.
+
+### BYOK Route Allocation Insight
+
+Unique BYOK route entries are expensive primarily because the current route
+dedupe identity combines route shape with credential binding. Target route keys
+include:
+
+```text
+provider + model + secret_ref
+```
+
+The original `byok-target-unique-secret` benchmark is a stress shape where the
+input emits a different secret ref for every principal/requested-model pair. That
+is not the expected product-default BYOK shape. In the real UI, a user typically
+sets one BYOK credential per provider, such as one Anthropic key and one OpenAI
+key, then chooses a policy:
+
+- `ALWAYS`: use the user's provider key
+- `PREFER`: try the user's provider key and fall back to the platform provider
+  key when the BYOK attempt fails
+
+Rules can still express per-model overrides, so the stress benchmark remains
+valid as an upper bound, but the benchmark matrix now also includes
+provider-level BYOK shapes:
+
+```text
+byok-provider-secret-always
+byok-provider-secret-prefer
+```
+
+Even with provider-level credential refs, the current format still duplicates
+target route records by principal/requested-model because the secret ref is part
+of target route identity. Provider-level normalization reduces unique secret
+strings from roughly principal/model cardinality to principal/provider
+cardinality, but it does not fully recover route-shape dedupe.
+
+The route tree shape is not the first-order problem in that benchmark because
+the worst stress case is already a single target node. In the real `PREFER`
+provider-key shape, trees do amplify the issue: the platform fallback target is
+shared, but the chain parent remains unique because its BYOK child is unique.
+The root issue is still coupling route-shape dedupe to per-principal credential
+metadata.
+
+Near-term producer guidance:
+
+- normalize credential refs to the coarsest semantically correct level before
+  building `cherry.Input`
+- prefer one principal/provider credential ref over principal/model refs when
+  the same BYOK credential applies to all models for that provider
+- do not collapse refs that represent genuinely different credentials or
+  different enforcement semantics
+
+Likely root-package optimization direction:
+
+```text
+route_shape(provider, model, tree)
+principal_route_binding(principal, requested_model, route_shape_id, secret_ref_id, rate_id)
+```
+
+That split would let Cherry dedupe the static route shape while keeping secret
+refs and rate policies in mutable binding metadata. For chain and split plans,
+the same idea may require a credential overlay keyed by route leaf or child
+position so shared trees can still carry per-principal BYOK refs without
+duplicating the full route tree.
+
+Focused provider-level BYOK benchmark, 2026-06-13:
+
+```text
+byok-provider-secret-always, 100k route entries:
+  time: 532.3 ms/op
+  alloc: 183.7 MB/op
+  allocs: 401k/op
+  blob: 6.2 MB raw, 1.6 MB zstd
+
+byok-provider-secret-always, 1M route entries:
+  time: 3.61 s/op
+  alloc: 1.82 GB/op
+  allocs: 4.0M/op
+  blob: 62.0 MB raw, 16.2 MB zstd
+
+byok-provider-secret-prefer, 100k route entries:
+  time: 723.8 ms/op
+  alloc: 340.2 MB/op
+  allocs: 1.3M/op
+  blob: 10.2 MB raw, 2.1 MB zstd
+
+byok-provider-secret-prefer, 1M route entries:
+  time: 30.0 s/op
+  alloc: 3.35 GB/op
+  allocs: 13.0M/op
+  blob: 102.0 MB raw, 20.5 MB zstd
+```
+
+Raw output:
+
+```text
+/tmp/cherry-byok-provider-bench-20260613204349.txt
+```
+
+These provider-level results replace the earlier interpretation that the
+per-model stress shape was the only large BYOK concern. Provider-level
+normalization is still the right producer behavior, but it does not solve the
+builder allocation problem by itself. The `PREFER` shape is the clearest
+realistic driver for V2 route-shape/binding separation because it combines
+per-principal provider credentials with fallback-chain trees.
+
+After chunk 3, route shape and binding metadata are separated inside the pack.
+The before numbers above are retained as the baseline that motivated the format
+change.
+
+### Route Shape / Binding Separation Plan
+
+Goal: let Cherry dedupe route topology independently from per-principal mutable
+metadata such as BYOK credential refs and rate policies.
+
+Current target route identity:
+
+```text
+target(provider_id, model_id, secret_ref_id)
+```
+
+Desired split:
+
+```text
+route_shape(provider_id, model_id, tree)
+principal_route_binding(scope, principal, requested_model, route_shape_id, credential_refs, rate_policy_id)
+```
+
+For `ALWAYS` provider BYOK:
+
+```text
+shape #7:
+  target anthropic/claude-haiku
+
+binding:
+  principal slug:user-a, requested_model claude-haiku
+  route_shape_id #7
+  credential slot target = env://USER_A_ANTHROPIC
+```
+
+For `PREFER` provider BYOK:
+
+```text
+shape #12:
+  chain retry_on=401,connect-failure,reset,5xx
+    child 0: target anthropic/claude-haiku credential_slot=byok
+    child 1: target anthropic/claude-haiku credential_slot=platform
+
+binding:
+  principal slug:user-a, requested_model claude-haiku
+  route_shape_id #12
+  credential slot byok = env://USER_A_ANTHROPIC
+  credential slot platform = env://ANTHROPIC_PLATFORM_KEY
+```
+
+Implementation phases:
+
+1. Add measurement-only benchmarks and profiles for realistic provider-level
+   `ALWAYS` and `PREFER` BYOK. Status: benchmark cases added.
+2. Format bump:
+   - add route shape records that store provider/model topology and tree child
+     relationships
+   - add principal route binding records that point to shape IDs, rate IDs, and
+     credential binding records
+   - add credential slot records for target leaves or stable leaf ordinals
+   - update `Open`, `validateOffsets`, manifest/version checks, round-trip tests,
+     and inspector tests
+3. Preserve hot-path APIs:
+   - `ResolveLLMPlanIDs` should return the same effective provider/model/secret
+     refs, but materialize them by applying binding credential slots to the
+     shared route shape
+   - `ResolveLLMIDs` can keep returning the first executable target with the
+     effective secret ref
+   - string-materializing diagnostics should remain stable
+4. Build V2 overlay/shard support on top of the split:
+   - static/base pack owns provider/model catalogs and reusable route shapes
+   - mutable overlay owns scopes, principal route bindings, credential slots,
+     rate policies, MCP profile bindings, and MCP credential refs
+   - scope-sharded overlays can replace only affected workspaces when a key or
+     secret-ref changes
+5. Validation criteria:
+   - provider-level `ALWAYS` and `PREFER` BYOK allocation drops materially at
+     100k and 1M route entries
+   - simple shared route and catalog benchmarks do not regress
+   - route resolution outputs are byte-for-byte equivalent in tests for target,
+     chain, split, BYOK `ALWAYS`, and BYOK `PREFER`
+   - old immutable generations remain safe for in-flight requests during swaps
+
+Risks and constraints:
+
+- credential slot ordinals must be deterministic so inspector APIs are stable
+- chain/split route shapes need a clear way to identify which target leaf a
+  binding credential applies to
+- route-shape dedupe must not collapse routes with different retry semantics,
+  provider/model targets, child order, or split weights
+- this is a binary format change once it affects persisted tables, so it should
+  bump the internal pack version and update all validation paths
+
+### Chunk 3: Split Route Shape From Credential Binding
+
+Status: implemented.
+
+Change:
+
+- pack format version bumped from 5 to 6
+- principal route records now include credential slot count and offset
+- credential slot records store target-leaf ordinal and secret-ref SID
+- target route shape keys now exclude actual secret refs
+- route traversal applies principal binding credential slots by deterministic
+  target ordinal
+- `PREFER` chains can share topology even when the BYOK child and platform
+  fallback child use the same provider/model with different secret refs
+- hot-path and diagnostic APIs preserve effective secret-ref behavior
+
+Focused benchmark command:
+
+```sh
+go test -run '^$' \
+  -bench '^BenchmarkCherryPackRouteScale/byok-provider-secret-(always|prefer)/' \
+  -benchmem \
+  -benchtime=3s \
+  -count=3 \
+  ./...
+```
+
+Raw output:
+
+```text
+/tmp/cherry-byok-provider-after-shape-binding-20260613205732.txt
+```
+
+Representative p50 after results:
+
+```text
+byok-provider-secret-always, 100k route entries:
+  time: 83.6 ms/op
+  alloc: 76.4 MB/op
+  allocs: 700k/op
+  blob: 5.4 MB raw, 1.5 MB zstd
+
+byok-provider-secret-always, 1M route entries:
+  time: 1.29 s/op
+  alloc: 732.8 MB/op
+  allocs: 7.0M/op
+  blob: 54.0 MB raw, 15.8 MB zstd
+
+byok-provider-secret-prefer, 100k route entries:
+  time: 101.1 ms/op
+  alloc: 92.4 MB/op
+  allocs: 1.1M/op
+  blob: 5.4 MB raw, 1.6 MB zstd
+
+byok-provider-secret-prefer, 1M route entries:
+  time: 1.54 s/op
+  alloc: 892.8 MB/op
+  allocs: 11.0M/op
+  blob: 54.0 MB raw, 15.8 MB zstd
+```
+
+Before -> after p50 deltas:
+
+```text
+byok-provider-secret-always, 1M route entries:
+  time: 3.61 s/op -> 1.29 s/op
+  alloc: 1.82 GB/op -> 732.8 MB/op
+  blob: 62.0 MB raw -> 54.0 MB raw
+
+byok-provider-secret-prefer, 1M route entries:
+  time: 30.0 s/op -> 1.54 s/op
+  alloc: 3.35 GB/op -> 892.8 MB/op
+  blob: 102.0 MB raw -> 54.0 MB raw
+```
+
 Open design questions:
 
 - whether overlays are exposed as a new root API or hidden behind a higher-level
@@ -381,11 +681,110 @@ reduced allocation count, but regressed CPU because every route lookup had to
 hash multiple string fields. Do not reintroduce that approach without a better
 hashing strategy and benchmark proof.
 
+### Benchmark Run: 2026-06-13 Complete Matrix
+
+Status: completed.
+
+Command:
+
+```sh
+go test -run '^$' \
+  -bench '^BenchmarkCherryPack(CatalogScale|RouteScale|MCPProfileScale)$' \
+  -benchmem \
+  -benchtime=3s \
+  -count=3 \
+  ./...
+```
+
+Environment:
+
+```text
+Go:          go1.26.2
+GOOS/GOARCH: darwin/arm64
+CPU:         Apple M1
+GOMAXPROCS: 8
+Raw output:  /tmp/cherry-pack-bench-complete-20260613202120.txt
+Elapsed:     root package 946.810s
+```
+
+Representative p50 results from the three samples:
+
+```text
+catalog, 500 providers x 5k models:
+  time: 19.7 ms/op
+  alloc: 10.9 MB/op
+  allocs: 25.3k/op
+  blob: 626.7 KB raw, 219.1 KB zstd
+
+simple shared target routes, 1M route entries:
+  time: 1.27 s/op
+  alloc: 357.2 MB/op
+  allocs: 3.0M/op
+  blob: 26.0 MB raw, 9.8 MB zstd
+
+unique rate policies, 1M route entries:
+  time: 2.14 s/op
+  alloc: 378.6 MB/op
+  allocs: 3.0M/op
+  blob: 27.6 MB raw, 10.2 MB zstd
+
+unique BYOK target secret refs, 100k route entries:
+  time: 280.0 ms/op
+  alloc: 197.9 MB/op
+  allocs: 391k/op
+  blob: 7.7 MB raw, 2.0 MB zstd
+
+unique BYOK target secret refs, 1M route entries:
+  time: 3.44 s/op
+  alloc: 2.0 GB/op
+  allocs: 4.0M/op
+  blob: 77.9 MB raw, 20.0 MB zstd
+
+MCP shared toolsets, 10k profiles x 10 tools:
+  time: 104.7 ms/op
+  alloc: 58.4 MB/op
+  allocs: 140k/op
+  blob: 320.7 KB raw, 141.1 KB zstd
+
+MCP unique toolsets, 10k profiles x 10 tools:
+  time: 205.1 ms/op
+  alloc: 99.8 MB/op
+  allocs: 131k/op
+  blob: 6.1 MB raw, 803.3 KB zstd
+
+MCP unique secret refs, 10k profiles x 10 tools:
+  time: 85.5 ms/op
+  alloc: 74.4 MB/op
+  allocs: 139k/op
+  blob: 2.7 MB raw, 349.1 KB zstd
+```
+
+Interpretation:
+
+- catalog rebuild cost remains secondary compared with route/profile churn
+- unique BYOK route entries remain the largest allocation concern by a wide
+  margin
+- unique rate policies add modest cost relative to simple target routes, but do
+  not resemble the BYOK secret-ref allocation profile
+- MCP profile churn is meaningful at 10k-profile scale, especially unique
+  toolsets, but still below the 1M BYOK-heavy LLM route case
+- this supports the V2 direction: a key or secret-ref event should trigger an
+  immediate immutable snapshot for the affected mutable surface, and future
+  overlay or scope sharding should avoid rebuilding unrelated catalog and route
+  data
+
 ## Current Status
 
 - Benchmarks added in `pack_bench_test.go`.
 - First no-format-change allocation reduction implemented in `pack.go`.
 - Scope-local lookup hash precomputation implemented in `pack.go`.
+- V2 snapshot planning started with `SnapshotPolicy`: callers can keep a
+  periodic cadence for static catalog churn while requesting an immediate
+  immutable snapshot for normalized mutable changes such as principal binding,
+  route, secret-ref, rate policy, and MCP profile/tool binding changes.
+- Route shape / credential binding separation implemented in pack format version
+  6.
+- Complete `-benchtime=3s -count=3` benchmark matrix captured on 2026-06-13.
 - `go test ./...` passes.
 - `make format` passes.
 - `make lint` passes.

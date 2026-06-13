@@ -28,7 +28,7 @@ import (
 
 const (
 	magic              = "OPK1"
-	currentPackVersion = uint32(5)
+	currentPackVersion = uint32(6)
 	headerSize         = 64
 
 	// Header layout:
@@ -38,7 +38,7 @@ const (
 	//   16:20 strings table offset
 	//   20:24 providers table offset
 	//   24:28 models table offset
-	//   28:32 route plans table offset
+	//   28:32 route shape table offset
 	//   32:36 rate policies table offset
 	//   36:40 MCP servers table offset
 	//   40:44 MCP toolsets table offset
@@ -60,7 +60,8 @@ const (
 	headerPrincipalsOff  = 48
 	headerMCPPathsOff    = 52
 
-	principalLen      = 24 // hash64(slug + "\x00" + requestedModel), slugSID, routeID, rateID, requestedModelID
+	principalLen      = 32 // hash64(slug + "\x00" + requestedModel), slugSID, routeID, rateID, requestedModelID, credentialCount, credentialOffset
+	credentialLen     = 8  // target ordinal, secretSID
 	modelLen          = 32 // hash64, idSID, providerID, nameSID, modeSID, capabilitiesSID, metadataSID
 	providerLen       = 24 // idSID, kindSID, endpointSID, secretSID, authTypeSID, pathPrefixSID
 	routeLen          = 24 // kind, target fields or child count/offset/retry fields
@@ -560,13 +561,21 @@ func Build(input Input) ([]byte, error) {
 				if err != nil {
 					return nil, fmt.Errorf("principal %q route for %q: %w", principal.Slug, requestedModel, err)
 				}
+				credentialSlots, err := routeCredentialSlots(route, routeIDs)
+				if err != nil {
+					return nil, fmt.Errorf("principal %q route for %q: %w", principal.Slug, requestedModel, err)
+				}
+				for _, slot := range credentialSlots {
+					builder.stringID(slot.secretRef)
+				}
 				lookupHash := principalLookupHash(principal.Slug, requestedModel)
 				compiled.principalEntries = append(compiled.principalEntries, compiledPrincipalEntry{
-					slug:           principal.Slug,
-					requestedModel: requestedModel,
-					lookupHash:     lookupHash,
-					routeID:        routeID,
-					rate:           principal.Rate,
+					slug:            principal.Slug,
+					requestedModel:  requestedModel,
+					lookupHash:      lookupHash,
+					routeID:         routeID,
+					rate:            principal.Rate,
+					credentialSlots: credentialSlots,
 				})
 			}
 			if _, ok := rateIDs[principal.Rate]; !ok {
@@ -761,7 +770,8 @@ func (r Reader) ResolveLLMPlanIDs(scopeID string, principalSlug string, modelID 
 	if !ok {
 		return LLMPlanIDs{}, false
 	}
-	plan, ok := r.routePlanIDs(principal.routeID)
+	var targetOrdinal uint32
+	plan, ok := r.routePlanIDs(principal.routeID, principal, &targetOrdinal)
 	if !ok {
 		return LLMPlanIDs{}, false
 	}
@@ -1170,11 +1180,14 @@ func (r Reader) PrincipalRoutes(scopeID string) ([]PrincipalRoute, bool) {
 	for i := uint32(0); i < scope.principalCount; i++ {
 		entryBase := base + int(i)*principalLen
 		principal := principalRef{
-			slugSID: r.read32(entryBase + 8),
-			routeID: r.read32(entryBase + 12),
-			rateID:  r.read32(entryBase + 16),
+			slugSID:          r.read32(entryBase + 8),
+			routeID:          r.read32(entryBase + 12),
+			rateID:           r.read32(entryBase + 16),
+			credentialCount:  r.read32(entryBase + 24),
+			credentialOffset: r.read32(entryBase + 28),
 		}
-		plan, ok := r.routePlanIDs(principal.routeID)
+		var targetOrdinal uint32
+		plan, ok := r.routePlanIDs(principal.routeID, principal, &targetOrdinal)
 		if !ok {
 			continue
 		}
@@ -1287,11 +1300,17 @@ type compiledScope struct {
 }
 
 type compiledPrincipalEntry struct {
-	slug           string
-	requestedModel string
-	lookupHash     uint64
-	routeID        uint32
-	rate           RatePolicy
+	slug            string
+	requestedModel  string
+	lookupHash      uint64
+	routeID         uint32
+	rate            RatePolicy
+	credentialSlots []compiledCredentialSlot
+}
+
+type compiledCredentialSlot struct {
+	targetOrdinal uint32
+	secretRef     string
 }
 
 type compiledMCPProfile struct {
@@ -1404,7 +1423,7 @@ func internRoute(
 		if _, ok := providerIDs[normalized.Provider]; !ok {
 			return 0, fmt.Errorf("references unknown provider %q", normalized.Provider)
 		}
-		b.stringID(normalized.SecretRef)
+		compiled.plan.SecretRef = ""
 	case RouteKindChain:
 		if len(normalized.Children) == 0 {
 			return 0, errors.New("chain route node must not be empty")
@@ -1460,8 +1479,6 @@ func writeRouteKey(builder *strings.Builder, route RoutePlan) {
 		builder.WriteString(route.Provider)
 		builder.WriteByte('\x00')
 		builder.WriteString(route.Model)
-		builder.WriteByte('\x00')
-		builder.WriteString(route.SecretRef)
 	case RouteKindChain:
 		if route.Retry != nil {
 			builder.WriteString(route.Retry.RetryOn)
@@ -1480,6 +1497,52 @@ func writeRouteKey(builder *strings.Builder, route RoutePlan) {
 			writeRouteKey(builder, child.Plan)
 		}
 	}
+}
+
+func routeCredentialSlots(route RoutePlan, routeIDs map[string]uint32) ([]compiledCredentialSlot, error) {
+	slots := []compiledCredentialSlot{}
+	var targetOrdinal uint32
+	if err := appendRouteCredentialSlots(route, routeIDs, &targetOrdinal, &slots); err != nil {
+		return nil, err
+	}
+	return slots, nil
+}
+
+func appendRouteCredentialSlots(
+	route RoutePlan,
+	routeIDs map[string]uint32,
+	targetOrdinal *uint32,
+	slots *[]compiledCredentialSlot,
+) error {
+	normalized := normalizeRoutePlan(route)
+	switch normalized.Kind {
+	case RouteKindTarget:
+		if _, ok := routeIDs[routeKey(normalized)]; !ok {
+			return errors.New("missing route shape for credential slot")
+		}
+		if normalized.SecretRef != "" {
+			*slots = append(*slots, compiledCredentialSlot{
+				targetOrdinal: *targetOrdinal,
+				secretRef:     normalized.SecretRef,
+			})
+		}
+		(*targetOrdinal)++
+	case RouteKindChain:
+		for index, child := range normalized.Children {
+			if err := appendRouteCredentialSlots(child, routeIDs, targetOrdinal, slots); err != nil {
+				return fmt.Errorf("chain[%d]: %w", index, err)
+			}
+		}
+	case RouteKindSplit:
+		for index, child := range normalized.Split {
+			if err := appendRouteCredentialSlots(child.Plan, routeIDs, targetOrdinal, slots); err != nil {
+				return fmt.Errorf("split[%d]: %w", index, err)
+			}
+		}
+	default:
+		return fmt.Errorf("unsupported route node kind %q", normalized.Kind)
+	}
+	return nil
 }
 
 func capabilitiesKey(values []string) string {
@@ -1705,10 +1768,8 @@ func writeMCPToolsets(out *bytes.Buffer, b *builder, toolsets [][]MCPToolBinding
 func writeScopes(out *bytes.Buffer, b *builder, scopes []compiledScope, rateIDs map[RatePolicy]uint32) (uint32, uint32) {
 	putU32(out, uint32(len(scopes)))
 	scopeRecords := make([]scopeRef, len(scopes))
-	var principalData bytes.Buffer
-	var mcpPathData bytes.Buffer
-	principalsOff := uint32(out.Len() + len(scopes)*scopeLen)
-
+	sortedPrincipalEntries := make([][]compiledPrincipalEntry, len(scopes))
+	totalPrincipalRecords := 0
 	for i, scope := range scopes {
 		principalEntries := append([]compiledPrincipalEntry{}, scope.principalEntries...)
 		sort.Slice(principalEntries, func(i, j int) bool {
@@ -1720,6 +1781,17 @@ func writeScopes(out *bytes.Buffer, b *builder, scopes []compiledScope, rateIDs 
 			}
 			return principalEntries[i].lookupHash < principalEntries[j].lookupHash
 		})
+		sortedPrincipalEntries[i] = principalEntries
+		totalPrincipalRecords += len(principalEntries)
+	}
+	var principalData bytes.Buffer
+	var credentialData bytes.Buffer
+	var mcpPathData bytes.Buffer
+	principalsOff := uint32(out.Len() + len(scopes)*scopeLen)
+	credentialsOff := principalsOff + uint32(totalPrincipalRecords*principalLen)
+
+	for i, scope := range scopes {
+		principalEntries := sortedPrincipalEntries[i]
 		scopeRecords[i] = scopeRef{
 			sid:             b.stringID(scope.id),
 			principalCount:  uint32(len(principalEntries)),
@@ -1731,10 +1803,16 @@ func writeScopes(out *bytes.Buffer, b *builder, scopes []compiledScope, rateIDs 
 			putU32(&principalData, principal.routeID)
 			putU32(&principalData, rateIDs[principal.rate])
 			putU32(&principalData, b.stringID(principal.requestedModel))
+			putU32(&principalData, uint32(len(principal.credentialSlots)))
+			putU32(&principalData, credentialsOff+uint32(credentialData.Len()))
+			for _, slot := range principal.credentialSlots {
+				putU32(&credentialData, slot.targetOrdinal)
+				putU32(&credentialData, b.stringID(slot.secretRef))
+			}
 		}
 	}
 
-	mcpPathsOff := principalsOff + uint32(principalData.Len())
+	mcpPathsOff := credentialsOff + uint32(credentialData.Len())
 	for i, scope := range scopes {
 		profiles := append([]compiledMCPProfile{}, scope.mcpProfiles...)
 		sort.Slice(profiles, func(i, j int) bool {
@@ -1760,6 +1838,7 @@ func writeScopes(out *bytes.Buffer, b *builder, scopes []compiledScope, rateIDs 
 		putU32(out, record.mcpPathOffset)
 	}
 	out.Write(principalData.Bytes())
+	out.Write(credentialData.Bytes())
 	out.Write(mcpPathData.Bytes())
 	return principalsOff, mcpPathsOff
 }
@@ -1773,9 +1852,11 @@ type scopeRef struct {
 }
 
 type principalRef struct {
-	slugSID uint32
-	routeID uint32
-	rateID  uint32
+	slugSID          uint32
+	routeID          uint32
+	rateID           uint32
+	credentialCount  uint32
+	credentialOffset uint32
 }
 
 type mcpPathRef struct {
@@ -1980,9 +2061,11 @@ func (r Reader) findPrincipal(scope scopeRef, slug string, requestedModel string
 		requestedModelID := r.read32(entryBase + 20)
 		if r.stringEqual(sid, slug) && r.stringEqual(requestedModelID, requestedModel) {
 			return principalRef{
-				slugSID: sid,
-				routeID: r.read32(entryBase + 12),
-				rateID:  r.read32(entryBase + 16),
+				slugSID:          sid,
+				routeID:          r.read32(entryBase + 12),
+				rateID:           r.read32(entryBase + 16),
+				credentialCount:  r.read32(entryBase + 24),
+				credentialOffset: r.read32(entryBase + 28),
 			}, true
 		}
 	}
@@ -2086,13 +2169,17 @@ func (r Reader) route(id uint32) routeRef {
 	}
 }
 
-func (r Reader) routePlanIDs(routeID uint32) (LLMRoutePlanIDs, bool) {
+func (r Reader) routePlanIDs(routeID uint32, principal principalRef, targetOrdinal *uint32) (LLMRoutePlanIDs, bool) {
 	route := r.route(routeID)
 	switch route.kind {
 	case routeKindTargetID:
 		provider := r.provider(route.providerID)
 		model := r.model(route.modelID)
 		secretSID := route.secretSID
+		if credentialSID, ok := r.credentialSecretSID(principal, *targetOrdinal); ok {
+			secretSID = credentialSID
+		}
+		(*targetOrdinal)++
 		if r.stringEqual(secretSID, "") {
 			secretSID = provider.secretSID
 		}
@@ -2109,7 +2196,7 @@ func (r Reader) routePlanIDs(routeID uint32) (LLMRoutePlanIDs, bool) {
 			SecretSID:    secretSID,
 		}, true
 	case routeKindChainID:
-		children, ok := r.routeChildren(route)
+		children, ok := r.routeChildren(route, principal, targetOrdinal)
 		if !ok {
 			return LLMRoutePlanIDs{}, false
 		}
@@ -2121,7 +2208,7 @@ func (r Reader) routePlanIDs(routeID uint32) (LLMRoutePlanIDs, bool) {
 			Children:        children,
 		}, true
 	case routeKindSplitID:
-		children, ok := r.routeChildren(route)
+		children, ok := r.routeChildren(route, principal, targetOrdinal)
 		if !ok {
 			return LLMRoutePlanIDs{}, false
 		}
@@ -2135,13 +2222,13 @@ func (r Reader) routePlanIDs(routeID uint32) (LLMRoutePlanIDs, bool) {
 	}
 }
 
-func (r Reader) routeChildren(route routeRef) ([]LLMRouteChildIDs, bool) {
+func (r Reader) routeChildren(route routeRef, principal principalRef, targetOrdinal *uint32) ([]LLMRouteChildIDs, bool) {
 	children := make([]LLMRouteChildIDs, 0, route.childCount)
 	for i := uint32(0); i < route.childCount; i++ {
 		entryBase := int(route.childOffset) + int(i)*routeChildLen
 		weight := r.read32(entryBase)
 		childRouteID := r.read32(entryBase + 4)
-		child, ok := r.routePlanIDs(childRouteID)
+		child, ok := r.routePlanIDs(childRouteID, principal, targetOrdinal)
 		if !ok {
 			return nil, false
 		}
@@ -2151,6 +2238,16 @@ func (r Reader) routeChildren(route routeRef) ([]LLMRouteChildIDs, bool) {
 		})
 	}
 	return children, true
+}
+
+func (r Reader) credentialSecretSID(principal principalRef, targetOrdinal uint32) (uint32, bool) {
+	for i := uint32(0); i < principal.credentialCount; i++ {
+		entryBase := int(principal.credentialOffset) + int(i)*credentialLen
+		if r.read32(entryBase) == targetOrdinal {
+			return r.read32(entryBase + 4), true
+		}
+	}
+	return 0, false
 }
 
 func firstTargetPlanIDs(plan LLMRoutePlanIDs) (LLMRoutePlanIDs, bool) {
@@ -2346,6 +2443,42 @@ func (r Reader) validateOffsets() error {
 	for _, offset := range indexOffsets {
 		if int(offset) < headerSize || int(offset) > len(r.blob) {
 			return fmt.Errorf("invalid pack offset %d", offset)
+		}
+	}
+	if err := r.validateCredentialOffsets(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (r Reader) validateCredentialOffsets() error {
+	count := r.sectionCount(r.scopesOff)
+	base := int(r.scopesOff) + 4
+	credentialsStart := r.principalsOff
+	for scopeIndex := uint32(0); scopeIndex < count; scopeIndex++ {
+		principalCount := r.read32(base + int(scopeIndex)*scopeLen + 4)
+		principalOffset := r.read32(base + int(scopeIndex)*scopeLen + 8)
+		principalEnd := principalOffset + principalCount*principalLen
+		if principalEnd > credentialsStart {
+			credentialsStart = principalEnd
+		}
+	}
+	for scopeIndex := uint32(0); scopeIndex < count; scopeIndex++ {
+		scope := scopeRef{
+			principalCount:  r.read32(base + int(scopeIndex)*scopeLen + 4),
+			principalOffset: r.read32(base + int(scopeIndex)*scopeLen + 8),
+		}
+		for principalIndex := uint32(0); principalIndex < scope.principalCount; principalIndex++ {
+			entryBase := int(scope.principalOffset) + int(principalIndex)*principalLen
+			credentialCount := r.read32(entryBase + 24)
+			credentialOffset := r.read32(entryBase + 28)
+			if credentialCount == 0 {
+				continue
+			}
+			credentialEnd := int(credentialOffset) + int(credentialCount)*credentialLen
+			if credentialOffset < credentialsStart || credentialOffset > r.mcpPathsOff || credentialEnd > int(r.mcpPathsOff) {
+				return fmt.Errorf("invalid credential offset %d", credentialOffset)
+			}
 		}
 	}
 	return nil
