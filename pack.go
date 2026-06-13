@@ -1895,42 +1895,46 @@ func writeScopes(out *bytes.Buffer, b *builder, scopes []compiledScope, rateIDs 
 		}
 		totalMCPPathRecords += len(scopes[i].mcpProfiles)
 	}
-	var principalData bytes.Buffer
-	var credentialData bytes.Buffer
-	var mcpPathData bytes.Buffer
-	principalData.Grow(totalPrincipalRecords * principalLen)
-	credentialData.Grow(totalCredentialRecords * credentialLen)
-	mcpPathData.Grow(totalMCPPathRecords * mcpPathLen)
-	principalsOff := uint32(out.Len() + len(scopes)*scopeLen)
+	out.Grow(len(scopes)*scopeLen + totalPrincipalRecords*principalLen + totalCredentialRecords*credentialLen + totalMCPPathRecords*mcpPathLen)
+	scopeRecordsStart := out.Len()
+	out.Write(make([]byte, len(scopes)*scopeLen))
+	principalsOff := uint32(out.Len())
 	credentialsOff := principalsOff + uint32(totalPrincipalRecords*principalLen)
+	credentialIndex := 0
 
 	for i := range scopes {
 		principalEntries := scopes[i].principalEntries
 		scopeRecords[i] = scopeRef{
 			sid:             b.stringID(scopes[i].id),
 			principalCount:  uint32(len(principalEntries)),
-			principalOffset: principalsOff + uint32(principalData.Len()),
+			principalOffset: uint32(out.Len()),
 		}
 		for _, principal := range principalEntries {
-			putU64(&principalData, principal.lookupHash)
-			putU32(&principalData, b.stringID(principal.slug))
-			putU32(&principalData, principal.routeID)
-			putU32(&principalData, rateIDs[principal.rate])
-			putU32(&principalData, b.stringID(principal.requestedModel))
-			putU32(&principalData, principal.credentialSlotCount)
-			putU32(&principalData, credentialsOff+uint32(credentialData.Len()))
+			putU64(out, principal.lookupHash)
+			putU32(out, b.stringID(principal.slug))
+			putU32(out, principal.routeID)
+			putU32(out, rateIDs[principal.rate])
+			putU32(out, b.stringID(principal.requestedModel))
+			putU32(out, principal.credentialSlotCount)
+			putU32(out, credentialsOff+uint32(credentialIndex*credentialLen))
+			credentialIndex += int(principal.credentialSlotCount)
+		}
+	}
+
+	for i := range scopes {
+		for _, principal := range scopes[i].principalEntries {
 			if principal.credentialSlotCount > 0 {
-				putU32(&credentialData, principal.credentialSlot0.targetOrdinal)
-				putU32(&credentialData, b.stringID(principal.credentialSlot0.secretRef))
+				putU32(out, principal.credentialSlot0.targetOrdinal)
+				putU32(out, b.stringID(principal.credentialSlot0.secretRef))
 			}
 			for _, slot := range principal.credentialSlotExtra {
-				putU32(&credentialData, slot.targetOrdinal)
-				putU32(&credentialData, b.stringID(slot.secretRef))
+				putU32(out, slot.targetOrdinal)
+				putU32(out, b.stringID(slot.secretRef))
 			}
 		}
 	}
 
-	mcpPathsOff := credentialsOff + uint32(credentialData.Len())
+	mcpPathsOff := uint32(out.Len())
 	for i := range scopes {
 		profiles := scopes[i].mcpProfiles
 		sort.Slice(profiles, func(i, j int) bool {
@@ -1940,24 +1944,23 @@ func writeScopes(out *bytes.Buffer, b *builder, scopes []compiledScope, rateIDs 
 			return profiles[i].pathHash < profiles[j].pathHash
 		})
 		scopeRecords[i].mcpPathCount = uint32(len(profiles))
-		scopeRecords[i].mcpPathOffset = mcpPathsOff + uint32(mcpPathData.Len())
+		scopeRecords[i].mcpPathOffset = uint32(out.Len())
 		for _, profile := range profiles {
-			putU64(&mcpPathData, profile.pathHash)
-			putU32(&mcpPathData, b.stringID(profile.path))
-			putU32(&mcpPathData, profile.toolsetID)
+			putU64(out, profile.pathHash)
+			putU32(out, b.stringID(profile.path))
+			putU32(out, profile.toolsetID)
 		}
 	}
 
-	for _, record := range scopeRecords {
-		putU32(out, record.sid)
-		putU32(out, record.principalCount)
-		putU32(out, record.principalOffset)
-		putU32(out, record.mcpPathCount)
-		putU32(out, record.mcpPathOffset)
+	blob := out.Bytes()
+	for i, record := range scopeRecords {
+		base := scopeRecordsStart + i*scopeLen
+		put32(blob[base:base+4], record.sid)
+		put32(blob[base+4:base+8], record.principalCount)
+		put32(blob[base+8:base+12], record.principalOffset)
+		put32(blob[base+12:base+16], record.mcpPathCount)
+		put32(blob[base+16:base+20], record.mcpPathOffset)
 	}
-	out.Write(principalData.Bytes())
-	out.Write(credentialData.Bytes())
-	out.Write(mcpPathData.Bytes())
 	return principalsOff, mcpPathsOff
 }
 

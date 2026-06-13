@@ -1120,6 +1120,130 @@ Interpretation:
 - the next allocation-space target is no longer credential-slot slices; it is
   mostly fixed-width table materialization and final buffer growth/copying
 
+### BYOK Provider Profile: 2026-06-13 After Chunk 7
+
+Status: measured.
+
+Focused profile command:
+
+```sh
+go test -run '^$' \
+  -bench '^BenchmarkCherryPackRouteScale/byok-provider-secret-(always|prefer)/route_entries=1000000' \
+  -benchmem \
+  -benchtime=10s \
+  -memprofile=/tmp/cherry-byok-provider-after-chunk7.mem \
+  -cpuprofile=/tmp/cherry-byok-provider-after-chunk7.cpu \
+  .
+```
+
+Benchmark sample from the profile run:
+
+```text
+byok-provider-secret-always, 1M route entries:
+  time: 0.644 s/op
+  alloc: 432.9 MB/op
+  allocs: 2.2k/op
+  blob: 54.0 MB raw, 15.8 MB zstd
+
+byok-provider-secret-prefer, 1M route entries:
+  time: 1.06 s/op
+  alloc: 432.9 MB/op
+  allocs: 2.2k/op
+  blob: 54.0 MB raw, 15.8 MB zstd
+```
+
+Allocation object profile:
+
+```text
+benchmarkRouteInput: 99.4% cumulative objects
+benchmarkRoutePlan:  69.8% cumulative objects
+Build:                0.5% cumulative objects
+```
+
+Allocation space profile:
+
+```text
+Build:             86.0% cumulative bytes
+bytes.growSlice:   47.2% flat bytes
+writeScopes:       35.4% cumulative bytes
+builder.stringID:  12.6% flat bytes
+writeStrings:      11.0% cumulative bytes
+```
+
+CPU profile:
+
+```text
+Build:        73.0% cumulative samples
+writeScopes:  31.9% cumulative samples
+sort.Slice:   15.7% cumulative samples
+stringID:     16.7% cumulative samples
+```
+
+Interpretation:
+
+- build-side allocation count is no longer the issue for provider-level BYOK;
+  benchmark input construction now dominates allocation objects
+- the remaining builder allocation space is mostly fixed-width table
+  materialization and copying side buffers into the final pack
+- the next focused optimization is to write scope principal, credential, and MCP
+  path tables directly into the final output buffer after reserving the scope
+  records, preserving the persisted layout
+
+### Chunk 8: Direct Scope Table Writer
+
+Status: implemented.
+
+Change:
+
+- `writeScopes` reserves the fixed-width scope records in the final output
+  buffer, writes principal, credential, and MCP path tables directly into the
+  final output, then patches the reserved scope records.
+- this removes intermediate principal, credential, and MCP path buffers plus the
+  final copies from those buffers into the pack blob.
+- this preserves the persisted layout and public API.
+
+Focused benchmark command:
+
+```sh
+go test -run '^$' \
+  -bench '^BenchmarkCherryPackRouteScale/byok-provider-secret-(always|prefer)/route_entries=1000000' \
+  -benchmem \
+  -benchtime=3s \
+  -count=3 \
+  .
+```
+
+Raw output:
+
+```text
+/tmp/cherry-byok-provider-after-direct-scope-writer-20260613221100.txt
+```
+
+Representative p50 before -> after:
+
+```text
+byok-provider-secret-always, 1M route entries:
+  time:   0.648 s/op -> 0.638 s/op
+  alloc:  432.9 MB/op -> 309.0 MB/op
+  allocs: 2.2k/op -> 2.2k/op
+  blob:   54.0 MB raw -> 54.0 MB raw
+
+byok-provider-secret-prefer, 1M route entries:
+  time:   0.926 s/op -> 0.943 s/op
+  alloc:  432.9 MB/op -> 309.0 MB/op
+  allocs: 2.2k/op -> 2.2k/op
+  blob:   54.0 MB raw -> 54.0 MB raw
+```
+
+Interpretation:
+
+- direct scope table writing removes about 124 MB/op of temporary allocation
+  space in the provider-level BYOK cases
+- allocation count remains effectively unchanged because chunk 7 already removed
+  the dominant build-side allocation events
+- wall time is close and noisy; the allocation-space reduction is the primary
+  win
+
 ## Optimization Log
 
 ### Chunk 1: Carry Compiled IDs Into Table Writers
