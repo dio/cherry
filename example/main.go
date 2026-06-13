@@ -38,6 +38,8 @@ func run(args []string) error {
 		return runPack(args[1:])
 	case "repl":
 		return runREPL(args[1:])
+	case "split-check":
+		return runSplitCheck(args[1:])
 	case "stress-pack":
 		return runStressPack(args[1:])
 	case "help", "-h", "--help":
@@ -57,18 +59,19 @@ func printHelp() {
 	fmt.Println("usage:")
 	fmt.Println("  go run ./example")
 	fmt.Println("  go run ./example [fixture.yaml]")
-	fmt.Println("  go run ./example pack [--models models.json] [--providers providers.json] [--mcp-catalog catalog.json] <workspace|project> <id> <fixture.yaml> [out.zst]")
+	fmt.Println("  go run ./example pack [--cluster combined|llm|mcp] [--generation id] [--models models.json] [--providers providers.json] [--mcp-catalog catalog.json] <workspace|project> <id> <fixture.yaml> [out.zst]")
 	fmt.Println("  go run ./example repl <cherry.zst>")
+	fmt.Println("  go run ./example split-check [--generation id] <llm.zst> <mcp.zst>")
 	fmt.Println("  go run ./example stress-pack <principals-per-scope> <queries> [scopes]")
 }
 
 func runPack(args []string) error {
-	catalogs, args, err := parseCatalogFlags(args)
+	flags, args, err := parsePackFlags(args)
 	if err != nil {
 		return err
 	}
 	if len(args) != 3 && len(args) != 4 {
-		return fmt.Errorf("usage: pack [--models models.json] [--providers providers.json] [--mcp-catalog catalog.json] <workspace|project> <id> <fixture.yaml> [out.zst]")
+		return fmt.Errorf("usage: pack [--cluster combined|llm|mcp] [--generation id] [--models models.json] [--providers providers.json] [--mcp-catalog catalog.json] <workspace|project> <id> <fixture.yaml> [out.zst]")
 	}
 	scopeKind := transform.ScopeKind(args[0])
 	if scopeKind != transform.ScopeKindWorkspace && scopeKind != transform.ScopeKindProject {
@@ -79,28 +82,31 @@ func runPack(args []string) error {
 	if err != nil {
 		return err
 	}
-	if catalogs.modelsPath != "" {
-		models, err := source.LoadModelCatalogJSON(catalogs.modelsPath)
+	if flags.modelsPath != "" {
+		models, err := source.LoadModelCatalogJSON(flags.modelsPath)
 		if err != nil {
 			return err
 		}
 		fixture.Models = source.MergeModels(fixture.Models, models)
 	}
-	if catalogs.providersPath != "" {
-		providers, err := source.LoadProviderCatalogJSON(catalogs.providersPath)
+	if flags.providersPath != "" {
+		providers, err := source.LoadProviderCatalogJSON(flags.providersPath)
 		if err != nil {
 			return err
 		}
 		fixture.Providers = source.MergeProviders(fixture.Providers, providers)
 	}
-	if catalogs.mcpCatalogPath != "" {
-		servers, err := source.LoadMCPCatalogJSON(catalogs.mcpCatalogPath)
+	if flags.mcpCatalogPath != "" {
+		servers, err := source.LoadMCPCatalogJSON(flags.mcpCatalogPath)
 		if err != nil {
 			return err
 		}
 		fixture.MCPServers = source.MergeMCPServers(fixture.MCPServers, servers)
 	}
 	outPath := fmt.Sprintf("%s-%s.pack.zst", scopeKind, scopeID)
+	if flags.cluster != packClusterCombined {
+		outPath = fmt.Sprintf("%s-%s.%s.pack.zst", scopeKind, scopeID, flags.cluster)
+	}
 	if len(args) == 4 {
 		outPath = args[3]
 	}
@@ -109,11 +115,13 @@ func runPack(args []string) error {
 	if err != nil {
 		return err
 	}
-	blob, manifest, err := cherry.BuildWithManifest(result.Input)
+	input := inputForCluster(result.Input, flags.cluster)
+	blob, manifest, err := cherry.BuildWithManifest(input)
 	if err != nil {
 		return err
 	}
 	bundle := cherry.NewBundle(string(scopeKind), scopeID, result.Scopes, blob, manifest)
+	bundle.Metadata.GenerationID = flags.generationID
 	compressed, err := cherry.EncodeBundleZstd(bundle)
 	if err != nil {
 		return err
@@ -122,53 +130,114 @@ func runPack(args []string) error {
 		return err
 	}
 	fmt.Printf(
-		"wrote %s scope=%s:%s scopes=%s providers=%d models=%d mcp_servers=%d raw_bytes=%d\n",
+		"wrote %s cluster=%s generation=%s scope=%s:%s scopes=%s providers=%d models=%d mcp_servers=%d raw_bytes=%d\n",
 		outPath,
+		flags.cluster,
+		flags.generationID,
 		scopeKind,
 		scopeID,
 		strings.Join(result.Scopes, ","),
-		len(result.Input.Providers),
-		len(result.Input.Models),
-		len(result.Input.MCPServers),
+		len(input.Providers),
+		len(input.Models),
+		len(input.MCPServers),
 		len(blob),
 	)
 	return nil
 }
 
-type catalogFlags struct {
+type packCluster string
+
+const (
+	packClusterCombined packCluster = "combined"
+	packClusterLLM      packCluster = "llm"
+	packClusterMCP      packCluster = "mcp"
+)
+
+type packFlags struct {
 	modelsPath     string
 	providersPath  string
 	mcpCatalogPath string
+	cluster        packCluster
+	generationID   string
 }
 
-func parseCatalogFlags(args []string) (catalogFlags, []string, error) {
+func parsePackFlags(args []string) (packFlags, []string, error) {
 	out := make([]string, 0, len(args))
-	var catalogs catalogFlags
+	flags := packFlags{cluster: packClusterCombined}
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--models":
 			if i+1 >= len(args) {
-				return catalogFlags{}, nil, fmt.Errorf("--models requires a path")
+				return packFlags{}, nil, fmt.Errorf("--models requires a path")
 			}
-			catalogs.modelsPath = args[i+1]
+			flags.modelsPath = args[i+1]
 			i++
 		case "--providers":
 			if i+1 >= len(args) {
-				return catalogFlags{}, nil, fmt.Errorf("--providers requires a path")
+				return packFlags{}, nil, fmt.Errorf("--providers requires a path")
 			}
-			catalogs.providersPath = args[i+1]
+			flags.providersPath = args[i+1]
 			i++
 		case "--mcp-catalog":
 			if i+1 >= len(args) {
-				return catalogFlags{}, nil, fmt.Errorf("--mcp-catalog requires a path")
+				return packFlags{}, nil, fmt.Errorf("--mcp-catalog requires a path")
 			}
-			catalogs.mcpCatalogPath = args[i+1]
+			flags.mcpCatalogPath = args[i+1]
+			i++
+		case "--cluster":
+			if i+1 >= len(args) {
+				return packFlags{}, nil, fmt.Errorf("--cluster requires combined, llm, or mcp")
+			}
+			flags.cluster = packCluster(args[i+1])
+			if flags.cluster != packClusterCombined && flags.cluster != packClusterLLM && flags.cluster != packClusterMCP {
+				return packFlags{}, nil, fmt.Errorf("invalid --cluster %q; want combined, llm, or mcp", args[i+1])
+			}
+			i++
+		case "--generation":
+			if i+1 >= len(args) {
+				return packFlags{}, nil, fmt.Errorf("--generation requires an id")
+			}
+			flags.generationID = args[i+1]
 			i++
 		default:
 			out = append(out, args[i])
 		}
 	}
-	return catalogs, out, nil
+	return flags, out, nil
+}
+
+func inputForCluster(input cherry.Input, cluster packCluster) cherry.Input {
+	switch cluster {
+	case packClusterLLM:
+		out := cherry.Input{
+			Providers: append([]cherry.Provider(nil), input.Providers...),
+			Models:    append([]cherry.Model(nil), input.Models...),
+			Scopes:    make([]cherry.Scope, 0, len(input.Scopes)),
+		}
+		for _, scope := range input.Scopes {
+			outScope := cherry.Scope{
+				ID:         scope.ID,
+				Principals: append([]cherry.Principal(nil), scope.Principals...),
+			}
+			out.Scopes = append(out.Scopes, outScope)
+		}
+		return out
+	case packClusterMCP:
+		out := cherry.Input{
+			MCPServers: append([]cherry.MCPServer(nil), input.MCPServers...),
+			Scopes:     make([]cherry.Scope, 0, len(input.Scopes)),
+		}
+		for _, scope := range input.Scopes {
+			outScope := cherry.Scope{
+				ID:          scope.ID,
+				MCPProfiles: append([]cherry.MCPProfile(nil), scope.MCPProfiles...),
+			}
+			out.Scopes = append(out.Scopes, outScope)
+		}
+		return out
+	default:
+		return input
+	}
 }
 
 func runREPL(args []string) error {
@@ -213,6 +282,44 @@ func runREPL(args []string) error {
 			return nil
 		}
 	}
+}
+
+func runSplitCheck(args []string) error {
+	generationID := ""
+	filtered := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--generation":
+			if i+1 >= len(args) {
+				return fmt.Errorf("--generation requires an id")
+			}
+			generationID = args[i+1]
+			i++
+		default:
+			filtered = append(filtered, args[i])
+		}
+	}
+	if len(filtered) != 2 {
+		return fmt.Errorf("usage: split-check [--generation id] <llm.zst> <mcp.zst>")
+	}
+	opened, err := loadSplitPack(filtered[0], filtered[1], cherry.SplitBundleOptions{GenerationID: generationID})
+	if err != nil {
+		return err
+	}
+	fmt.Printf("loaded split scope=%s:%s scopes=%s generation=%s\n",
+		opened.LLM.Metadata.ScopeKind,
+		opened.LLM.Metadata.ScopeID,
+		strings.Join(opened.LLM.Metadata.Scopes, ","),
+		opened.LLM.Metadata.GenerationID,
+	)
+	fmt.Printf("  llm_raw_bytes: %d\n", len(opened.LLM.Blob))
+	fmt.Printf("  llm_manifest_checksum: %d\n", opened.LLM.Metadata.PackManifest.Checksum)
+	fmt.Printf("  llm_providers: %d\n", len(opened.View.Providers()))
+	fmt.Printf("  llm_models: %d\n", len(opened.View.Models()))
+	fmt.Printf("  mcp_raw_bytes: %d\n", len(opened.MCP.Blob))
+	fmt.Printf("  mcp_manifest_checksum: %d\n", opened.MCP.Metadata.PackManifest.Checksum)
+	fmt.Printf("  mcp_servers: %d\n", len(opened.View.MCPServers()))
+	return nil
 }
 
 type replSession struct {
@@ -986,6 +1093,18 @@ func loadPack(path string) (cherry.OpenedBundle, error) {
 		return cherry.OpenedBundle{}, err
 	}
 	return cherry.OpenBundleZstd(data)
+}
+
+func loadSplitPack(llmPath string, mcpPath string, options cherry.SplitBundleOptions) (cherry.OpenedSplitBundle, error) {
+	llmData, err := os.ReadFile(llmPath)
+	if err != nil {
+		return cherry.OpenedSplitBundle{}, err
+	}
+	mcpData, err := os.ReadFile(mcpPath)
+	if err != nil {
+		return cherry.OpenedSplitBundle{}, err
+	}
+	return cherry.OpenSplitBundleZstdWithOptions(llmData, mcpData, options)
 }
 
 func defaultScope(scopes []string) string {

@@ -24,6 +24,7 @@ type BundleMetadata struct {
 	ScopeKind     string   `json:"scope_kind"`
 	ScopeID       string   `json:"scope_id"`
 	Scopes        []string `json:"scopes"`
+	GenerationID  string   `json:"generation_id,omitempty"`
 	PackManifest  Manifest `json:"pack_manifest"`
 }
 

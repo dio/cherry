@@ -1930,6 +1930,155 @@ make format
 make lint
 ```
 
+Split-view query/open benchmark:
+
+```sh
+go test -run '^$' \
+  -bench '^(BenchmarkReaderResolveLLMIDs|BenchmarkReaderResolveMCPToolIDs|BenchmarkSplitViewResolveLLMIDs|BenchmarkSplitViewResolveMCPToolIDs|BenchmarkOpenSplitBundleZstd)$' \
+  -benchmem \
+  -benchtime=3s \
+  -count=6 \
+  . | tee /tmp/cherry-split-view-query-open.txt
+```
+
+Representative results:
+
+```text
+Reader ResolveLLMIDs:
+  time:   ~258-266 ns/op
+  alloc:  0 B/op
+  allocs: 0/op
+
+SplitView ResolveLLMIDs:
+  time:   ~262-277 ns/op
+  alloc:  0 B/op
+  allocs: 0/op
+
+Reader ResolveMCPToolIDs:
+  time:   ~95-99 ns/op
+  alloc:  0 B/op
+  allocs: 0/op
+
+SplitView ResolveMCPToolIDs:
+  time:   ~100-109 ns/op
+  alloc:  0 B/op
+  allocs: 0/op
+
+OpenSplitBundleZstdWithOptions, small fixture:
+  time:   ~207-225 us/op
+  alloc:  176 KB/op
+  allocs: 102/op
+```
+
+Interpretation:
+
+- SplitView hot-path ID lookups remain zero allocation
+- delegation overhead is small relative to the underlying lookup
+- paired open cost is load/generation-swap cost, not request-path cost
+
+### Chunk 12: LLM/MCP Split View Prototype
+
+Status: implemented as an API/view prototype.
+
+Change:
+
+- added `SplitView`, an immutable composed view over one LLM `Reader` and one
+  MCP `Reader`
+- LLM resolver methods delegate to the LLM reader
+- MCP resolver methods delegate to the MCP reader
+- `LLMString` and `MCPString` make the separate string-table ownership explicit
+- `LLMReader` and `MCPReader` expose the underlying readers for inspector APIs
+  not mirrored by the prototype
+- `OpenSplitBundleZstd` opens paired LLM/MCP artifacts using the existing
+  single-bundle envelope
+- `ValidateSplitBundleCompatibility` verifies matching scope kind, selected
+  scope ID, and concrete scope set while allowing independent pack manifests
+- `BundleMetadata.GenerationID` gives producers an optional paired-generation
+  label without a new envelope format
+- `OpenSplitBundleZstdWithOptions` validates expected generation ID, component
+  pack checksums, and required catalog entries
+- no pack format, bundle envelope, or `Reader` mutation change
+
+Correctness tests:
+
+- LLM and MCP calls route to separate readers built from split inputs
+- numeric string IDs are not treated as interchangeable across readers
+- old and new split-view generations remain independently readable after an MCP
+  generation swap
+- paired bundle opening preserves each component manifest and composes a usable
+  `SplitView`
+- incompatible paired bundles are rejected before a `SplitView` is returned
+- generation, checksum, and catalog expectation mismatches are rejected before a
+  `SplitView` is returned
+
+Current front-experiment command:
+
+```sh
+go test -run '^$' \
+  -bench '^BenchmarkCherryPack(RealMixed|LLMChurnOnly|MCPChurnOnly|ClusterSplitCandidate)$|^BenchmarkCherryPackRouteScale/(weighted-split-2-shared|byok-target-unique-secret|byok-provider-secret-prefer)/route_entries=1000000|^BenchmarkCherryPackMCPProfileScale/(unique-toolsets|unique-secret-refs)/profiles=10000/tools_per_profile=10$' \
+  -benchmem \
+  -benchtime=2s \
+  -count=6 \
+  . | tee /tmp/cherry-front-experiments-current.txt
+```
+
+Representative current reads:
+
+```text
+real-mixed:
+  time:   ~115-129 ms/op
+  alloc:  99.7 MB/op
+  allocs: 42k/op
+
+llm-churn-only:
+  time:   ~1.04-1.22 s/op
+  alloc:  267.5 MB/op
+  allocs: 2.2k/op
+
+mcp-churn-only:
+  time:   ~40-55 ms/op
+  alloc:  49.2 MB/op
+  allocs: 40.7k/op
+
+split-candidate combined:
+  time:   ~115-125 ms/op
+  alloc:  99.7 MB/op
+  allocs: 42k/op
+
+split-candidate llm-only:
+  time:   ~63-65 ms/op
+  alloc:  27.6 MB/op
+  allocs: 863/op
+
+split-candidate mcp-only:
+  time:   ~39-42 ms/op
+  alloc:  49.3 MB/op
+  allocs: 41k/op
+```
+
+Interpretation:
+
+- the prototype proves an enforcement point can hold independent immutable LLM
+  and MCP generations without changing `Reader`
+- split-view APIs must keep ID ownership explicit because each reader has its
+  own string table
+- independent LLM or MCP rebuilds are materially cheaper than rebuilding the
+  combined real-mixed pack when only one policy cluster changes
+- a bundle-envelope split is still premature; the current paired-open path gives
+  EPs a concrete documented consumption model using two existing bundle
+  artifacts
+- the next useful step is producer integration: generate LLM/MCP artifacts from
+  one normalized source selection, stamp a shared generation ID, and provide
+  expected checksums to the EP before swapping the composed view
+
+Validation:
+
+```sh
+go test ./...
+make format
+make lint
+```
+
 ### Chunk 11: String Offset Slice Elimination
 
 Status: implemented.

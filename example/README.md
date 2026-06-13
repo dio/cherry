@@ -74,6 +74,24 @@ Pack one project:
 go run ./example pack project project1 example/source/testdata/example_fixture.yaml /tmp/project1.cherry.zst
 ```
 
+Pack one project as independent LLM and MCP bundles from the same source
+selection:
+
+```sh
+go run ./example pack --cluster llm --generation gen1 \
+  project project1 example/source/testdata/example_fixture.yaml /tmp/project1.llm.cherry.zst
+
+go run ./example pack --cluster mcp --generation gen1 \
+  project project1 example/source/testdata/example_fixture.yaml /tmp/project1.mcp.cherry.zst
+
+go run ./example split-check --generation gen1 \
+  /tmp/project1.llm.cherry.zst /tmp/project1.mcp.cherry.zst
+```
+
+This uses the same single-bundle envelope for each artifact. The enforcement
+point opens the pair with `cherry.OpenSplitBundleZstdWithOptions`, validates the
+shared generation and scope set, then swaps a composed `SplitView`.
+
 Pack one project with the copied LLM/MCP catalogs:
 
 ```sh

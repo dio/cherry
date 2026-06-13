@@ -260,6 +260,69 @@ The example directory includes fixture loaders for seed-style model/provider
 catalogs and MCP catalogs. Those loaders are example producer code, not root
 package schema contracts.
 
+## Split LLM/MCP View
+
+An enforcement point can also consume independently delivered LLM and MCP
+bundles without changing the single-bundle envelope:
+
+```go
+opened, err := cherry.OpenSplitBundleZstd(llmBundleBytes, mcpBundleBytes)
+if err != nil {
+    return err
+}
+
+view := opened.View
+```
+
+`OpenSplitBundleZstd` opens each artifact with `OpenBundleZstd`, then validates
+that both bundles describe the same control-plane selection and concrete scope
+set. The LLM and MCP pack manifests are allowed to differ because the policy
+clusters are expected to rebuild independently.
+
+For stricter rollout checks, set `Bundle.Metadata.GenerationID` on each bundle
+and use `OpenSplitBundleZstdWithOptions` with expected generation, component
+checksums, or required catalog entries:
+
+```go
+opened, err := cherry.OpenSplitBundleZstdWithOptions(llmBundleBytes, mcpBundleBytes, cherry.SplitBundleOptions{
+    GenerationID:         "generation-2026-06-14T12:00:00Z",
+    LLMPackChecksum:      expectedLLMChecksum,
+    MCPPackChecksum:      expectedMCPChecksum,
+    RequiredLLMProviders: []string{"openai"},
+    RequiredLLMModels:    []string{"gpt-4o-mini"},
+    RequiredMCPServers:   []string{"github"},
+})
+if err != nil {
+    return err
+}
+```
+
+LLM calls use the LLM reader:
+
+```go
+llm, ok := view.ResolveLLMIDs("workspace1", "slug:project1", "claude-haiku-4-5")
+if !ok {
+    // reject
+}
+
+provider := view.LLMString(llm.ProviderSID)
+```
+
+MCP calls use the MCP reader:
+
+```go
+tool, ok := view.ResolveMCPToolIDs("workspace1", "profile-dev-tools", "github__list-repos")
+if !ok {
+    // reject
+}
+
+server := view.MCPString(tool.ServerSID)
+```
+
+String IDs are reader-local. Use `LLMString` for IDs returned by LLM methods and
+`MCPString` for IDs returned by MCP methods. Materialized helpers such as
+`ResolveLLM` and `ResolveMCP` handle this internally.
+
 ## Boundary
 
 Cherry does not own tenancy joins, key verification, ownership checks, rule
