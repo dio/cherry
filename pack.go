@@ -1756,18 +1756,18 @@ func mcpToolsetsEqual(left []MCPToolBinding, right []MCPToolBinding) bool {
 // length is derived from adjacent offsets.
 func writeStrings(out *bytes.Buffer, stringsTable []string) {
 	putU32(out, uint32(len(stringsTable)))
-	offsets := make([]uint32, 0, len(stringsTable)+1)
 	dataLen := 0
 	for _, value := range stringsTable {
-		offsets = append(offsets, uint32(dataLen))
 		dataLen += len(value)
 	}
-	offsets = append(offsets, uint32(dataLen))
-	out.Grow(4 + len(offsets)*4 + dataLen)
+	out.Grow(4 + (len(stringsTable)+1)*4 + dataLen)
 	putU32(out, uint32(dataLen))
-	for _, offset := range offsets {
-		putU32(out, offset)
+	offset := 0
+	for _, value := range stringsTable {
+		putU32(out, uint32(offset))
+		offset += len(value)
 	}
+	putU32(out, uint32(offset))
 	for _, value := range stringsTable {
 		out.WriteString(value)
 	}

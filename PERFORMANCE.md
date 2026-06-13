@@ -1930,6 +1930,62 @@ make format
 make lint
 ```
 
+### Chunk 11: String Offset Slice Elimination
+
+Status: implemented.
+
+Change:
+
+- `writeStrings` no longer allocates a temporary `[]uint32` offsets slice
+- string table emission now computes total string data length in one pass,
+  writes offsets directly in a second pass, then writes string data
+- persisted pack format and public APIs are unchanged from version 6
+
+Focused before/after benchmark command:
+
+```sh
+go test -run '^$' \
+  -bench '^BenchmarkCherryPack(RealMixed|MCPChurnOnly|LLMChurnOnly)$|^BenchmarkCherryPackMCPProfileScale/(shared-toolsets|unique-toolsets|unique-secret-refs)/profiles=10000/tools_per_profile=10$' \
+  -benchmem \
+  -benchtime=2s \
+  -count=3 \
+  . | tee /tmp/cherry-string-offsets-after.txt
+
+benchstat /tmp/cherry-direct-emission-after.txt /tmp/cherry-string-offsets-after.txt
+```
+
+Benchstat summary:
+
+```text
+geomean time:     65.97 ms/op -> 65.99 ms/op, +0.02%
+geomean alloc:    56.79 MiB/op -> 56.47 MiB/op, -0.56%
+geomean allocs:   23.85k/op -> 23.85k/op, -0.01%
+blob bytes:       unchanged
+```
+
+The run used `count=3`, so benchstat again reports insufficient samples for
+strong statistical confidence. This change is still worth keeping because it is
+strictly simpler allocation behavior: fewer temporary objects, unchanged pack
+bytes, and neutral timing.
+
+Rejected experiment:
+
+- carrying compiled MCP tool binding SIDs into `writeMCPToolsets` reduced
+  writer-time string-table lookups and showed a sampled geomean time improvement
+  of 6.61%
+- it required storing compiled copies of unique MCP bindings and regressed
+  allocation space by 12.70% geomean
+- because the current optimization goal is allocation pressure under rebuild
+  churn, that tradeoff was rejected
+
+Validation:
+
+```sh
+go test ./...
+make format
+make lint
+```
+
 ### Chunk 10: Direct String and MCP Binding Emission
 
 Status: implemented.
