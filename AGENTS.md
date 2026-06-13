@@ -83,6 +83,8 @@ name.
   - `Principals`
   - `PrincipalRoutes`
   - `MCPPaths`
+  - `MCPServers`
+  - `ResolveMCPServer`
 - Store secret refs only. Never store secret material in the pack.
 - Treat `Reader` as an immutable view over its blob. Do not add mutable request
   counters or runtime caches inside it.

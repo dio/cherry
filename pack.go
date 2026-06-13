@@ -461,6 +461,16 @@ type MCPPath struct {
 	Tools   []MCPTool
 }
 
+// MCPServerInfo is the string-materialized metadata for one upstream MCP server
+// stored in the pack. It is intended for diagnostics and EP setup inspection.
+// SecretRef is a ref only; secret material is never stored in the pack.
+type MCPServerInfo struct {
+	ID        string
+	Endpoint  string
+	SecretRef string
+	AuthType  string
+}
+
 // Manifest is the minimal external metadata needed to reject stale or corrupted
 // blobs before the reader is made visible to the enforcement data path. A real CP
 // envelope would add generation IDs, project/workspace labels, timestamps, and a
@@ -834,6 +844,32 @@ func (r Reader) Providers() []ProviderInfo {
 	return providers
 }
 
+// ResolveMCPServer returns catalog metadata for one MCP server ID.
+func (r Reader) ResolveMCPServer(serverID string) (MCPServerInfo, bool) {
+	count := r.sectionCount(r.mcpServersOff)
+	for id := uint32(0); id < count; id++ {
+		info := r.mcpServerInfo(id)
+		if info.ID == serverID {
+			return info, true
+		}
+	}
+	return MCPServerInfo{}, false
+}
+
+// MCPServers returns all upstream MCP server catalog entries in deterministic
+// order by server ID.
+func (r Reader) MCPServers() []MCPServerInfo {
+	count := r.sectionCount(r.mcpServersOff)
+	servers := make([]MCPServerInfo, 0, count)
+	for id := uint32(0); id < count; id++ {
+		servers = append(servers, r.mcpServerInfo(id))
+	}
+	sort.Slice(servers, func(i, j int) bool {
+		return servers[i].ID < servers[j].ID
+	})
+	return servers
+}
+
 // ResolveModel returns catalog metadata for one model ID.
 func (r Reader) ResolveModel(modelID string) (ModelInfo, bool) {
 	id, ok := r.findModel(modelID)
@@ -1063,6 +1099,16 @@ func (r Reader) providerInfo(id uint32) ProviderInfo {
 		Kind:      r.String(provider.kindSID),
 		Endpoint:  r.String(provider.endpointSID),
 		SecretRef: r.String(provider.secretSID),
+	}
+}
+
+func (r Reader) mcpServerInfo(id uint32) MCPServerInfo {
+	server := r.mcpServer(id)
+	return MCPServerInfo{
+		ID:        r.String(server.idSID),
+		Endpoint:  r.String(server.endpointSID),
+		SecretRef: r.String(server.secretSID),
+		AuthType:  r.String(server.authTypeSID),
 	}
 }
 

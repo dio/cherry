@@ -219,14 +219,17 @@ principals, ok := reader.PrincipalRoutes("workspace1")
 mcpPaths, ok := reader.MCPPaths("workspace1")
 ```
 
-Model catalog queries are available from the same loaded bundle:
+Model catalog and MCP server queries are available from the same loaded bundle:
 
 ```go
 model, ok := reader.ResolveModel("gpt-4o-mini")
 supportsImages := reader.ModelCapability("gpt-5", "image_generation")
 providers := reader.Providers()
+provider, ok := reader.ResolveProvider("openai")
 modelsJSON, err := reader.V1ModelsJSON()
 openAIModelsJSON, err := reader.V1ModelsJSONForProvider("openai")
+servers := reader.MCPServers()
+server, ok := reader.ResolveMCPServer("github")
 ```
 
 `V1ModelsJSON` renders the packed catalog in a `/v1/models` response shape while

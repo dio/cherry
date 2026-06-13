@@ -149,6 +149,38 @@ func TestReaderProviders(t *testing.T) {
 	}
 }
 
+func TestReaderMCPServers(t *testing.T) {
+	blob, err := Build(testPackInput(1, 1))
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	reader, err := Open(blob)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+
+	servers := reader.MCPServers()
+	if len(servers) != 2 {
+		t.Fatalf("MCPServers() len = %d, want 2", len(servers))
+	}
+	if servers[0].ID != "github" || servers[1].ID != "kiwi" {
+		t.Fatalf("MCPServers() IDs = [%s, %s], want [github, kiwi]", servers[0].ID, servers[1].ID)
+	}
+
+	info, ok := reader.ResolveMCPServer("github")
+	if !ok {
+		t.Fatal("ResolveMCPServer(\"github\") ok = false, want true")
+	}
+	if info.Endpoint != "https://api.github.com" || info.AuthType != "bearer" || info.SecretRef != "env://GITHUB_MCP_TOKEN" {
+		t.Fatalf("ResolveMCPServer(\"github\") = %#v", info)
+	}
+
+	_, ok = reader.ResolveMCPServer("missing")
+	if ok {
+		t.Fatal("ResolveMCPServer(\"missing\") ok = true, want false")
+	}
+}
+
 func TestReaderV1ModelsJSON(t *testing.T) {
 	blob, err := Build(testPackInput(1, 1))
 	if err != nil {
