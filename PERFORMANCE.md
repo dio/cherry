@@ -1929,3 +1929,115 @@ go test ./...
 make format
 make lint
 ```
+
+### Chunk 10: Direct String and MCP Binding Emission
+
+Status: implemented.
+
+Change:
+
+- `writeStrings` no longer builds a temporary string-data `bytes.Buffer` before
+  copying into the final pack buffer
+- string table emission now precomputes data length and offsets, grows the final
+  buffer once, and writes string bytes directly
+- `writeMCPToolsets` no longer builds a temporary bindings `bytes.Buffer`
+- MCP toolset emission now precomputes binding counts, writes toolset records,
+  then writes binding records directly into the final pack buffer
+- persisted pack format and public APIs are unchanged from version 6
+
+Focused before/after benchmark command:
+
+```sh
+go test -run '^$' \
+  -bench '^BenchmarkCherryPack(RealMixed|MCPChurnOnly|LLMChurnOnly)$|^BenchmarkCherryPackMCPProfileScale/(shared-toolsets|unique-toolsets|unique-secret-refs)/profiles=10000/tools_per_profile=10$' \
+  -benchmem \
+  -benchtime=2s \
+  -count=3 \
+  . | tee /tmp/cherry-direct-emission-before.txt
+
+go test -run '^$' \
+  -bench '^BenchmarkCherryPack(RealMixed|MCPChurnOnly|LLMChurnOnly)$|^BenchmarkCherryPackMCPProfileScale/(shared-toolsets|unique-toolsets|unique-secret-refs)/profiles=10000/tools_per_profile=10$' \
+  -benchmem \
+  -benchtime=2s \
+  -count=3 \
+  . | tee /tmp/cherry-direct-emission-after.txt
+```
+
+`benchstat` comparison:
+
+```sh
+benchstat /tmp/cherry-direct-emission-before.txt /tmp/cherry-direct-emission-after.txt
+```
+
+Benchstat summary:
+
+```text
+geomean time:     70.39 ms/op -> 65.97 ms/op, -6.27%
+geomean alloc:    67.55 MiB/op -> 56.79 MiB/op, -15.93%
+geomean allocs:   23.93k/op -> 23.85k/op, -0.35%
+blob bytes:       unchanged
+```
+
+The run used `count=3`, so benchstat reports insufficient samples for 95%
+confidence intervals and alpha=0.05 difference detection. Treat allocation-space
+reduction as the useful signal; do not treat the time delta as proven.
+
+Representative before -> after:
+
+```text
+shared-toolsets, 10k profiles x 10 tools:
+  alloc:  21.1 MB/op -> 20.7 MB/op
+  allocs: 30.2k/op -> 30.1k/op
+  time:   ~14.5 ms/op -> ~14.8 ms/op
+  blob:   unchanged
+
+unique-toolsets, 10k profiles x 10 tools:
+  alloc:  63.9 MB/op -> 49.6 MB/op
+  allocs: 40.8k/op -> 40.7k/op
+  time:   ~44.4 ms/op -> ~39.1 ms/op
+  blob:   unchanged
+
+unique-secret-refs, 10k profiles x 10 tools:
+  alloc:  38.7 MB/op -> 32.4 MB/op
+  allocs: 40.3k/op -> 40.3k/op
+  time:   ~30.8 ms/op -> ~27.7 ms/op
+  blob:   unchanged
+
+real-mixed, 100 workspaces, 100k LLM route entries, 10k MCP profiles:
+  alloc:  122.6 MB/op -> 100.3 MB/op
+  allocs: 42.1k/op -> 42.0k/op
+  time:   ~121.1 ms/op -> ~118.8 ms/op
+  blob:   unchanged
+
+llm-churn-only, 1M provider-level BYOK PREFER route entries:
+  alloc:  309.0 MB/op -> 269.1 MB/op
+  allocs: 2.2k/op -> 2.2k/op
+  time:   ~1.15 s/op -> ~1.07 s/op
+  blob:   unchanged
+
+mcp-churn-only, 10k profiles x 10 unique tools:
+  alloc:  63.9 MB/op -> 49.6 MB/op
+  allocs: 40.8k/op -> 40.7k/op
+  time:   ~43.8 ms/op -> ~40.8 ms/op
+  blob:   unchanged
+```
+
+Interpretation:
+
+- this removes avoidable temporary copy buffers in two pack writers
+- allocation-space reduction is clear; allocation-count reduction is small
+  because the removed buffers were large backing arrays rather than many tiny
+  objects
+- elapsed time geomean improved in this sample, but benchstat does not mark it
+  statistically significant at `count=3`
+- the next no-format-change optimization should target repeated writer-time
+  `builder.stringID` lookups by carrying already-interned SIDs deeper into
+  compiled MCP and catalog records
+
+Validation:
+
+```sh
+go test ./...
+make format
+make lint
+```

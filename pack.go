@@ -1756,18 +1756,21 @@ func mcpToolsetsEqual(left []MCPToolBinding, right []MCPToolBinding) bool {
 // length is derived from adjacent offsets.
 func writeStrings(out *bytes.Buffer, stringsTable []string) {
 	putU32(out, uint32(len(stringsTable)))
-	var data bytes.Buffer
 	offsets := make([]uint32, 0, len(stringsTable)+1)
+	dataLen := 0
 	for _, value := range stringsTable {
-		offsets = append(offsets, uint32(data.Len()))
-		data.WriteString(value)
+		offsets = append(offsets, uint32(dataLen))
+		dataLen += len(value)
 	}
-	offsets = append(offsets, uint32(data.Len()))
-	putU32(out, uint32(data.Len()))
+	offsets = append(offsets, uint32(dataLen))
+	out.Grow(4 + len(offsets)*4 + dataLen)
+	putU32(out, uint32(dataLen))
 	for _, offset := range offsets {
 		putU32(out, offset)
 	}
-	out.Write(data.Bytes())
+	for _, value := range stringsTable {
+		out.WriteString(value)
+	}
 }
 
 // writeProviders writes fixed-width provider records in provider ID order.
@@ -1910,28 +1913,27 @@ func writeMCPServers(out *bytes.Buffer, b *builder, servers []MCPServer) {
 // tool binding records.
 func writeMCPToolsets(out *bytes.Buffer, b *builder, toolsets [][]MCPToolBinding, serverIDs map[string]uint32) {
 	putU32(out, uint32(len(toolsets)))
-	records := make([]struct {
-		count  uint32
-		offset uint32
-	}, len(toolsets))
-	var bindings bytes.Buffer
+	totalBindings := 0
+	for _, toolset := range toolsets {
+		totalBindings += len(toolset)
+	}
+	out.Grow(len(toolsets)*mcpToolsetLen + totalBindings*mcpToolBindingLen)
 	baseOffset := uint32(out.Len() + len(toolsets)*mcpToolsetLen)
-	for i, toolset := range toolsets {
-		records[i].count = uint32(len(toolset))
-		records[i].offset = baseOffset + uint32(bindings.Len())
+	bindingOffset := baseOffset
+	for _, toolset := range toolsets {
+		putU32(out, uint32(len(toolset)))
+		putU32(out, bindingOffset)
+		bindingOffset += uint32(len(toolset) * mcpToolBindingLen)
+	}
+	for _, toolset := range toolsets {
 		for _, binding := range toolset {
-			putU32(&bindings, b.stringID(binding.ExposedName))
-			putU32(&bindings, serverIDs[binding.Server])
-			putU32(&bindings, b.stringID(binding.Tool))
-			putU32(&bindings, b.stringID(binding.SecretRef))
-			putU32(&bindings, b.stringID(binding.AuthType))
+			putU32(out, b.stringID(binding.ExposedName))
+			putU32(out, serverIDs[binding.Server])
+			putU32(out, b.stringID(binding.Tool))
+			putU32(out, b.stringID(binding.SecretRef))
+			putU32(out, b.stringID(binding.AuthType))
 		}
 	}
-	for _, record := range records {
-		putU32(out, record.count)
-		putU32(out, record.offset)
-	}
-	out.Write(bindings.Bytes())
 }
 
 // writeScopes writes scope records plus the two scope-local indexes they point
