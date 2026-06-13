@@ -196,7 +196,12 @@ computed from repeated raw samples.
 
 ## Profiling Protocol
 
-Profile the slowest route and MCP cases before choosing an optimization:
+Profile the slowest route and MCP cases before choosing an optimization.
+
+Go rejects `-cpuprofile` when `go test` targets multiple packages. Run CPU and
+memory benchmark profiles against the package that owns the benchmark instead of
+`./...`. The route and MCP scale benchmarks live in the root package, so use
+`.`:
 
 ```sh
 go test -run '^$' \
@@ -204,7 +209,7 @@ go test -run '^$' \
   -benchtime=10s \
   -cpuprofile=/tmp/cherry-route.cpu \
   -memprofile=/tmp/cherry-route.mem \
-  ./...
+  .
 
 go tool pprof -top /tmp/cherry-route.cpu
 go tool pprof -alloc_objects -top /tmp/cherry-route.mem
@@ -218,7 +223,7 @@ go test -run '^$' \
   -benchtime=10s \
   -cpuprofile=/tmp/cherry-mcp.cpu \
   -memprofile=/tmp/cherry-mcp.mem \
-  ./...
+  .
 
 go tool pprof -top /tmp/cherry-mcp.cpu
 go tool pprof -alloc_objects -top /tmp/cherry-mcp.mem
@@ -593,6 +598,140 @@ Open design questions:
 Do not start v2 until the current full-build allocation reductions are measured.
 If full rebuild becomes acceptable at realistic route/profile scale, v2 may be
 unnecessary for the near term.
+
+### BYOK Provider Profile: 2026-06-13 After Shape/Binding Split
+
+Status: measured.
+
+Focused profile command requested `./...`, but Go rejects `-cpuprofile` with
+multiple packages. The equivalent root-package command was used because the
+benchmark lives in `github.com/dio/cherry`:
+
+```sh
+go test -run '^$' \
+  -bench '^BenchmarkCherryPackRouteScale/byok-provider-secret-(always|prefer)/route_entries=1000000' \
+  -benchmem \
+  -benchtime=10s \
+  -memprofile=/tmp/cherry-byok-provider.mem \
+  -cpuprofile=/tmp/cherry-byok-provider.cpu \
+  .
+```
+
+Benchmark sample from the profile run:
+
+```text
+byok-provider-secret-always, 1M route entries:
+  time: 1.18 s/op
+  alloc: 732.8 MB/op
+  allocs: 7.0M/op
+  blob: 54.0 MB raw, 15.8 MB zstd
+
+byok-provider-secret-prefer, 1M route entries:
+  time: 1.82 s/op
+  alloc: 892.8 MB/op
+  allocs: 11.0M/op
+  blob: 54.0 MB raw, 15.8 MB zstd
+```
+
+Allocation object profile:
+
+```text
+strings.(*Builder).WriteString: 77.5% flat objects
+appendRouteCredentialSlots:     52.2% cumulative objects
+internRoute:                    38.7% cumulative objects
+routeKey/writeRouteKey:         78.1% cumulative objects
+benchmarkRouteInput:             9.0% cumulative objects
+```
+
+Allocation space profile:
+
+```text
+Build:                      89.1% cumulative bytes
+writeScopes:                37.3% cumulative bytes
+routeKey/writeRouteKey:     23.6% cumulative bytes
+appendRouteCredentialSlots: 20.0% cumulative bytes
+builder.stringID:            7.3% flat bytes
+benchmarkRouteInput:         8.0% cumulative bytes
+```
+
+CPU profile:
+
+```text
+Build:                      63.2% cumulative samples
+GC/runtime work:            dominant flat samples
+writeScopes:                23.8% cumulative samples
+routeKey/writeRouteKey:     15.6% cumulative samples
+appendRouteCredentialSlots:  8.9% cumulative samples
+sort.Slice:                  8.7% cumulative samples
+```
+
+Interpretation:
+
+- benchmark input construction is visible, especially provider secret-ref and
+  model/provider ID strings, but it is not the dominant allocation source
+- the clearest remaining builder issue is route-key construction
+- `internRoute` still needs route keys for shape dedupe, but
+  `appendRouteCredentialSlots` rebuilds target route keys only to validate that
+  the shape exists after `internRoute` already succeeded
+- removing that redundant credential-slot route-key validation is the next
+  focused optimization to test
+
+### Chunk 4: Remove Redundant Credential-Slot Route-Key Validation
+
+Status: implemented.
+
+Change:
+
+- `routeCredentialSlots` no longer receives `routeIDs`.
+- `appendRouteCredentialSlots` no longer rebuilds `routeKey(target)` for each
+  credential-bearing target leaf.
+- route existence validation remains in `internRoute`, which is called
+  immediately before credential-slot extraction for each principal/requested
+  model route.
+
+Focused benchmark command:
+
+```sh
+go test -run '^$' \
+  -bench '^BenchmarkCherryPackRouteScale/byok-provider-secret-(always|prefer)/route_entries=1000000' \
+  -benchmem \
+  -benchtime=3s \
+  -count=3 \
+  .
+```
+
+Raw output:
+
+```text
+/tmp/cherry-byok-provider-after-credential-slot-key-removal-20260613211700.txt
+```
+
+Representative p50 before -> after:
+
+```text
+byok-provider-secret-always, 1M route entries:
+  time:   1.29 s/op -> 0.953 s/op
+  alloc:  732.8 MB/op -> 652.8 MB/op
+  allocs: 7.0M/op -> 4.0M/op
+  blob:   54.0 MB raw -> 54.0 MB raw
+
+byok-provider-secret-prefer, 1M route entries:
+  time:   1.54 s/op -> 1.51 s/op
+  alloc:  892.8 MB/op -> 732.8 MB/op
+  allocs: 11.0M/op -> 5.0M/op
+  blob:   54.0 MB raw -> 54.0 MB raw
+```
+
+Interpretation:
+
+- the change removes the largest allocation-count source identified in the
+  profile without changing the persisted format
+- `PREFER` allocation count is now much closer to `ALWAYS`; the remaining gap is
+  mostly from the extra chain/fallback route traversal and benchmark route-plan
+  construction
+- remaining allocation space is now more likely to be dominated by structural
+  temporary storage: compiled principal entries, credential slot slices, string
+  interning for secret refs, table buffer growth, and sorting copies
 
 ## Optimization Log
 

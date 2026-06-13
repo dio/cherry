@@ -561,7 +561,7 @@ func Build(input Input) ([]byte, error) {
 				if err != nil {
 					return nil, fmt.Errorf("principal %q route for %q: %w", principal.Slug, requestedModel, err)
 				}
-				credentialSlots, err := routeCredentialSlots(route, routeIDs)
+				credentialSlots, err := routeCredentialSlots(route)
 				if err != nil {
 					return nil, fmt.Errorf("principal %q route for %q: %w", principal.Slug, requestedModel, err)
 				}
@@ -1499,10 +1499,10 @@ func writeRouteKey(builder *strings.Builder, route RoutePlan) {
 	}
 }
 
-func routeCredentialSlots(route RoutePlan, routeIDs map[string]uint32) ([]compiledCredentialSlot, error) {
+func routeCredentialSlots(route RoutePlan) ([]compiledCredentialSlot, error) {
 	slots := []compiledCredentialSlot{}
 	var targetOrdinal uint32
-	if err := appendRouteCredentialSlots(route, routeIDs, &targetOrdinal, &slots); err != nil {
+	if err := appendRouteCredentialSlots(route, &targetOrdinal, &slots); err != nil {
 		return nil, err
 	}
 	return slots, nil
@@ -1510,16 +1510,12 @@ func routeCredentialSlots(route RoutePlan, routeIDs map[string]uint32) ([]compil
 
 func appendRouteCredentialSlots(
 	route RoutePlan,
-	routeIDs map[string]uint32,
 	targetOrdinal *uint32,
 	slots *[]compiledCredentialSlot,
 ) error {
 	normalized := normalizeRoutePlan(route)
 	switch normalized.Kind {
 	case RouteKindTarget:
-		if _, ok := routeIDs[routeKey(normalized)]; !ok {
-			return errors.New("missing route shape for credential slot")
-		}
 		if normalized.SecretRef != "" {
 			*slots = append(*slots, compiledCredentialSlot{
 				targetOrdinal: *targetOrdinal,
@@ -1529,13 +1525,13 @@ func appendRouteCredentialSlots(
 		(*targetOrdinal)++
 	case RouteKindChain:
 		for index, child := range normalized.Children {
-			if err := appendRouteCredentialSlots(child, routeIDs, targetOrdinal, slots); err != nil {
+			if err := appendRouteCredentialSlots(child, targetOrdinal, slots); err != nil {
 				return fmt.Errorf("chain[%d]: %w", index, err)
 			}
 		}
 	case RouteKindSplit:
 		for index, child := range normalized.Split {
-			if err := appendRouteCredentialSlots(child.Plan, routeIDs, targetOrdinal, slots); err != nil {
+			if err := appendRouteCredentialSlots(child.Plan, targetOrdinal, slots); err != nil {
 				return fmt.Errorf("split[%d]: %w", index, err)
 			}
 		}
