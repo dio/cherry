@@ -2276,7 +2276,10 @@ func (r Reader) read64(offset int) uint64 {
 }
 
 func (r Reader) validateOffsets() error {
-	offsets := []uint32{
+	// These offsets point to top-level sections. Every top-level section starts
+	// with a uint32 count, even when the section has zero records, so the offset
+	// itself may not be EOF.
+	tableOffsets := []uint32{
 		r.stringsOff,
 		r.providersOff,
 		r.modelsOff,
@@ -2285,11 +2288,23 @@ func (r Reader) validateOffsets() error {
 		r.mcpServersOff,
 		r.mcpToolsetsOff,
 		r.scopesOff,
+	}
+	for _, offset := range tableOffsets {
+		if int(offset) < headerSize || int(offset)+4 > len(r.blob) {
+			return fmt.Errorf("invalid pack offset %d", offset)
+		}
+	}
+
+	// These offsets point into scope-local index data. Unlike the top-level
+	// sections above, the indexes have no standalone count word; each scope
+	// record stores its own count. If all scopes have zero MCP profiles, the MCP
+	// path index is empty and its offset is exactly len(blob), which is valid.
+	indexOffsets := []uint32{
 		r.principalsOff,
 		r.mcpPathsOff,
 	}
-	for _, offset := range offsets {
-		if int(offset) < headerSize || int(offset) >= len(r.blob) {
+	for _, offset := range indexOffsets {
+		if int(offset) < headerSize || int(offset) > len(r.blob) {
 			return fmt.Errorf("invalid pack offset %d", offset)
 		}
 	}

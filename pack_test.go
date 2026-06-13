@@ -221,6 +221,34 @@ func TestReaderMCPServers(t *testing.T) {
 	}
 }
 
+func TestReaderOpensPackWithoutMCPEntries(t *testing.T) {
+	input := testPackInput(1, 1)
+	input.MCPServers = nil
+	for i := range input.Scopes {
+		input.Scopes[i].MCPProfiles = nil
+	}
+
+	blob, err := Build(input)
+	require.NoError(t, err)
+	// This is the boundary case that used to make Open reject LLM-only packs:
+	// there are no MCP path records, so the MCP path index starts at EOF.
+	require.Equal(t, uint32(len(blob)), u32(blob[headerMCPPathsOff:headerMCPPathsOff+4]))
+
+	reader, err := Open(blob)
+	require.NoError(t, err)
+
+	_, ok := reader.ResolveLLMIDs("workspace1", "slug:1:1", "gpt-4o-mini")
+	require.True(t, ok)
+	assert.Empty(t, reader.MCPServers())
+
+	paths, ok := reader.MCPPaths("workspace1")
+	require.True(t, ok)
+	assert.Empty(t, paths)
+
+	_, ok = reader.ResolveMCPIDs("workspace1", "profile-dev-tools")
+	require.False(t, ok)
+}
+
 func TestReaderV1ModelsJSON(t *testing.T) {
 	blob, err := Build(testPackInput(1, 1))
 	if err != nil {
