@@ -502,11 +502,12 @@ func packProviders(fixture source.Fixture) []cherry.Provider {
 	byID := map[string]cherry.Provider{}
 	for _, provider := range fixture.Providers {
 		byID[provider.ID] = cherry.Provider{
-			ID:        provider.ID,
-			Kind:      provider.Kind,
-			Endpoint:  provider.Endpoint,
-			SecretRef: provider.SecretRef,
-			AuthType:  provider.AuthType,
+			ID:         provider.ID,
+			Kind:       provider.Kind,
+			Endpoint:   provider.Endpoint,
+			SecretRef:  provider.SecretRef,
+			AuthType:   provider.AuthType,
+			PathPrefix: provider.PathPrefix,
 		}
 	}
 	for _, model := range fixture.Models {

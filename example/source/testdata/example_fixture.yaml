@@ -237,6 +237,7 @@ providers:
     endpoint: https://api.anthropic.com
     secret_ref: env://ANTHROPIC_API_KEY
     auth_type: bearer
+    path_prefix: ""
     request_mutations:
       "*":
         headers:
@@ -249,6 +250,7 @@ providers:
     endpoint: https://api.openai.com
     secret_ref: env://OPENAI_API_KEY
     auth_type: bearer
+    path_prefix: ""
     request_mutations:
       "*":
         headers:
@@ -261,6 +263,7 @@ providers:
     endpoint: https://us-east5-aiplatform.googleapis.com
     secret_ref: env://VERTEX_ANTHROPIC_API_KEY
     auth_type: bearer
+    path_prefix: ""
     request_mutations:
       "*":
         headers:
@@ -273,6 +276,7 @@ providers:
     endpoint: https://192.0.2.1
     secret_ref: literal://fake
     auth_type: bearer
+    path_prefix: ""
     request_mutations: {}
     response_mutations: {}
   - id: fallback_p2
@@ -280,6 +284,7 @@ providers:
     endpoint: https://192.0.2.2
     secret_ref: literal://fake
     auth_type: bearer
+    path_prefix: ""
     request_mutations: {}
     response_mutations: {}
   - id: fallback_p3
@@ -287,6 +292,7 @@ providers:
     endpoint: https://192.0.2.3
     secret_ref: literal://fake
     auth_type: bearer
+    path_prefix: ""
     request_mutations: {}
     response_mutations: {}
 

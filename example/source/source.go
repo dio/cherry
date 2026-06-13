@@ -301,6 +301,7 @@ type Provider struct {
 	Endpoint          string                     `yaml:"endpoint"`
 	SecretRef         string                     `yaml:"secret_ref"`
 	AuthType          string                     `yaml:"auth_type"`
+	PathPrefix        string                     `yaml:"path_prefix"`
 	RequestMutations  map[string]ProviderMutator `yaml:"request_mutations"`
 	ResponseMutations map[string]ProviderMutator `yaml:"response_mutations"`
 }
@@ -522,6 +523,9 @@ func mergeProvider(base Provider, overlay Provider) Provider {
 	}
 	if overlay.AuthType != "" {
 		base.AuthType = overlay.AuthType
+	}
+	if overlay.PathPrefix != "" {
+		base.PathPrefix = overlay.PathPrefix
 	}
 	if len(overlay.RequestMutations) > 0 {
 		base.RequestMutations = overlay.RequestMutations

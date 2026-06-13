@@ -28,7 +28,7 @@ import (
 
 const (
 	magic              = "OPK1"
-	currentPackVersion = uint32(4)
+	currentPackVersion = uint32(5)
 	headerSize         = 64
 
 	// Header layout:
@@ -62,7 +62,7 @@ const (
 
 	principalLen      = 24 // hash64(slug + "\x00" + requestedModel), slugSID, routeID, rateID, requestedModelID
 	modelLen          = 32 // hash64, idSID, providerID, nameSID, modeSID, capabilitiesSID, metadataSID
-	providerLen       = 20 // idSID, kindSID, endpointSID, secretSID, authTypeSID
+	providerLen       = 24 // idSID, kindSID, endpointSID, secretSID, authTypeSID, pathPrefixSID
 	routeLen          = 24 // kind, target fields or child count/offset/retry fields
 	routeChildLen     = 8  // weight, childRouteID; weight is zero for chain children
 	rateLen           = 16 // usdCents, rpm, onExceedSID
@@ -98,11 +98,12 @@ const (
 // this provider (e.g. "bearer"). Empty string is treated as "bearer" by
 // enforcement points for backwards compatibility.
 type Provider struct {
-	ID        string
-	Kind      string
-	Endpoint  string
-	SecretRef string
-	AuthType  string
+	ID         string
+	Kind       string
+	Endpoint   string
+	SecretRef  string
+	AuthType   string
+	PathPrefix string
 }
 
 // Model describes a logical model name accepted by enforcement requests.
@@ -347,11 +348,12 @@ type LLMPlan struct {
 // ProviderInfo is the string-materialized metadata for one provider stored in
 // the pack. It is intended for diagnostics and EP setup inspection.
 type ProviderInfo struct {
-	ID        string
-	Kind      string
-	Endpoint  string
-	SecretRef string
-	AuthType  string
+	ID         string
+	Kind       string
+	Endpoint   string
+	SecretRef  string
+	AuthType   string
+	PathPrefix string
 }
 
 // ModelInfo is the string-materialized metadata for one model stored in the
@@ -513,6 +515,8 @@ func Build(input Input) ([]byte, error) {
 		builder.stringID(provider.Kind)
 		builder.stringID(provider.Endpoint)
 		builder.stringID(provider.SecretRef)
+		builder.stringID(provider.AuthType)
+		builder.stringID(provider.PathPrefix)
 	}
 
 	models := sortedModels(input.Models)
@@ -1100,11 +1104,12 @@ func (r Reader) ScopeIDs() []string {
 func (r Reader) providerInfo(id uint32) ProviderInfo {
 	provider := r.provider(id)
 	return ProviderInfo{
-		ID:        r.String(provider.idSID),
-		Kind:      r.String(provider.kindSID),
-		Endpoint:  r.String(provider.endpointSID),
-		SecretRef: r.String(provider.secretSID),
-		AuthType:  r.String(provider.authTypeSID),
+		ID:         r.String(provider.idSID),
+		Kind:       r.String(provider.kindSID),
+		Endpoint:   r.String(provider.endpointSID),
+		SecretRef:  r.String(provider.secretSID),
+		AuthType:   r.String(provider.authTypeSID),
+		PathPrefix: r.String(provider.pathPrefixSID),
 	}
 }
 
@@ -1496,6 +1501,7 @@ func writeProviders(out *bytes.Buffer, b *builder, providers []Provider) {
 		putU32(out, b.stringID(provider.Endpoint))
 		putU32(out, b.stringID(provider.SecretRef))
 		putU32(out, b.stringID(provider.AuthType))
+		putU32(out, b.stringID(provider.PathPrefix))
 	}
 }
 
@@ -1747,11 +1753,12 @@ type modelRef struct {
 }
 
 type providerRef struct {
-	idSID       uint32
-	kindSID     uint32
-	endpointSID uint32
-	secretSID   uint32
-	authTypeSID uint32
+	idSID         uint32
+	kindSID       uint32
+	endpointSID   uint32
+	secretSID     uint32
+	authTypeSID   uint32
+	pathPrefixSID uint32
 }
 
 type routeRef struct {
@@ -2000,11 +2007,12 @@ func (r Reader) model(id uint32) modelRef {
 func (r Reader) provider(id uint32) providerRef {
 	base := int(r.providersOff) + 4 + int(id)*providerLen
 	return providerRef{
-		idSID:       r.read32(base),
-		kindSID:     r.read32(base + 4),
-		endpointSID: r.read32(base + 8),
-		secretSID:   r.read32(base + 12),
-		authTypeSID: r.read32(base + 16),
+		idSID:         r.read32(base),
+		kindSID:       r.read32(base + 4),
+		endpointSID:   r.read32(base + 8),
+		secretSID:     r.read32(base + 12),
+		authTypeSID:   r.read32(base + 16),
+		pathPrefixSID: r.read32(base + 20),
 	}
 }
 

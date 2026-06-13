@@ -149,6 +149,46 @@ func TestReaderProviders(t *testing.T) {
 	}
 }
 
+// TestProviderPathPrefixRoundTrip guards against the pre-intern bug where a
+// non-empty PathPrefix or AuthType that appears only in a provider record would
+// be written with an ID beyond the frozen string table, making it unreadable.
+func TestProviderPathPrefixRoundTrip(t *testing.T) {
+	input := testPackInput(1, 1)
+	// Inject a provider whose PathPrefix and AuthType are unique strings that
+	// would be missed by the pre-intern loop if it didn't include them.
+	input.Providers = append(input.Providers, Provider{
+		ID:         "custom",
+		Kind:       "openai",
+		Endpoint:   "https://custom.example.com",
+		SecretRef:  "env://CUSTOM_KEY",
+		AuthType:   "custom-auth",
+		PathPrefix: "/api/v2",
+	})
+	// Add a model to satisfy the scope route requirements.
+	input.Models = append(input.Models, Model{
+		ID: "custom-model", Provider: "custom", Name: "custom-model", Mode: "chat",
+	})
+
+	blob, err := Build(input)
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	r, err := Open(blob)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	info, ok := r.ResolveProvider("custom")
+	if !ok {
+		t.Fatal("ResolveProvider(custom) not found")
+	}
+	if info.PathPrefix != "/api/v2" {
+		t.Errorf("PathPrefix = %q, want %q", info.PathPrefix, "/api/v2")
+	}
+	if info.AuthType != "custom-auth" {
+		t.Errorf("AuthType = %q, want %q", info.AuthType, "custom-auth")
+	}
+}
+
 func TestReaderMCPServers(t *testing.T) {
 	blob, err := Build(testPackInput(1, 1))
 	if err != nil {
