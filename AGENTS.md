@@ -134,7 +134,6 @@ command:
 
 ```sh
 make format
-make fmt
 make lint
 make lint-fix
 make lint-config
@@ -164,7 +163,7 @@ go test ./...
 For code quality checks, also run:
 
 ```sh
-make fmt
+make format
 make lint
 ```
 

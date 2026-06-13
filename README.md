@@ -141,6 +141,27 @@ if err != nil {
 The resulting `bundleBytes` are what the control plane stores or serves to an
 enforcement point.
 
+If the control plane normally publishes bundles on a periodic cadence, use
+`SnapshotPolicy` to decide which normalized mutable changes should interrupt
+that cadence and publish a fresh immutable snapshot immediately. External key
+watching and verification stay outside Cherry; after that system observes a key
+change, it can map the event to a normalized principal or secret-ref change:
+
+```go
+decision := cherry.DefaultSnapshotPolicy().Decide([]cherry.SnapshotChange{
+    {
+        Kind:          cherry.SnapshotChangePrincipalBinding,
+        ScopeID:       "workspace1",
+        PrincipalSlug: "slug:project1",
+        Reason:        "key binding changed",
+    },
+})
+if decision.TakeSnapshot {
+    // Rebuild the affected bundle or scope overlay, encode it, open it, and
+    // publish it with the normal atomic generation swap.
+}
+```
+
 Model catalog records can carry opaque normalized metadata. A producer can read
 its raw model catalog, keep pricing, limits, modalities, and capabilities in
 `Model.MetadataJSON`, and pass selected capability names in `Model.Capabilities`.
