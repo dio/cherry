@@ -156,6 +156,137 @@ func TestReaderProviderBYOKPreferDedupesRouteShapeAndKeepsPlatformFallback(t *te
 	assert.Equal(t, "env://OPENAI_API_KEY", userB.Plan.Children[1].Plan.SecretRef)
 }
 
+func TestReaderShortChainRouteKeysKeepRetryAndChildOrder(t *testing.T) {
+	input := testPackInput(1, 1)
+	input.Providers = append(input.Providers,
+		Provider{ID: "fallback", Kind: "openai", Endpoint: "https://fallback.example", SecretRef: "env://FALLBACK_KEY"},
+	)
+	input.Models = append(input.Models,
+		Model{ID: "gpt-fallback", Provider: "fallback", Name: "gpt-fallback", Mode: "chat"},
+	)
+	input.Scopes[0].Principals = []Principal{
+		{
+			Slug: "slug:user-a",
+			ModelRoutes: map[string]RoutePlan{
+				"gpt-4o-mini": {
+					Kind: RouteKindChain,
+					Retry: &RetryPolicy{
+						RetryOn:         "401",
+						PerTryTimeoutMS: 1000,
+					},
+					Children: []RoutePlan{
+						{Kind: RouteKindTarget, Provider: "openai", Model: "gpt-4o-mini", SecretRef: "env://USER_A_OPENAI"},
+						{Kind: RouteKindTarget, Provider: "fallback", Model: "gpt-fallback"},
+					},
+				},
+			},
+		},
+		{
+			Slug: "slug:user-b",
+			ModelRoutes: map[string]RoutePlan{
+				"gpt-4o-mini": {
+					Kind: RouteKindChain,
+					Retry: &RetryPolicy{
+						RetryOn:         "5xx",
+						PerTryTimeoutMS: 2000,
+					},
+					Children: []RoutePlan{
+						{Kind: RouteKindTarget, Provider: "fallback", Model: "gpt-fallback", SecretRef: "env://USER_B_FALLBACK"},
+						{Kind: RouteKindTarget, Provider: "openai", Model: "gpt-4o-mini"},
+					},
+				},
+			},
+		},
+	}
+
+	blob, err := Build(input)
+	require.NoError(t, err)
+	reader, err := Open(blob)
+	require.NoError(t, err)
+
+	assert.Equal(t, uint32(4), reader.sectionCount(reader.routesOff))
+
+	userA, ok := reader.ResolveLLMPlan("workspace1", "slug:user-a", "gpt-4o-mini")
+	require.True(t, ok)
+	require.Equal(t, RouteKindChain, userA.Plan.Kind)
+	assert.Equal(t, "401", userA.Plan.RetryOn)
+	assert.Equal(t, uint32(1000), userA.Plan.PerTryTimeoutMS)
+	require.Len(t, userA.Plan.Children, 2)
+	assert.Equal(t, "openai", userA.Plan.Children[0].Plan.Provider)
+	assert.Equal(t, "env://USER_A_OPENAI", userA.Plan.Children[0].Plan.SecretRef)
+	assert.Equal(t, "fallback", userA.Plan.Children[1].Plan.Provider)
+	assert.Equal(t, "env://FALLBACK_KEY", userA.Plan.Children[1].Plan.SecretRef)
+
+	userB, ok := reader.ResolveLLMPlan("workspace1", "slug:user-b", "gpt-4o-mini")
+	require.True(t, ok)
+	require.Equal(t, RouteKindChain, userB.Plan.Kind)
+	assert.Equal(t, "5xx", userB.Plan.RetryOn)
+	assert.Equal(t, uint32(2000), userB.Plan.PerTryTimeoutMS)
+	require.Len(t, userB.Plan.Children, 2)
+	assert.Equal(t, "fallback", userB.Plan.Children[0].Plan.Provider)
+	assert.Equal(t, "env://USER_B_FALLBACK", userB.Plan.Children[0].Plan.SecretRef)
+	assert.Equal(t, "openai", userB.Plan.Children[1].Plan.Provider)
+	assert.Equal(t, "env://OPENAI_API_KEY", userB.Plan.Children[1].Plan.SecretRef)
+}
+
+func TestReaderCredentialSlotOverflowPreservesSplitSecrets(t *testing.T) {
+	input := testPackInput(1, 1)
+	input.Providers = append(input.Providers,
+		Provider{ID: "fallback", Kind: "openai", Endpoint: "https://fallback.example", SecretRef: "env://FALLBACK_KEY"},
+	)
+	input.Models = append(input.Models,
+		Model{ID: "gpt-fallback", Provider: "fallback", Name: "gpt-fallback", Mode: "chat"},
+	)
+	input.Scopes[0].Principals = []Principal{
+		{
+			Slug: "slug:user-a",
+			ModelRoutes: map[string]RoutePlan{
+				"gpt-4o-mini": {
+					Kind: RouteKindSplit,
+					Split: []WeightedRoutePlan{
+						{
+							Weight: 70,
+							Plan: RoutePlan{
+								Kind:      RouteKindTarget,
+								Provider:  "openai",
+								Model:     "gpt-4o-mini",
+								SecretRef: "env://USER_A_OPENAI",
+							},
+						},
+						{
+							Weight: 30,
+							Plan: RoutePlan{
+								Kind:      RouteKindTarget,
+								Provider:  "fallback",
+								Model:     "gpt-fallback",
+								SecretRef: "env://USER_A_FALLBACK",
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	blob, err := Build(input)
+	require.NoError(t, err)
+	reader, err := Open(blob)
+	require.NoError(t, err)
+
+	plan, ok := reader.ResolveLLMPlan("workspace1", "slug:user-a", "gpt-4o-mini")
+	require.True(t, ok)
+	require.Equal(t, RouteKindSplit, plan.Plan.Kind)
+	require.Len(t, plan.Plan.Children, 2)
+	assert.Equal(t, uint32(70), plan.Plan.Children[0].Weight)
+	assert.Equal(t, "env://USER_A_OPENAI", plan.Plan.Children[0].Plan.SecretRef)
+	assert.Equal(t, uint32(30), plan.Plan.Children[1].Weight)
+	assert.Equal(t, "env://USER_A_FALLBACK", plan.Plan.Children[1].Plan.SecretRef)
+
+	ids, ok := reader.ResolveLLMIDs("workspace1", "slug:user-a", "gpt-4o-mini")
+	require.True(t, ok)
+	assert.Equal(t, "env://USER_A_OPENAI", reader.String(ids.SecretSID))
+}
+
 func providerBYOKPreferRoute(secretRef string) RoutePlan {
 	return RoutePlan{
 		Kind: RouteKindChain,
