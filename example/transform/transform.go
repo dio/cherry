@@ -506,6 +506,7 @@ func packProviders(fixture source.Fixture) []cherry.Provider {
 			Kind:      provider.Kind,
 			Endpoint:  provider.Endpoint,
 			SecretRef: provider.SecretRef,
+			AuthType:  provider.AuthType,
 		}
 	}
 	for _, model := range fixture.Models {

@@ -300,6 +300,7 @@ type Provider struct {
 	Kind              string                     `yaml:"kind"`
 	Endpoint          string                     `yaml:"endpoint"`
 	SecretRef         string                     `yaml:"secret_ref"`
+	AuthType          string                     `yaml:"auth_type"`
 	RequestMutations  map[string]ProviderMutator `yaml:"request_mutations"`
 	ResponseMutations map[string]ProviderMutator `yaml:"response_mutations"`
 }
@@ -425,6 +426,7 @@ func LoadProviderCatalogJSON(path string) ([]Provider, error) {
 			ID:       row.Name,
 			Kind:     row.Name,
 			Endpoint: row.APIBaseURL,
+			AuthType: row.AuthType,
 		})
 	}
 	return providers, nil
@@ -517,6 +519,9 @@ func mergeProvider(base Provider, overlay Provider) Provider {
 	}
 	if overlay.SecretRef != "" {
 		base.SecretRef = overlay.SecretRef
+	}
+	if overlay.AuthType != "" {
+		base.AuthType = overlay.AuthType
 	}
 	if len(overlay.RequestMutations) > 0 {
 		base.RequestMutations = overlay.RequestMutations

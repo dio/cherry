@@ -28,7 +28,7 @@ import (
 
 const (
 	magic              = "OPK1"
-	currentPackVersion = uint32(3)
+	currentPackVersion = uint32(4)
 	headerSize         = 64
 
 	// Header layout:
@@ -62,7 +62,7 @@ const (
 
 	principalLen      = 24 // hash64(slug + "\x00" + requestedModel), slugSID, routeID, rateID, requestedModelID
 	modelLen          = 32 // hash64, idSID, providerID, nameSID, modeSID, capabilitiesSID, metadataSID
-	providerLen       = 16 // idSID, kindSID, endpointSID, secretSID
+	providerLen       = 20 // idSID, kindSID, endpointSID, secretSID, authTypeSID
 	routeLen          = 24 // kind, target fields or child count/offset/retry fields
 	routeChildLen     = 8  // weight, childRouteID; weight is zero for chain children
 	rateLen           = 16 // usdCents, rpm, onExceedSID
@@ -94,11 +94,15 @@ const (
 
 // Provider describes an upstream LLM provider available to compiled LLM routes.
 // SecretRef is a reference to secret material, not the secret material itself.
+// AuthType identifies the credential scheme used to authenticate requests to
+// this provider (e.g. "bearer"). Empty string is treated as "bearer" by
+// enforcement points for backwards compatibility.
 type Provider struct {
 	ID        string
 	Kind      string
 	Endpoint  string
 	SecretRef string
+	AuthType  string
 }
 
 // Model describes a logical model name accepted by enforcement requests.
@@ -347,6 +351,7 @@ type ProviderInfo struct {
 	Kind      string
 	Endpoint  string
 	SecretRef string
+	AuthType  string
 }
 
 // ModelInfo is the string-materialized metadata for one model stored in the
@@ -1099,6 +1104,7 @@ func (r Reader) providerInfo(id uint32) ProviderInfo {
 		Kind:      r.String(provider.kindSID),
 		Endpoint:  r.String(provider.endpointSID),
 		SecretRef: r.String(provider.secretSID),
+		AuthType:  r.String(provider.authTypeSID),
 	}
 }
 
@@ -1489,6 +1495,7 @@ func writeProviders(out *bytes.Buffer, b *builder, providers []Provider) {
 		putU32(out, b.stringID(provider.Kind))
 		putU32(out, b.stringID(provider.Endpoint))
 		putU32(out, b.stringID(provider.SecretRef))
+		putU32(out, b.stringID(provider.AuthType))
 	}
 }
 
@@ -1744,6 +1751,7 @@ type providerRef struct {
 	kindSID     uint32
 	endpointSID uint32
 	secretSID   uint32
+	authTypeSID uint32
 }
 
 type routeRef struct {
@@ -1996,6 +2004,7 @@ func (r Reader) provider(id uint32) providerRef {
 		kindSID:     r.read32(base + 4),
 		endpointSID: r.read32(base + 8),
 		secretSID:   r.read32(base + 12),
+		authTypeSID: r.read32(base + 16),
 	}
 }
 
