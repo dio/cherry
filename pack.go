@@ -565,17 +565,22 @@ func Build(input Input) ([]byte, error) {
 				if err != nil {
 					return nil, fmt.Errorf("principal %q route for %q: %w", principal.Slug, requestedModel, err)
 				}
-				for _, slot := range credentialSlots {
-					builder.stringID(slot.secretRef)
+				if credentialSlots.count > 0 {
+					builder.stringID(credentialSlots.first.secretRef)
+					for _, slot := range credentialSlots.extra {
+						builder.stringID(slot.secretRef)
+					}
 				}
 				lookupHash := principalLookupHash(principal.Slug, requestedModel)
 				compiled.principalEntries = append(compiled.principalEntries, compiledPrincipalEntry{
-					slug:            principal.Slug,
-					requestedModel:  requestedModel,
-					lookupHash:      lookupHash,
-					routeID:         routeID,
-					rate:            principal.Rate,
-					credentialSlots: credentialSlots,
+					slug:                principal.Slug,
+					requestedModel:      requestedModel,
+					lookupHash:          lookupHash,
+					routeID:             routeID,
+					rate:                principal.Rate,
+					credentialSlotCount: credentialSlots.count,
+					credentialSlot0:     credentialSlots.first,
+					credentialSlotExtra: credentialSlots.extra,
 				})
 			}
 			if _, ok := rateIDs[principal.Rate]; !ok {
@@ -1300,17 +1305,25 @@ type compiledScope struct {
 }
 
 type compiledPrincipalEntry struct {
-	slug            string
-	requestedModel  string
-	lookupHash      uint64
-	routeID         uint32
-	rate            RatePolicy
-	credentialSlots []compiledCredentialSlot
+	slug                string
+	requestedModel      string
+	lookupHash          uint64
+	routeID             uint32
+	rate                RatePolicy
+	credentialSlotCount uint32
+	credentialSlot0     compiledCredentialSlot
+	credentialSlotExtra []compiledCredentialSlot
 }
 
 type compiledCredentialSlot struct {
 	targetOrdinal uint32
 	secretRef     string
+}
+
+type compiledCredentialSlots struct {
+	count uint32
+	first compiledCredentialSlot
+	extra []compiledCredentialSlot
 }
 
 type compiledMCPProfile struct {
@@ -1588,11 +1601,11 @@ func writeRouteKey(builder *strings.Builder, route RoutePlan) {
 	}
 }
 
-func routeCredentialSlots(route RoutePlan) ([]compiledCredentialSlot, error) {
-	slots := []compiledCredentialSlot{}
+func routeCredentialSlots(route RoutePlan) (compiledCredentialSlots, error) {
+	var slots compiledCredentialSlots
 	var targetOrdinal uint32
 	if err := appendRouteCredentialSlots(route, &targetOrdinal, &slots); err != nil {
-		return nil, err
+		return compiledCredentialSlots{}, err
 	}
 	return slots, nil
 }
@@ -1600,13 +1613,13 @@ func routeCredentialSlots(route RoutePlan) ([]compiledCredentialSlot, error) {
 func appendRouteCredentialSlots(
 	route RoutePlan,
 	targetOrdinal *uint32,
-	slots *[]compiledCredentialSlot,
+	slots *compiledCredentialSlots,
 ) error {
 	normalized := normalizeRoutePlan(route)
 	switch normalized.Kind {
 	case RouteKindTarget:
 		if normalized.SecretRef != "" {
-			*slots = append(*slots, compiledCredentialSlot{
+			slots.append(compiledCredentialSlot{
 				targetOrdinal: *targetOrdinal,
 				secretRef:     normalized.SecretRef,
 			})
@@ -1628,6 +1641,15 @@ func appendRouteCredentialSlots(
 		return fmt.Errorf("unsupported route node kind %q", normalized.Kind)
 	}
 	return nil
+}
+
+func (slots *compiledCredentialSlots) append(slot compiledCredentialSlot) {
+	if slots.count == 0 {
+		slots.first = slot
+	} else {
+		slots.extra = append(slots.extra, slot)
+	}
+	slots.count++
 }
 
 func capabilitiesKey(values []string) string {
@@ -1869,7 +1891,7 @@ func writeScopes(out *bytes.Buffer, b *builder, scopes []compiledScope, rateIDs 
 		})
 		totalPrincipalRecords += len(principalEntries)
 		for _, principal := range principalEntries {
-			totalCredentialRecords += len(principal.credentialSlots)
+			totalCredentialRecords += int(principal.credentialSlotCount)
 		}
 		totalMCPPathRecords += len(scopes[i].mcpProfiles)
 	}
@@ -1895,9 +1917,13 @@ func writeScopes(out *bytes.Buffer, b *builder, scopes []compiledScope, rateIDs 
 			putU32(&principalData, principal.routeID)
 			putU32(&principalData, rateIDs[principal.rate])
 			putU32(&principalData, b.stringID(principal.requestedModel))
-			putU32(&principalData, uint32(len(principal.credentialSlots)))
+			putU32(&principalData, principal.credentialSlotCount)
 			putU32(&principalData, credentialsOff+uint32(credentialData.Len()))
-			for _, slot := range principal.credentialSlots {
+			if principal.credentialSlotCount > 0 {
+				putU32(&credentialData, principal.credentialSlot0.targetOrdinal)
+				putU32(&credentialData, b.stringID(principal.credentialSlot0.secretRef))
+			}
+			for _, slot := range principal.credentialSlotExtra {
 				putU32(&credentialData, slot.targetOrdinal)
 				putU32(&credentialData, b.stringID(slot.secretRef))
 			}

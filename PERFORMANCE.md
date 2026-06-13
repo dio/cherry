@@ -995,6 +995,131 @@ Interpretation:
   route-key allocation pattern, and concurrency would need deterministic merge
   rules for route IDs, string IDs, and scope-local indexes
 
+### BYOK Provider Profile: 2026-06-13 After Chunk 6
+
+Status: measured.
+
+Focused profile command:
+
+```sh
+go test -run '^$' \
+  -bench '^BenchmarkCherryPackRouteScale/byok-provider-secret-(always|prefer)/route_entries=1000000' \
+  -benchmem \
+  -benchtime=10s \
+  -memprofile=/tmp/cherry-byok-provider-after-chunk6.mem \
+  -cpuprofile=/tmp/cherry-byok-provider-after-chunk6.cpu \
+  .
+```
+
+Benchmark sample from the profile run:
+
+```text
+byok-provider-secret-always, 1M route entries:
+  time: 0.749 s/op
+  alloc: 424.9 MB/op
+  allocs: 1.0M/op
+  blob: 54.0 MB raw, 15.8 MB zstd
+
+byok-provider-secret-prefer, 1M route entries:
+  time: 1.08 s/op
+  alloc: 424.9 MB/op
+  allocs: 1.0M/op
+  blob: 54.0 MB raw, 15.8 MB zstd
+```
+
+Allocation object profile:
+
+```text
+Build:                       66.3% cumulative objects
+appendRouteCredentialSlots:  66.2% flat objects
+benchmarkRouteInput:         33.6% cumulative objects
+```
+
+Allocation space profile:
+
+```text
+Build:                   85.5% cumulative bytes
+bytes.growSlice:         47.9% flat bytes
+writeScopes:             35.8% cumulative bytes
+builder.stringID:        12.8% flat bytes
+appendRouteCredentialSlots: 4.8% flat bytes
+```
+
+CPU profile:
+
+```text
+Build:                   74.3% cumulative samples
+writeScopes:             31.1% cumulative samples
+internShortChainRoute:    6.4% flat samples
+builder.stringID:        14.5% cumulative samples
+appendRouteCredentialSlots: 6.4% cumulative samples
+```
+
+Interpretation:
+
+- route-key allocation is no longer the dominant allocation source
+- the remaining build-side allocation count is mostly the tiny
+  `[]compiledCredentialSlot` backing array allocated for each one-slot BYOK
+  route
+- the next focused optimization is to store the common first credential slot
+  inline in `compiledPrincipalEntry`, using a slice only for additional slots
+
+### Chunk 7: Inline The First Credential Slot
+
+Status: implemented.
+
+Change:
+
+- `compiledPrincipalEntry` now stores the first credential slot inline.
+- additional credential slots use an overflow slice.
+- the common provider-level BYOK shape has one credential slot per route, so it
+  no longer allocates a tiny backing array per principal/requested-model route.
+- this preserves the persisted format and public API; it only changes temporary
+  builder storage.
+
+Focused benchmark command:
+
+```sh
+go test -run '^$' \
+  -bench '^BenchmarkCherryPackRouteScale/byok-provider-secret-(always|prefer)/route_entries=1000000' \
+  -benchmem \
+  -benchtime=3s \
+  -count=3 \
+  .
+```
+
+Raw output:
+
+```text
+/tmp/cherry-byok-provider-after-inline-credential-slot-20260613220000.txt
+```
+
+Representative p50 before -> after:
+
+```text
+byok-provider-secret-always, 1M route entries:
+  time:   0.726 s/op -> 0.648 s/op
+  alloc:  424.9 MB/op -> 432.9 MB/op
+  allocs: 1.0M/op -> 2.2k/op
+  blob:   54.0 MB raw -> 54.0 MB raw
+
+byok-provider-secret-prefer, 1M route entries:
+  time:   1.06 s/op -> 0.926 s/op
+  alloc:  424.9 MB/op -> 432.9 MB/op
+  allocs: 1.0M/op -> 2.2k/op
+  blob:   54.0 MB raw -> 54.0 MB raw
+```
+
+Interpretation:
+
+- this removes nearly all remaining build-side heap allocation events for the
+  provider-level BYOK cases
+- bytes per op increase by about 8 MB because every compiled principal entry now
+  carries inline credential-slot fields; the tradeoff is favorable for GC and
+  wall time at 1M route entries
+- the next allocation-space target is no longer credential-slot slices; it is
+  mostly fixed-width table materialization and final buffer growth/copying
+
 ## Optimization Log
 
 ### Chunk 1: Carry Compiled IDs Into Table Writers
