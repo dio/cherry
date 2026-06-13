@@ -503,10 +503,11 @@ func Build(input Input) ([]byte, error) {
 	modelIDs := map[string]uint32{}
 	mcpServerIDs := map[string]uint32{}
 	routeIDs := map[string]uint32{}
-	routes := []RoutePlan{}
+	routes := []compiledRoute{}
 	rateIDs := map[RatePolicy]uint32{}
 	toolsetIDs := map[string]uint32{}
 	toolsets := [][]MCPToolBinding{}
+	compiledScopes := make([]compiledScope, 0, len(input.Scopes))
 
 	providers := sortedProviders(input.Providers)
 	for i, provider := range providers {
@@ -542,6 +543,11 @@ func Build(input Input) ([]byte, error) {
 	}
 
 	for _, scope := range input.Scopes {
+		compiled := compiledScope{
+			id:               scope.ID,
+			principalEntries: make([]compiledPrincipalEntry, 0, countPrincipalRoutes(scope.Principals)),
+			mcpProfiles:      make([]compiledMCPProfile, 0, len(scope.MCPProfiles)),
+		}
 		builder.stringID(scope.ID)
 		for _, principal := range scope.Principals {
 			builder.stringID(principal.Slug)
@@ -550,9 +556,18 @@ func Build(input Input) ([]byte, error) {
 				if _, ok := modelIDs[requestedModel]; !ok {
 					return nil, fmt.Errorf("principal %q references unknown requested model %q", principal.Slug, requestedModel)
 				}
-				if _, err := internRoute(route, builder, providerIDs, modelIDs, routeIDs, &routes); err != nil {
+				routeID, err := internRoute(route, builder, providerIDs, modelIDs, routeIDs, &routes)
+				if err != nil {
 					return nil, fmt.Errorf("principal %q route for %q: %w", principal.Slug, requestedModel, err)
 				}
+				lookupHash := principalLookupHash(principal.Slug, requestedModel)
+				compiled.principalEntries = append(compiled.principalEntries, compiledPrincipalEntry{
+					slug:           principal.Slug,
+					requestedModel: requestedModel,
+					lookupHash:     lookupHash,
+					routeID:        routeID,
+					rate:           principal.Rate,
+				})
 			}
 			if _, ok := rateIDs[principal.Rate]; !ok {
 				rateIDs[principal.Rate] = uint32(len(rateIDs))
@@ -580,7 +595,14 @@ func Build(input Input) ([]byte, error) {
 				toolsetIDs[key] = uint32(len(toolsets))
 				toolsets = append(toolsets, canonicalTools)
 			}
+			pathHash := hashString(profile.Path)
+			compiled.mcpProfiles = append(compiled.mcpProfiles, compiledMCPProfile{
+				path:      profile.Path,
+				pathHash:  pathHash,
+				toolsetID: toolsetIDs[key],
+			})
 		}
+		compiledScopes = append(compiledScopes, compiled)
 	}
 
 	var out bytes.Buffer
@@ -594,7 +616,7 @@ func Build(input Input) ([]byte, error) {
 	modelsOff := uint32(out.Len())
 	writeModels(&out, builder, models, providerIDs)
 	routesOff := uint32(out.Len())
-	writeRoutes(&out, builder, routes, routeIDs, providerIDs, modelIDs)
+	writeRoutes(&out, builder, routes, providerIDs, modelIDs)
 	ratesOff := uint32(out.Len())
 	writeRates(&out, builder, rateIDs)
 	mcpServersOff := uint32(out.Len())
@@ -602,7 +624,7 @@ func Build(input Input) ([]byte, error) {
 	mcpToolsetsOff := uint32(out.Len())
 	writeMCPToolsets(&out, builder, toolsets, mcpServerIDs)
 	scopesOff := uint32(out.Len())
-	principalsOff, mcpPathsOff := writeScopes(&out, builder, input.Scopes, routeIDs, rateIDs, toolsetIDs)
+	principalsOff, mcpPathsOff := writeScopes(&out, builder, compiledScopes, rateIDs)
 
 	blob := out.Bytes()
 	copy(blob[headerMagicOff:headerMagicOff+4], []byte(magic))
@@ -1252,6 +1274,32 @@ type builder struct {
 	strings     []string
 }
 
+type compiledRoute struct {
+	plan          RoutePlan
+	chainChildIDs []uint32
+	splitChildIDs []uint32
+}
+
+type compiledScope struct {
+	id               string
+	principalEntries []compiledPrincipalEntry
+	mcpProfiles      []compiledMCPProfile
+}
+
+type compiledPrincipalEntry struct {
+	slug           string
+	requestedModel string
+	lookupHash     uint64
+	routeID        uint32
+	rate           RatePolicy
+}
+
+type compiledMCPProfile struct {
+	path      string
+	pathHash  uint64
+	toolsetID uint32
+}
+
 func newBuilder() *builder {
 	return &builder{stringIndex: map[string]uint32{}, strings: []string{}}
 }
@@ -1314,6 +1362,14 @@ func principalRoutes(principal Principal) map[string]RoutePlan {
 	}
 }
 
+func countPrincipalRoutes(principals []Principal) int {
+	count := 0
+	for _, principal := range principals {
+		count += len(principalRoutes(principal))
+	}
+	return count
+}
+
 func normalizeRoutePlan(route RoutePlan) RoutePlan {
 	if route.Kind == "" {
 		route.Kind = RouteKindTarget
@@ -1326,12 +1382,20 @@ func normalizeRoutePlan(route RoutePlan) RoutePlan {
 	return route
 }
 
-func internRoute(route RoutePlan, b *builder, providerIDs map[string]uint32, modelIDs map[string]uint32, routeIDs map[string]uint32, routes *[]RoutePlan) (uint32, error) {
+func internRoute(
+	route RoutePlan,
+	b *builder,
+	providerIDs map[string]uint32,
+	modelIDs map[string]uint32,
+	routeIDs map[string]uint32,
+	routes *[]compiledRoute,
+) (uint32, error) {
 	normalized := normalizeRoutePlan(route)
 	key := routeKey(normalized)
 	if id, ok := routeIDs[key]; ok {
 		return id, nil
 	}
+	compiled := compiledRoute{plan: normalized}
 	switch normalized.Kind {
 	case RouteKindTarget:
 		if _, ok := modelIDs[normalized.Model]; !ok {
@@ -1348,31 +1412,35 @@ func internRoute(route RoutePlan, b *builder, providerIDs map[string]uint32, mod
 		if normalized.Retry != nil {
 			b.stringID(normalized.Retry.RetryOn)
 		}
+		compiled.chainChildIDs = make([]uint32, 0, len(normalized.Children))
 		for index, child := range normalized.Children {
 			childID, err := internRoute(child, b, providerIDs, modelIDs, routeIDs, routes)
 			if err != nil {
 				return 0, fmt.Errorf("chain[%d]: %w", index, err)
 			}
-			_ = childID
+			compiled.chainChildIDs = append(compiled.chainChildIDs, childID)
 		}
 	case RouteKindSplit:
 		if len(normalized.Split) == 0 {
 			return 0, errors.New("split route node must not be empty")
 		}
+		compiled.splitChildIDs = make([]uint32, 0, len(normalized.Split))
 		for index, child := range normalized.Split {
 			if child.Weight == 0 {
 				return 0, fmt.Errorf("split[%d]: weight must be positive", index)
 			}
-			if _, err := internRoute(child.Plan, b, providerIDs, modelIDs, routeIDs, routes); err != nil {
+			childID, err := internRoute(child.Plan, b, providerIDs, modelIDs, routeIDs, routes)
+			if err != nil {
 				return 0, fmt.Errorf("split[%d]: %w", index, err)
 			}
+			compiled.splitChildIDs = append(compiled.splitChildIDs, childID)
 		}
 	default:
 		return 0, fmt.Errorf("unsupported route node kind %q", normalized.Kind)
 	}
 	id := uint32(len(*routes))
 	routeIDs[key] = id
-	*routes = append(*routes, normalized)
+	*routes = append(*routes, compiled)
 	return id, nil
 }
 
@@ -1428,30 +1496,6 @@ func splitCapabilities(value string) []string {
 		return nil
 	}
 	return strings.Split(value, "\x00")
-}
-
-type principalEntry struct {
-	slug           string
-	requestedModel string
-	route          RoutePlan
-	rate           RatePolicy
-}
-
-// expandPrincipalEntries flattens principals into the fixed-width records used
-// by the scope-local principal index.
-func expandPrincipalEntries(principals []Principal) []principalEntry {
-	entries := []principalEntry{}
-	for _, principal := range principals {
-		for requestedModel, route := range principalRoutes(principal) {
-			entries = append(entries, principalEntry{
-				slug:           principal.Slug,
-				requestedModel: requestedModel,
-				route:          route,
-				rate:           principal.Rate,
-			})
-		}
-	}
-	return entries
 }
 
 // toolsetKey is a deterministic deduplication key for a canonical MCP toolset.
@@ -1523,13 +1567,13 @@ func writeModels(out *bytes.Buffer, b *builder, models []Model, providerIDs map[
 // writeRoutes writes deduplicated LLM route trees. Principal index records
 // reference this table by route ID. Chain and split nodes point into a child
 // table stored immediately after the fixed-width route records.
-func writeRoutes(out *bytes.Buffer, b *builder, routes []RoutePlan, routeIDs map[string]uint32, providerIDs map[string]uint32, modelIDs map[string]uint32) {
+func writeRoutes(out *bytes.Buffer, b *builder, routes []compiledRoute, providerIDs map[string]uint32, modelIDs map[string]uint32) {
 	putU32(out, uint32(len(routes)))
 	records := make([]routeRef, len(routes))
 	var children bytes.Buffer
 	baseOffset := uint32(out.Len() + len(routes)*routeLen)
-	for i, route := range routes {
-		route = normalizeRoutePlan(route)
+	for i, compiled := range routes {
+		route := compiled.plan
 		switch route.Kind {
 		case RouteKindTarget:
 			records[i] = routeRef{
@@ -1546,9 +1590,9 @@ func writeRoutes(out *bytes.Buffer, b *builder, routes []RoutePlan, routeIDs map
 				retryOnSID:      retryOnSID(b, route.Retry),
 				perTryTimeoutMS: retryTimeout(route.Retry),
 			}
-			for _, child := range route.Children {
+			for _, childID := range compiled.chainChildIDs {
 				putU32(&children, 0)
-				putU32(&children, routeIDs[routeKey(child)])
+				putU32(&children, childID)
 			}
 		case RouteKindSplit:
 			records[i] = routeRef{
@@ -1556,9 +1600,9 @@ func writeRoutes(out *bytes.Buffer, b *builder, routes []RoutePlan, routeIDs map
 				childCount:  uint32(len(route.Split)),
 				childOffset: baseOffset + uint32(children.Len()),
 			}
-			for _, child := range route.Split {
+			for childIndex, child := range route.Split {
 				putU32(&children, child.Weight)
-				putU32(&children, routeIDs[routeKey(child.Plan)])
+				putU32(&children, compiled.splitChildIDs[childIndex])
 			}
 		}
 	}
@@ -1658,7 +1702,7 @@ func writeMCPToolsets(out *bytes.Buffer, b *builder, toolsets [][]MCPToolBinding
 
 // writeScopes writes scope records plus the two scope-local indexes they point
 // at: principal/model routes and MCP path suffixes.
-func writeScopes(out *bytes.Buffer, b *builder, scopes []Scope, routeIDs map[string]uint32, rateIDs map[RatePolicy]uint32, toolsetIDs map[string]uint32) (uint32, uint32) {
+func writeScopes(out *bytes.Buffer, b *builder, scopes []compiledScope, rateIDs map[RatePolicy]uint32) (uint32, uint32) {
 	putU32(out, uint32(len(scopes)))
 	scopeRecords := make([]scopeRef, len(scopes))
 	var principalData bytes.Buffer
@@ -1666,27 +1710,25 @@ func writeScopes(out *bytes.Buffer, b *builder, scopes []Scope, routeIDs map[str
 	principalsOff := uint32(out.Len() + len(scopes)*scopeLen)
 
 	for i, scope := range scopes {
-		principalEntries := expandPrincipalEntries(scope.Principals)
+		principalEntries := append([]compiledPrincipalEntry{}, scope.principalEntries...)
 		sort.Slice(principalEntries, func(i, j int) bool {
-			leftHash := principalLookupHash(principalEntries[i].slug, principalEntries[i].requestedModel)
-			rightHash := principalLookupHash(principalEntries[j].slug, principalEntries[j].requestedModel)
-			if leftHash == rightHash {
+			if principalEntries[i].lookupHash == principalEntries[j].lookupHash {
 				if principalEntries[i].slug == principalEntries[j].slug {
 					return principalEntries[i].requestedModel < principalEntries[j].requestedModel
 				}
 				return principalEntries[i].slug < principalEntries[j].slug
 			}
-			return leftHash < rightHash
+			return principalEntries[i].lookupHash < principalEntries[j].lookupHash
 		})
 		scopeRecords[i] = scopeRef{
-			sid:             b.stringID(scope.ID),
+			sid:             b.stringID(scope.id),
 			principalCount:  uint32(len(principalEntries)),
 			principalOffset: principalsOff + uint32(principalData.Len()),
 		}
 		for _, principal := range principalEntries {
-			putU64(&principalData, principalLookupHash(principal.slug, principal.requestedModel))
+			putU64(&principalData, principal.lookupHash)
 			putU32(&principalData, b.stringID(principal.slug))
-			putU32(&principalData, routeIDs[routeKey(principal.route)])
+			putU32(&principalData, principal.routeID)
 			putU32(&principalData, rateIDs[principal.rate])
 			putU32(&principalData, b.stringID(principal.requestedModel))
 		}
@@ -1694,21 +1736,19 @@ func writeScopes(out *bytes.Buffer, b *builder, scopes []Scope, routeIDs map[str
 
 	mcpPathsOff := principalsOff + uint32(principalData.Len())
 	for i, scope := range scopes {
-		profiles := append([]MCPProfile{}, scope.MCPProfiles...)
+		profiles := append([]compiledMCPProfile{}, scope.mcpProfiles...)
 		sort.Slice(profiles, func(i, j int) bool {
-			leftHash := hashString(profiles[i].Path)
-			rightHash := hashString(profiles[j].Path)
-			if leftHash == rightHash {
-				return profiles[i].Path < profiles[j].Path
+			if profiles[i].pathHash == profiles[j].pathHash {
+				return profiles[i].path < profiles[j].path
 			}
-			return leftHash < rightHash
+			return profiles[i].pathHash < profiles[j].pathHash
 		})
 		scopeRecords[i].mcpPathCount = uint32(len(profiles))
 		scopeRecords[i].mcpPathOffset = mcpPathsOff + uint32(mcpPathData.Len())
 		for _, profile := range profiles {
-			putU64(&mcpPathData, hashString(profile.Path))
-			putU32(&mcpPathData, b.stringID(profile.Path))
-			putU32(&mcpPathData, toolsetIDs[toolsetKey(canonicalToolset(profile.Tools))])
+			putU64(&mcpPathData, profile.pathHash)
+			putU32(&mcpPathData, b.stringID(profile.path))
+			putU32(&mcpPathData, profile.toolsetID)
 		}
 	}
 
