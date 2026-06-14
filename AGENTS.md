@@ -67,6 +67,14 @@ name.
   - `ResolveMCPIDs`
   - `ResolveMCPInitializeIDs`
   - `ResolveMCPToolIDs`
+- Preserve split-view APIs for EPs that consume independently rebuilt LLM and
+  MCP bundles:
+  - `OpenSplitBundleZstd`
+  - `OpenSplitBundleZstdWithOptions`
+  - `ValidateSplitBundleCompatibility`
+  - `NewSplitView`
+  - `SplitView.LLMString`
+  - `SplitView.MCPString`
 - Keep string-materializing APIs and inspector APIs available for diagnostics:
   - `ResolveLLMPlan`
   - `ResolveLLM`
@@ -89,6 +97,11 @@ name.
 - Treat `Reader` as an immutable view over its blob. Do not add mutable request
   counters or runtime caches inside it.
 - If adding a hot cache, keep it outside `Reader` and clear it on generation swap.
+- For split LLM/MCP delivery, keep string IDs reader-local: use `LLMString` for
+  IDs returned by LLM methods and `MCPString` for IDs returned by MCP methods.
+- Do not require matching pack manifests for split LLM/MCP bundles. The split
+  compatibility contract is same scope kind, selected scope ID, concrete scopes,
+  and optional shared generation/catalog expectations.
 
 ## Binary Format Changes
 
@@ -175,6 +188,9 @@ go run ./example pack project project1 example/source/testdata/example_fixture.y
 printf 'use workspace1\nllm slug:project1 claude-haiku-4-5\nmcp initialize profile-kiwi-and-github\nmcp call profile-kiwi-and-github github__list-repos\nquit\n' \
   | go run ./example repl /tmp/project1.cherry.zst
 go run ./example pack --models example/source/testdata/catalogs/models.json --providers example/source/testdata/catalogs/providers.json --mcp-catalog example/source/testdata/catalogs/mcp-catalog-data-with-tools.json project project1 example/source/testdata/example_fixture.yaml /tmp/project1-catalogs.cherry.zst
+go run ./example pack --cluster llm --generation gen1 project project1 example/source/testdata/example_fixture.yaml /tmp/project1.llm.cherry.zst
+go run ./example pack --cluster mcp --generation gen1 project project1 example/source/testdata/example_fixture.yaml /tmp/project1.mcp.cherry.zst
+go run ./example split-check --generation gen1 /tmp/project1.llm.cherry.zst /tmp/project1.mcp.cherry.zst
 ```
 
 For performance checks:
@@ -194,6 +210,8 @@ Use focused tests for:
 - model catalog loading, capability lookup, and `/v1/models` projection
 - project fanout and workspace isolation in the example transformer
 - auth/secret-ref behavior for MCP profile bindings
+- split LLM/MCP bundle compatibility, generation validation, and reader-local
+  string table use
 
 ## Local Agent Skill
 

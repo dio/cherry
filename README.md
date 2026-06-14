@@ -141,6 +141,61 @@ if err != nil {
 The resulting `bundleBytes` are what the control plane stores or serves to an
 enforcement point.
 
+For production rebuild isolation, a producer can also publish separate LLM and
+MCP artifacts from the same source selection. Each artifact still uses the same
+bundle envelope; the producer only filters `cherry.Input` before building:
+
+```go
+llmInput := cherry.Input{
+    Providers: input.Providers,
+    Models:    input.Models,
+    Scopes:    make([]cherry.Scope, 0, len(input.Scopes)),
+}
+mcpInput := cherry.Input{
+    MCPServers: input.MCPServers,
+    Scopes:     make([]cherry.Scope, 0, len(input.Scopes)),
+}
+
+for _, scope := range input.Scopes {
+    llmInput.Scopes = append(llmInput.Scopes, cherry.Scope{
+        ID:         scope.ID,
+        Principals: scope.Principals,
+    })
+    mcpInput.Scopes = append(mcpInput.Scopes, cherry.Scope{
+        ID:          scope.ID,
+        MCPProfiles: scope.MCPProfiles,
+    })
+}
+
+llmBlob, llmManifest, err := cherry.BuildWithManifest(llmInput)
+if err != nil {
+    return err
+}
+mcpBlob, mcpManifest, err := cherry.BuildWithManifest(mcpInput)
+if err != nil {
+    return err
+}
+
+llmBundle := cherry.NewBundle("workspace", "workspace1", []string{"workspace1"}, llmBlob, llmManifest)
+mcpBundle := cherry.NewBundle("workspace", "workspace1", []string{"workspace1"}, mcpBlob, mcpManifest)
+llmBundle.Metadata.GenerationID = "generation-2026-06-14T12:00:00Z"
+mcpBundle.Metadata.GenerationID = "generation-2026-06-14T12:00:00Z"
+
+llmBundleBytes, err := cherry.EncodeBundleZstd(llmBundle)
+if err != nil {
+    return err
+}
+mcpBundleBytes, err := cherry.EncodeBundleZstd(mcpBundle)
+if err != nil {
+    return err
+}
+```
+
+This keeps MCP-only changes from rebuilding LLM policy/catalog sections, and
+LLM-only changes from rebuilding MCP sections. The external producer still owns
+which source records belong to each cluster; Cherry only packs the normalized
+rows it receives.
+
 If the control plane normally publishes bundles on a periodic cadence, use
 `SnapshotPolicy` to decide which normalized mutable changes should interrupt
 that cadence and publish a fresh immutable snapshot immediately. External key
@@ -266,7 +321,9 @@ An enforcement point can also consume independently delivered LLM and MCP
 bundles without changing the single-bundle envelope:
 
 ```go
-opened, err := cherry.OpenSplitBundleZstd(llmBundleBytes, mcpBundleBytes)
+opened, err := cherry.OpenSplitBundleZstdWithOptions(llmBundleBytes, mcpBundleBytes, cherry.SplitBundleOptions{
+    GenerationID: "generation-2026-06-14T12:00:00Z",
+})
 if err != nil {
     return err
 }
@@ -274,10 +331,11 @@ if err != nil {
 view := opened.View
 ```
 
-`OpenSplitBundleZstd` opens each artifact with `OpenBundleZstd`, then validates
-that both bundles describe the same control-plane selection and concrete scope
-set. The LLM and MCP pack manifests are allowed to differ because the policy
-clusters are expected to rebuild independently.
+`OpenSplitBundleZstd` and `OpenSplitBundleZstdWithOptions` open each artifact
+with `OpenBundleZstd`, then validate that both bundles describe the same
+control-plane selection and concrete scope set. The LLM and MCP pack manifests
+are allowed to differ because the policy clusters are expected to rebuild
+independently.
 
 For stricter rollout checks, set `Bundle.Metadata.GenerationID` on each bundle
 and use `OpenSplitBundleZstdWithOptions` with expected generation, component

@@ -88,6 +88,61 @@ if err != nil {
 }
 ```
 
+## Producer: Split LLM/MCP Bundle Delivery
+
+Use split delivery when LLM policy/catalog records and MCP profile/catalog
+records rebuild independently. The control plane still starts from one normalized
+source selection, then filters it into two `cherry.Input` values.
+
+```go
+llmInput := cherry.Input{
+    Providers: input.Providers,
+    Models:    input.Models,
+    Scopes:    make([]cherry.Scope, 0, len(input.Scopes)),
+}
+mcpInput := cherry.Input{
+    MCPServers: input.MCPServers,
+    Scopes:     make([]cherry.Scope, 0, len(input.Scopes)),
+}
+
+for _, scope := range input.Scopes {
+    llmInput.Scopes = append(llmInput.Scopes, cherry.Scope{
+        ID:         scope.ID,
+        Principals: scope.Principals,
+    })
+    mcpInput.Scopes = append(mcpInput.Scopes, cherry.Scope{
+        ID:          scope.ID,
+        MCPProfiles: scope.MCPProfiles,
+    })
+}
+
+llmBlob, llmManifest, err := cherry.BuildWithManifest(llmInput)
+if err != nil {
+    return err
+}
+mcpBlob, mcpManifest, err := cherry.BuildWithManifest(mcpInput)
+if err != nil {
+    return err
+}
+
+llmBundle := cherry.NewBundle("workspace", "workspace1", []string{"workspace1"}, llmBlob, llmManifest)
+mcpBundle := cherry.NewBundle("workspace", "workspace1", []string{"workspace1"}, mcpBlob, mcpManifest)
+llmBundle.Metadata.GenerationID = generationID
+mcpBundle.Metadata.GenerationID = generationID
+
+llmPayload, err := cherry.EncodeBundleZstd(llmBundle)
+if err != nil {
+    return err
+}
+mcpPayload, err := cherry.EncodeBundleZstd(mcpBundle)
+if err != nil {
+    return err
+}
+```
+
+The two pack manifests should normally differ. Do not force equal checksums or
+blob sizes across LLM and MCP artifacts.
+
 ## Consumer: Loading
 
 ```go
@@ -101,6 +156,27 @@ reader := opened.Reader
 
 For project bundles, choose a concrete enforcement scope from
 `opened.Metadata.Scopes` before querying.
+
+## Consumer: Split Loading
+
+```go
+opened, err := cherry.OpenSplitBundleZstdWithOptions(llmPayload, mcpPayload, cherry.SplitBundleOptions{
+    GenerationID:         generationID,
+    RequiredLLMProviders: []string{"openai"},
+    RequiredLLMModels:    []string{"gpt-4o-mini"},
+    RequiredMCPServers:   []string{"github"},
+})
+if err != nil {
+    return err
+}
+
+view := opened.View
+```
+
+`OpenSplitBundleZstdWithOptions` validates each bundle manifest, then validates
+that both artifacts describe the same scope selection. Keep the resulting
+`SplitView` behind the same kind of active generation pointer used for a
+combined `Reader`.
 
 ## Consumer: MCP Initialize
 
@@ -133,6 +209,9 @@ if !ok {
 
 The principal slug should come from a verifier outside Cherry.
 
+With a split view, call the same LLM method on `view` and materialize returned
+string IDs with `view.LLMString`.
+
 ## Consumer: Model Catalog Query
 
 ```go
@@ -148,6 +227,8 @@ Keep catalog details needed by the EP, such as pricing and limits, in
 `MetadataJSON`; Cherry packs that metadata and derives `/v1/models` projection
 fields from it.
 
+With a split view, provider/model catalog methods read from the LLM bundle.
+
 ## Consumer: MCP Query
 
 ```go
@@ -161,6 +242,9 @@ upstreamTool := reader.String(tool.ToolSID)
 authType := reader.String(tool.AuthTypeSID)
 secretRef := reader.String(tool.SecretSID)
 ```
+
+With a split view, call `view.ResolveMCPToolIDs` and materialize returned string
+IDs with `view.MCPString`.
 
 ## Consumer: Inspection
 
@@ -181,3 +265,6 @@ Use inspector APIs for diagnostics and admin views, not the hot path.
 - Adding mutable rate-limit counters to `Reader`.
 - Reusing hot-cache entries after swapping to a new bundle generation.
 - Relying on Go map iteration order when preparing inputs.
+- Materializing split-view LLM string IDs with the MCP reader, or MCP string IDs
+  with the LLM reader.
+- Treating split LLM and MCP pack manifests as if they should match.
