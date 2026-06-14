@@ -72,6 +72,8 @@ const (
 	mcpToolBindingLen = 20 // exposedSID, serverID, toolSID, secretSID, authTypeSID
 	scopeLen          = 20 // sid, principalCount, principalOffset, mcpPathCount, mcpPathOffset
 	mcpPathLen        = 16 // hash64, pathSID, toolsetID
+
+	smallMCPToolsetAuthLinearLimit = 16
 )
 
 const (
@@ -590,19 +592,28 @@ func Build(input Input) ([]byte, error) {
 		for _, profile := range scope.MCPProfiles {
 			builder.stringID(profile.Path)
 			canonicalTools := canonicalToolset(profile.Tools)
-			serverAuth := make(map[string]MCPToolBinding, len(canonicalTools))
+			var serverAuth map[string]MCPToolBinding
+			if len(canonicalTools) > smallMCPToolsetAuthLinearLimit {
+				serverAuth = make(map[string]MCPToolBinding, len(canonicalTools))
+			}
 			toolsetHash := newToolsetHash()
-			for _, tool := range canonicalTools {
+			for toolIndex, tool := range canonicalTools {
 				serverID, ok := mcpServerIDs[tool.Server]
 				if !ok {
 					return nil, fmt.Errorf("mcp profile %q references unknown server %q", profile.Path, tool.Server)
 				}
-				if existing, ok := serverAuth[tool.Server]; ok &&
-					(existing.SecretRef != tool.SecretRef ||
-						existing.AuthType != tool.AuthType) {
-					return nil, fmt.Errorf("mcp profile %q has conflicting auth for server %q", profile.Path, tool.Server)
+				if serverAuth == nil {
+					if err := validateMCPToolAuthLinear(profile.Path, canonicalTools[:toolIndex], tool); err != nil {
+						return nil, err
+					}
+				} else {
+					if existing, ok := serverAuth[tool.Server]; ok &&
+						(existing.SecretRef != tool.SecretRef ||
+							existing.AuthType != tool.AuthType) {
+						return nil, fmt.Errorf("mcp profile %q has conflicting auth for server %q", profile.Path, tool.Server)
+					}
+					serverAuth[tool.Server] = tool
 				}
-				serverAuth[tool.Server] = tool
 				toolsetHash = hashToolsetID(toolsetHash, builder.stringID(tool.ExposedName))
 				toolsetHash = hashToolsetID(toolsetHash, serverID)
 				toolsetHash = hashToolsetID(toolsetHash, builder.stringID(tool.Tool))
@@ -1450,6 +1461,17 @@ func mcpToolBindingLess(left MCPToolBinding, right MCPToolBinding) bool {
 		return left.SecretRef < right.SecretRef
 	}
 	return left.AuthType < right.AuthType
+}
+
+func validateMCPToolAuthLinear(profilePath string, previous []MCPToolBinding, tool MCPToolBinding) error {
+	for _, existing := range previous {
+		if existing.Server == tool.Server &&
+			(existing.SecretRef != tool.SecretRef ||
+				existing.AuthType != tool.AuthType) {
+			return fmt.Errorf("mcp profile %q has conflicting auth for server %q", profilePath, tool.Server)
+		}
+	}
+	return nil
 }
 
 // principalRoutes expands the compatibility Route field into the same shape as

@@ -629,6 +629,48 @@ func TestBuildRejectsConflictingMCPInitializeAuth(t *testing.T) {
 	}
 }
 
+func TestBuildRejectsConflictingMCPInitializeAuthSmallAndLargeToolsets(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		toolCount int
+	}{
+		{name: "small", toolCount: 3},
+		{name: "large", toolCount: smallMCPToolsetAuthLinearLimit + 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			input := testPackInput(1, 1)
+			tools := []MCPToolBinding{{
+				ExposedName: "github__first",
+				Server:      "github",
+				Tool:        "first",
+				SecretRef:   "env://GITHUB_PROFILE_TOKEN",
+				AuthType:    "bearer",
+			}}
+			for i := 0; i < tc.toolCount-2; i++ {
+				tools = append(tools, MCPToolBinding{
+					ExposedName: "kiwi__tool_" + itoa(i),
+					Server:      "kiwi",
+					Tool:        "tool_" + itoa(i),
+					SecretRef:   "env://KIWI_MCP_TOKEN",
+					AuthType:    "bearer",
+				})
+			}
+			tools = append(tools, MCPToolBinding{
+				ExposedName: "github__second",
+				Server:      "github",
+				Tool:        "second",
+				SecretRef:   "env://OTHER_GITHUB_TOKEN",
+				AuthType:    "bearer",
+			})
+			input.Scopes[0].MCPProfiles[0].Tools = tools
+
+			_, err := Build(input)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), `mcp profile "profile-dev-tools" has conflicting auth for server "github"`)
+		})
+	}
+}
+
 func TestManifestValidation(t *testing.T) {
 	blob, manifest, err := BuildWithManifest(testPackInput(1, 1))
 	if err != nil {

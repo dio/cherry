@@ -1930,6 +1930,83 @@ make format
 make lint
 ```
 
+### Chunk 14: Small MCP Toolset Auth Validation Without Map Allocation
+
+Hypothesis:
+
+- MCP profiles usually expose a small number of tools.
+- Build allocated one `map[string]MCPToolBinding` per profile to validate that
+  all tools for the same upstream MCP server use consistent auth.
+- For small toolsets, a bounded linear scan over prior bindings should preserve
+  validation semantics while removing one map allocation per profile.
+
+Implementation:
+
+- added `smallMCPToolsetAuthLinearLimit = 16`
+- for toolsets with `len(tools) <= 16`, validate server auth conflicts with a
+  linear scan over previous bindings
+- keep the existing map-based path for larger toolsets to avoid quadratic
+  behavior on unusually large profiles
+- added tests covering both the small linear path and the large map fallback
+
+Benchmark command:
+
+```sh
+go test -run '^$' \
+  -bench '^BenchmarkCherryPackMCPProfileScale/(unique-toolsets|unique-secret-refs)/profiles=10000/tools_per_profile=10$|^BenchmarkCherryPack(MCPChurnOnly|RealMixed)$' \
+  -benchmem \
+  -benchtime=2s \
+  -count=6 \
+  . | tee /tmp/cherry-mcp-auth-linear.txt
+```
+
+Compared against `/tmp/cherry-front-after-weighted-split.txt`:
+
+```sh
+benchstat /tmp/cherry-front-after-weighted-split.txt /tmp/cherry-mcp-auth-linear.txt
+```
+
+Key results:
+
+```text
+unique-toolsets, 10k profiles x 10 tools:
+  alloc:  46.94 MiB/op -> 29.46 MiB/op, -37.24%
+  allocs: 40.74k/op -> 10.73k/op, -73.65%
+  blob:   unchanged
+
+unique-secret-refs, 10k profiles x 10 tools:
+  alloc:  30.78 MiB/op -> 13.31 MiB/op, -56.76%
+  allocs: 40.29k/op -> 10.29k/op, -74.46%
+  blob:   unchanged
+
+real-mixed, 100 workspaces, 100k LLM route entries, 10k MCP profiles:
+  alloc:  95.04 MiB/op -> 77.57 MiB/op, -18.38%
+  allocs: 42.04k/op -> 12.04k/op, -71.36%
+  blob:   unchanged
+
+mcp-churn-only, 10k profiles x 10 unique tools:
+  alloc:  46.91 MiB/op -> 29.47 MiB/op, -37.17%
+  allocs: 40.73k/op -> 10.74k/op, -73.64%
+  blob:   unchanged
+```
+
+Interpretation:
+
+- this is a production-relevant allocation-count win because it removes a small
+  heap object per small MCP profile
+- elapsed time is noisy on these samples; treat allocation reduction as the
+  proven result
+- remaining MCP profile allocation count is mostly unique string interning,
+  `internMCPToolset` collision-slice values, and output buffer growth
+
+Validation:
+
+```sh
+make format
+go test ./...
+make lint
+```
+
 ### Chunk 13: Short Weighted Split Route Interning
 
 Status: implemented.
