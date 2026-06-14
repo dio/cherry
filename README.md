@@ -32,6 +32,9 @@ example/
 adds the zstd bundle envelope used for control-plane to enforcement-point
 delivery.
 
+`DESIGN.md` summarizes the stable mapped-split delivery design for high-churn
+user-key and MCP profile policy.
+
 ## Producing A Bundle
 
 The producer is the control-plane-side code that owns source selection and turns
@@ -141,60 +144,44 @@ if err != nil {
 The resulting `bundleBytes` are what the control plane stores or serves to an
 enforcement point.
 
-For production rebuild isolation, a producer can also publish separate LLM and
-MCP artifacts from the same source selection. Each artifact still uses the same
-bundle envelope; the producer only filters `cherry.Input` before building:
+For production delivery, Cherry recommends mapped split when route/profile churn
+or bundle size makes full-generation rebuilds too expensive. A mapped split
+generation publishes a small control map plus normal zstd Cherry bundles:
 
-```go
-llmInput := cherry.Input{
-    Providers: input.Providers,
-    Models:    input.Models,
-    Scopes:    make([]cherry.Scope, 0, len(input.Scopes)),
-}
-mcpInput := cherry.Input{
-    MCPServers: input.MCPServers,
-    Scopes:     make([]cherry.Scope, 0, len(input.Scopes)),
-}
-
-for _, scope := range input.Scopes {
-    llmInput.Scopes = append(llmInput.Scopes, cherry.Scope{
-        ID:         scope.ID,
-        Principals: scope.Principals,
-    })
-    mcpInput.Scopes = append(mcpInput.Scopes, cherry.Scope{
-        ID:          scope.ID,
-        MCPProfiles: scope.MCPProfiles,
-    })
-}
-
-llmBlob, llmManifest, err := cherry.BuildWithManifest(llmInput)
-if err != nil {
-    return err
-}
-mcpBlob, mcpManifest, err := cherry.BuildWithManifest(mcpInput)
-if err != nil {
-    return err
-}
-
-llmBundle := cherry.NewBundle("workspace", "workspace1", []string{"workspace1"}, llmBlob, llmManifest)
-mcpBundle := cherry.NewBundle("workspace", "workspace1", []string{"workspace1"}, mcpBlob, mcpManifest)
-llmBundle.Metadata.GenerationID = "generation-2026-06-14T12:00:00Z"
-mcpBundle.Metadata.GenerationID = "generation-2026-06-14T12:00:00Z"
-
-llmBundleBytes, err := cherry.EncodeBundleZstd(llmBundle)
-if err != nil {
-    return err
-}
-mcpBundleBytes, err := cherry.EncodeBundleZstd(mcpBundle)
-if err != nil {
-    return err
-}
+```text
+llm-generic                  low-churn providers, models, default routes
+mcp-servers                  low-churn MCP server catalog and s/<server> paths
+llm-user-key-{000..N}        partitioned principal routes, BYOK, rate policy
+mcp-user-profile-{000..N}    partitioned MCP profile paths and tool bindings
 ```
 
-This keeps MCP-only changes from rebuilding LLM policy/catalog sections, and
-LLM-only changes from rebuilding MCP sections. The external producer still owns
-which source records belong to each cluster; Cherry only packs the normalized
-rows it receives.
+Use `MappedSplitSpec` to keep producer and enforcement-point code on the same
+stable lane names and partition math:
+
+```go
+spec := cherry.MappedSplitSpec{
+    LLMUserKeyPartitions:     64,
+    MCPUserProfilePartitions: 64,
+}
+
+affected, err := spec.AffectedBundle(cherry.MappedSplitChange{
+    Kind:          cherry.MappedSplitChangeLLMUserKey,
+    PrincipalSlug: "slug:project1",
+})
+if err != nil {
+    return err
+}
+
+// Rebuild affected.Component(), for example llm-user-key-003.
+```
+
+Cherry does not infer source-record diffs. The control plane classifies whether
+a change belongs to generic LLM policy, MCP servers, a key-specific LLM route,
+or an MCP profile, then `MappedSplitSpec` computes the exact component. See
+`DESIGN.md` and `go run ./example mapped-split-demo ...` for the producer and EP
+shape. On the EP side, compare each new map ref with the active view by
+generation, URL, checksum, and size; fetch only missing or stale refs and reuse
+unchanged opened readers.
 
 If the control plane normally publishes bundles on a periodic cadence, use
 `SnapshotPolicy` to decide which normalized mutable changes should interrupt
@@ -314,72 +301,6 @@ preserving pricing and capability-derived fields from the normalized metadata.
 The example directory includes fixture loaders for seed-style model/provider
 catalogs and MCP catalogs. Those loaders are example producer code, not root
 package schema contracts.
-
-## Split LLM/MCP View
-
-An enforcement point can also consume independently delivered LLM and MCP
-bundles without changing the single-bundle envelope:
-
-```go
-opened, err := cherry.OpenSplitBundleZstdWithOptions(llmBundleBytes, mcpBundleBytes, cherry.SplitBundleOptions{
-    GenerationID: "generation-2026-06-14T12:00:00Z",
-})
-if err != nil {
-    return err
-}
-
-view := opened.View
-```
-
-`OpenSplitBundleZstd` and `OpenSplitBundleZstdWithOptions` open each artifact
-with `OpenBundleZstd`, then validate that both bundles describe the same
-control-plane selection and concrete scope set. The LLM and MCP pack manifests
-are allowed to differ because the policy clusters are expected to rebuild
-independently.
-
-For stricter rollout checks, set `Bundle.Metadata.GenerationID` on each bundle
-and use `OpenSplitBundleZstdWithOptions` with expected generation, component
-checksums, or required catalog entries:
-
-```go
-opened, err := cherry.OpenSplitBundleZstdWithOptions(llmBundleBytes, mcpBundleBytes, cherry.SplitBundleOptions{
-    GenerationID:         "generation-2026-06-14T12:00:00Z",
-    LLMPackChecksum:      expectedLLMChecksum,
-    MCPPackChecksum:      expectedMCPChecksum,
-    RequiredLLMProviders: []string{"openai"},
-    RequiredLLMModels:    []string{"gpt-4o-mini"},
-    RequiredMCPServers:   []string{"github"},
-})
-if err != nil {
-    return err
-}
-```
-
-LLM calls use the LLM reader:
-
-```go
-llm, ok := view.ResolveLLMIDs("workspace1", "slug:project1", "claude-haiku-4-5")
-if !ok {
-    // reject
-}
-
-provider := view.LLMString(llm.ProviderSID)
-```
-
-MCP calls use the MCP reader:
-
-```go
-tool, ok := view.ResolveMCPToolIDs("workspace1", "profile-dev-tools", "github__list-repos")
-if !ok {
-    // reject
-}
-
-server := view.MCPString(tool.ServerSID)
-```
-
-String IDs are reader-local. Use `LLMString` for IDs returned by LLM methods and
-`MCPString` for IDs returned by MCP methods. Materialized helpers such as
-`ResolveLLM` and `ResolveMCP` handle this internally.
 
 ## Boundary
 

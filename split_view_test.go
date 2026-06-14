@@ -138,6 +138,223 @@ func TestOpenSplitBundleZstdRejectsIncompatibleBundles(t *testing.T) {
 	})
 }
 
+func TestLayeredSplitViewRoutesOverridesFallbacksAndMCPPaths(t *testing.T) {
+	input := testPackInput(1, 1)
+	view := testLayeredSplitView(
+		t,
+		layeredLLMGenericInput(input, "slug:default"),
+		layeredLLMKeysInput(input),
+		layeredMCPServersInput(input),
+		layeredMCPProfilesInput(input),
+		LayeredSplitViewOptions{LLMDefaultPrincipalSlug: "slug:default"},
+	)
+
+	override, ok := view.ResolveLLM("workspace1", "slug:key-override", "gpt-4o-mini")
+	require.True(t, ok)
+	assert.Equal(t, "slug:key-override", override.PrincipalSlug)
+	assert.Equal(t, "env://OPENAI_KEY_OVERRIDE", override.SecretRef)
+	assert.Equal(t, uint32(30), override.Rate.RPM)
+
+	fallback, ok := view.ResolveLLM("workspace1", "slug:key-default", "gpt-4o-mini")
+	require.True(t, ok)
+	assert.Equal(t, "slug:key-default", fallback.PrincipalSlug)
+	assert.Equal(t, "env://OPENAI_DEFAULT_ROUTE", fallback.SecretRef)
+	assert.Equal(t, uint32(300), fallback.Rate.RPM)
+
+	fallbackIDs, ok := view.ResolveLLMIDs("workspace1", "slug:key-default", "gpt-4o-mini")
+	require.True(t, ok)
+	assert.Equal(t, LayeredLLMSourceGeneric, fallbackIDs.Source)
+	assert.Equal(t, "slug:default", fallbackIDs.ResolvedPrincipalSlug)
+	assert.Equal(t, "openai", view.LLMString(fallbackIDs.Source, fallbackIDs.ProviderSID))
+
+	serverTool, ok := view.ResolveMCPToolIDs("workspace1", "s/github", "github__list-repos")
+	require.True(t, ok)
+	assert.Equal(t, LayeredMCPSourceServers, serverTool.Source)
+	assert.Equal(t, "https://api.github.com", view.MCPString(serverTool.Source, serverTool.ServerEndpointSID))
+	assert.Equal(t, "env://GITHUB_MCP_TOKEN", view.MCPString(serverTool.Source, serverTool.SecretSID))
+
+	profileTool, ok := view.ResolveMCPToolIDs("workspace1", "profile-dev-tools", "github__list-repos")
+	require.True(t, ok)
+	assert.Equal(t, LayeredMCPSourceProfiles, profileTool.Source)
+	assert.Equal(t, "env://GITHUB_PROFILE_TOKEN", view.MCPString(profileTool.Source, profileTool.SecretSID))
+}
+
+func TestOpenLayeredSplitBundleZstdOpensCompatibleBundles(t *testing.T) {
+	input := testPackInput(1, 1)
+	llmGenericCompressed, llmGenericManifest := testEncodedBundle(
+		t,
+		"workspace",
+		"workspace1",
+		[]string{"workspace1"},
+		"gen-1",
+		layeredLLMGenericInput(input, "slug:default"),
+	)
+	llmKeysCompressed, llmKeysManifest := testEncodedBundle(
+		t,
+		"workspace",
+		"workspace1",
+		[]string{"workspace1"},
+		"gen-1",
+		layeredLLMKeysInput(input),
+	)
+	mcpServersCompressed, mcpServersManifest := testEncodedBundle(
+		t,
+		"workspace",
+		"workspace1",
+		[]string{"workspace1"},
+		"gen-1",
+		layeredMCPServersInput(input),
+	)
+	mcpProfilesCompressed, mcpProfilesManifest := testEncodedBundle(
+		t,
+		"workspace",
+		"workspace1",
+		[]string{"workspace1"},
+		"gen-1",
+		layeredMCPProfilesInput(input),
+	)
+
+	opened, err := OpenLayeredSplitBundleZstdWithOptions(
+		llmGenericCompressed,
+		llmKeysCompressed,
+		mcpServersCompressed,
+		mcpProfilesCompressed,
+		LayeredSplitBundleOptions{
+			GenerationID:            "gen-1",
+			LLMGenericPackChecksum:  llmGenericManifest.Checksum,
+			LLMKeysPackChecksum:     llmKeysManifest.Checksum,
+			MCPServersPackChecksum:  mcpServersManifest.Checksum,
+			MCPProfilesPackChecksum: mcpProfilesManifest.Checksum,
+			LLMDefaultPrincipalSlug: "slug:default",
+			RequiredLLMProviders:    []string{"openai"},
+			RequiredLLMModels:       []string{"gpt-4o-mini"},
+			RequiredMCPServers:      []string{"github"},
+		},
+	)
+	require.NoError(t, err)
+	assert.Equal(t, llmGenericManifest, opened.LLMGeneric.Metadata.PackManifest)
+	assert.Equal(t, llmKeysManifest, opened.LLMKeys.Metadata.PackManifest)
+	assert.Equal(t, mcpServersManifest, opened.MCPServers.Metadata.PackManifest)
+	assert.Equal(t, mcpProfilesManifest, opened.MCPProfiles.Metadata.PackManifest)
+
+	_, ok := opened.View.ResolveLLMIDs("workspace1", "slug:key-default", "gpt-4o-mini")
+	assert.True(t, ok)
+	_, ok = opened.View.ResolveMCPToolIDs("workspace1", "s/github", "github__list-repos")
+	assert.True(t, ok)
+}
+
+func TestOpenLayeredSplitBundleZstdRejectsIncompatibleBundles(t *testing.T) {
+	input := testPackInput(1, 1)
+	llmGenericCompressed, _ := testEncodedBundle(
+		t,
+		"workspace",
+		"workspace1",
+		[]string{"workspace1"},
+		"gen-1",
+		layeredLLMGenericInput(input, "slug:default"),
+	)
+	llmKeysCompressed, llmKeysManifest := testEncodedBundle(
+		t,
+		"workspace",
+		"workspace1",
+		[]string{"workspace1"},
+		"gen-1",
+		layeredLLMKeysInput(input),
+	)
+	mcpServersCompressed, _ := testEncodedBundle(
+		t,
+		"workspace",
+		"workspace1",
+		[]string{"workspace1"},
+		"gen-1",
+		layeredMCPServersInput(input),
+	)
+
+	t.Run("scope mismatch", func(t *testing.T) {
+		mcpProfilesCompressed, _ := testEncodedBundle(
+			t,
+			"workspace",
+			"workspace2",
+			[]string{"workspace1"},
+			"gen-1",
+			layeredMCPProfilesInput(input),
+		)
+		_, err := OpenLayeredSplitBundleZstd(
+			llmGenericCompressed,
+			llmKeysCompressed,
+			mcpServersCompressed,
+			mcpProfilesCompressed,
+		)
+		require.ErrorContains(t, err, "scope id mismatch")
+	})
+
+	t.Run("generation mismatch", func(t *testing.T) {
+		mcpProfilesCompressed, _ := testEncodedBundle(
+			t,
+			"workspace",
+			"workspace1",
+			[]string{"workspace1"},
+			"gen-2",
+			layeredMCPProfilesInput(input),
+		)
+		_, err := OpenLayeredSplitBundleZstd(
+			llmGenericCompressed,
+			llmKeysCompressed,
+			mcpServersCompressed,
+			mcpProfilesCompressed,
+		)
+		require.ErrorContains(t, err, "generation mismatch")
+	})
+
+	t.Run("generation mismatch with empty first generation", func(t *testing.T) {
+		llmGenericWithoutGeneration, _ := testEncodedBundle(
+			t,
+			"workspace",
+			"workspace1",
+			[]string{"workspace1"},
+			"",
+			layeredLLMGenericInput(input, "slug:default"),
+		)
+		mcpProfilesCompressed, _ := testEncodedBundle(
+			t,
+			"workspace",
+			"workspace1",
+			[]string{"workspace1"},
+			"gen-2",
+			layeredMCPProfilesInput(input),
+		)
+		_, err := OpenLayeredSplitBundleZstd(
+			llmGenericWithoutGeneration,
+			llmKeysCompressed,
+			mcpServersCompressed,
+			mcpProfilesCompressed,
+		)
+		require.ErrorContains(t, err, "generation mismatch")
+	})
+
+	t.Run("expected checksum mismatch", func(t *testing.T) {
+		mcpProfilesCompressed, _ := testEncodedBundle(
+			t,
+			"workspace",
+			"workspace1",
+			[]string{"workspace1"},
+			"gen-1",
+			layeredMCPProfilesInput(input),
+		)
+		_, err := OpenLayeredSplitBundleZstdWithOptions(
+			llmGenericCompressed,
+			llmKeysCompressed,
+			mcpServersCompressed,
+			mcpProfilesCompressed,
+			LayeredSplitBundleOptions{
+				GenerationID:        "gen-1",
+				LLMKeysPackChecksum: llmKeysManifest.Checksum + 1,
+			},
+		)
+		require.ErrorContains(t, err, "llm_keys checksum mismatch")
+	})
+}
+
 func testSplitView(t *testing.T, llmInput Input, mcpInput Input) SplitView {
 	t.Helper()
 	llmBlob, err := Build(llmInput)
@@ -149,6 +366,40 @@ func testSplitView(t *testing.T, llmInput Input, mcpInput Input) SplitView {
 	mcpReader, err := Open(mcpBlob)
 	require.NoError(t, err)
 	return NewSplitView(llmReader, mcpReader)
+}
+
+func testLayeredSplitView(
+	t *testing.T,
+	llmGenericInput Input,
+	llmKeysInput Input,
+	mcpServersInput Input,
+	mcpProfilesInput Input,
+	options LayeredSplitViewOptions,
+) LayeredSplitView {
+	t.Helper()
+	llmGenericBlob, err := Build(llmGenericInput)
+	require.NoError(t, err)
+	llmGenericReader, err := Open(llmGenericBlob)
+	require.NoError(t, err)
+	llmKeysBlob, err := Build(llmKeysInput)
+	require.NoError(t, err)
+	llmKeysReader, err := Open(llmKeysBlob)
+	require.NoError(t, err)
+	mcpServersBlob, err := Build(mcpServersInput)
+	require.NoError(t, err)
+	mcpServersReader, err := Open(mcpServersBlob)
+	require.NoError(t, err)
+	mcpProfilesBlob, err := Build(mcpProfilesInput)
+	require.NoError(t, err)
+	mcpProfilesReader, err := Open(mcpProfilesBlob)
+	require.NoError(t, err)
+	return NewLayeredSplitView(
+		llmGenericReader,
+		llmKeysReader,
+		mcpServersReader,
+		mcpProfilesReader,
+		options,
+	)
 }
 
 func testEncodedBundle(
@@ -193,6 +444,87 @@ func llmOnlyInput(input Input) Input {
 		out.Scopes = append(out.Scopes, outScope)
 	}
 	return out
+}
+
+func layeredLLMGenericInput(input Input, defaultPrincipalSlug string) Input {
+	out := Input{
+		Providers: append([]Provider(nil), input.Providers...),
+		Models:    append([]Model(nil), input.Models...),
+		Scopes:    make([]Scope, 0, len(input.Scopes)),
+	}
+	for _, scope := range input.Scopes {
+		out.Scopes = append(out.Scopes, Scope{
+			ID: scope.ID,
+			Principals: []Principal{{
+				Slug: defaultPrincipalSlug,
+				Route: RoutePlan{
+					Provider:  "openai",
+					Model:     "gpt-4o-mini",
+					SecretRef: "env://OPENAI_DEFAULT_ROUTE",
+				},
+				Rate: RatePolicy{
+					USDPerDayCents: 50000,
+					RPM:            300,
+					OnExceed:       "reject",
+				},
+			}},
+		})
+	}
+	return out
+}
+
+func layeredLLMKeysInput(input Input) Input {
+	out := Input{
+		Providers: append([]Provider(nil), input.Providers...),
+		Models:    append([]Model(nil), input.Models...),
+		Scopes:    make([]Scope, 0, len(input.Scopes)),
+	}
+	for _, scope := range input.Scopes {
+		out.Scopes = append(out.Scopes, Scope{
+			ID: scope.ID,
+			Principals: []Principal{{
+				Slug: "slug:key-override",
+				Route: RoutePlan{
+					Provider:  "openai",
+					Model:     "gpt-4o-mini",
+					SecretRef: "env://OPENAI_KEY_OVERRIDE",
+				},
+				Rate: RatePolicy{
+					USDPerDayCents: 1000,
+					RPM:            30,
+					OnExceed:       "reject",
+				},
+			}},
+		})
+	}
+	return out
+}
+
+func layeredMCPServersInput(input Input) Input {
+	out := Input{
+		MCPServers: append([]MCPServer(nil), input.MCPServers...),
+		Scopes:     make([]Scope, 0, len(input.Scopes)),
+	}
+	for _, scope := range input.Scopes {
+		out.Scopes = append(out.Scopes, Scope{
+			ID: scope.ID,
+			MCPProfiles: []MCPProfile{{
+				Path: "s/github",
+				Tools: []MCPToolBinding{{
+					ExposedName: "github__list-repos",
+					Server:      "github",
+					Tool:        "list-repos",
+					SecretRef:   "env://GITHUB_MCP_TOKEN",
+					AuthType:    "bearer",
+				}},
+			}},
+		})
+	}
+	return out
+}
+
+func layeredMCPProfilesInput(input Input) Input {
+	return mcpOnlyInput(input)
 }
 
 func mcpOnlyInput(input Input) Input {

@@ -40,6 +40,8 @@ func run(args []string) error {
 		return runREPL(args[1:])
 	case "split-check":
 		return runSplitCheck(args[1:])
+	case "mapped-split-demo":
+		return runMappedSplitDemo(args[1:])
 	case "stress-pack":
 		return runStressPack(args[1:])
 	case "help", "-h", "--help":
@@ -59,9 +61,9 @@ func printHelp() {
 	fmt.Println("usage:")
 	fmt.Println("  go run ./example")
 	fmt.Println("  go run ./example [fixture.yaml]")
-	fmt.Println("  go run ./example pack [--cluster combined|llm|mcp] [--generation id] [--models models.json] [--providers providers.json] [--mcp-catalog catalog.json] <workspace|project> <id> <fixture.yaml> [out.zst]")
+	fmt.Println("  go run ./example pack [--generation id] [--models models.json] [--providers providers.json] [--mcp-catalog catalog.json] <workspace|project> <id> <fixture.yaml> [out.zst]")
 	fmt.Println("  go run ./example repl <cherry.zst>")
-	fmt.Println("  go run ./example split-check [--generation id] <llm.zst> <mcp.zst>")
+	fmt.Println("  go run ./example mapped-split-demo [--partitions n] [--generation id] [--models models.json] [--providers providers.json] [--mcp-catalog catalog.json] <workspace|project> <id> <fixture.yaml>")
 	fmt.Println("  go run ./example stress-pack <principals-per-scope> <queries> [scopes]")
 }
 
@@ -71,7 +73,7 @@ func runPack(args []string) error {
 		return err
 	}
 	if len(args) != 3 && len(args) != 4 {
-		return fmt.Errorf("usage: pack [--cluster combined|llm|mcp] [--generation id] [--models models.json] [--providers providers.json] [--mcp-catalog catalog.json] <workspace|project> <id> <fixture.yaml> [out.zst]")
+		return fmt.Errorf("usage: pack [--generation id] [--models models.json] [--providers providers.json] [--mcp-catalog catalog.json] <workspace|project> <id> <fixture.yaml> [out.zst]")
 	}
 	scopeKind := transform.ScopeKind(args[0])
 	if scopeKind != transform.ScopeKindWorkspace && scopeKind != transform.ScopeKindProject {
@@ -240,6 +242,76 @@ func inputForCluster(input cherry.Input, cluster packCluster) cherry.Input {
 	}
 }
 
+func exampleLLMGenericInput(input cherry.Input) cherry.Input {
+	out := cherry.Input{
+		Providers: append([]cherry.Provider(nil), input.Providers...),
+		Models:    append([]cherry.Model(nil), input.Models...),
+		Scopes:    make([]cherry.Scope, 0, len(input.Scopes)),
+	}
+	defaultRoutes := make(map[string]cherry.RoutePlan, len(input.Models))
+	for _, model := range input.Models {
+		defaultRoutes[model.ID] = cherry.RoutePlan{
+			Provider: model.Provider,
+			Model:    model.ID,
+		}
+	}
+	for _, scope := range input.Scopes {
+		outScope := cherry.Scope{ID: scope.ID}
+		if len(defaultRoutes) > 0 {
+			outScope.Principals = []cherry.Principal{{
+				Slug:        "slug:default",
+				ModelRoutes: cloneRouteMap(defaultRoutes),
+				Rate: cherry.RatePolicy{
+					USDPerDayCents: 50000,
+					RPM:            300,
+					OnExceed:       "reject",
+				},
+			}}
+		}
+		out.Scopes = append(out.Scopes, outScope)
+	}
+	return out
+}
+
+func exampleMCPServersInput(input cherry.Input) cherry.Input {
+	out := cherry.Input{
+		MCPServers: append([]cherry.MCPServer(nil), input.MCPServers...),
+		Scopes:     make([]cherry.Scope, 0, len(input.Scopes)),
+	}
+	for _, scope := range input.Scopes {
+		outScope := cherry.Scope{
+			ID:          scope.ID,
+			MCPProfiles: make([]cherry.MCPProfile, 0, len(scope.MCPProfiles)),
+		}
+		for _, profile := range scope.MCPProfiles {
+			if !strings.HasPrefix(profile.Path, "s/") {
+				continue
+			}
+			outScope.MCPProfiles = append(outScope.MCPProfiles, cloneMCPProfile(profile))
+		}
+		out.Scopes = append(out.Scopes, outScope)
+	}
+	return out
+}
+
+func cloneRouteMap(routes map[string]cherry.RoutePlan) map[string]cherry.RoutePlan {
+	if routes == nil {
+		return nil
+	}
+	out := make(map[string]cherry.RoutePlan, len(routes))
+	for modelID, route := range routes {
+		out[modelID] = route
+	}
+	return out
+}
+
+func cloneMCPProfile(profile cherry.MCPProfile) cherry.MCPProfile {
+	return cherry.MCPProfile{
+		Path:  profile.Path,
+		Tools: append([]cherry.MCPToolBinding(nil), profile.Tools...),
+	}
+}
+
 func runREPL(args []string) error {
 	if len(args) != 1 {
 		return fmt.Errorf("usage: repl <cherry.zst>")
@@ -320,6 +392,1007 @@ func runSplitCheck(args []string) error {
 	fmt.Printf("  mcp_manifest_checksum: %d\n", opened.MCP.Metadata.PackManifest.Checksum)
 	fmt.Printf("  mcp_servers: %d\n", len(opened.View.MCPServers()))
 	return nil
+}
+
+func loadFixtureWithCatalogFlags(path string, flags packFlags) (source.Fixture, error) {
+	fixture, err := source.LoadFixtureYAML(path)
+	if err != nil {
+		return source.Fixture{}, err
+	}
+	if flags.modelsPath != "" {
+		models, err := source.LoadModelCatalogJSON(flags.modelsPath)
+		if err != nil {
+			return source.Fixture{}, err
+		}
+		fixture.Models = source.MergeModels(fixture.Models, models)
+	}
+	if flags.providersPath != "" {
+		providers, err := source.LoadProviderCatalogJSON(flags.providersPath)
+		if err != nil {
+			return source.Fixture{}, err
+		}
+		fixture.Providers = source.MergeProviders(fixture.Providers, providers)
+	}
+	if flags.mcpCatalogPath != "" {
+		servers, err := source.LoadMCPCatalogJSON(flags.mcpCatalogPath)
+		if err != nil {
+			return source.Fixture{}, err
+		}
+		fixture.MCPServers = source.MergeMCPServers(fixture.MCPServers, servers)
+	}
+	return fixture, nil
+}
+
+func encodeServedBundle(
+	scopeKind string,
+	scopeID string,
+	scopes []string,
+	generationID string,
+	input cherry.Input,
+) ([]byte, cherry.Manifest, int, error) {
+	blob, manifest, err := cherry.BuildWithManifest(input)
+	if err != nil {
+		return nil, cherry.Manifest{}, 0, err
+	}
+	bundle := cherry.NewBundle(scopeKind, scopeID, scopes, blob, manifest)
+	bundle.Metadata.GenerationID = generationID
+	payload, err := cherry.EncodeBundleZstd(bundle)
+	if err != nil {
+		return nil, cherry.Manifest{}, 0, err
+	}
+	return payload, manifest, len(blob), nil
+}
+
+type mappedSplitDemoFlags struct {
+	packFlags
+	partitions int
+}
+
+type exampleMappedSplitMap struct {
+	FormatVersion           string                                         `json:"format_version"`
+	ScopeKind               string                                         `json:"scope_kind"`
+	ScopeID                 string                                         `json:"scope_id"`
+	Scopes                  []string                                       `json:"scopes"`
+	GenerationID            string                                         `json:"generation_id"`
+	MapRevision             int                                            `json:"map_revision"`
+	LLMDefaultPrincipalSlug string                                         `json:"llm_default_principal_slug"`
+	Partitioning            map[string]exampleMappedSplitPartitionSpec     `json:"partitioning"`
+	Bundles                 map[string]exampleMappedSplitBundleRef         `json:"bundles"`
+	PartitionBundles        map[string][]exampleMappedSplitPartitionBundle `json:"partition_bundles"`
+}
+
+type exampleMappedSplitPartitionSpec struct {
+	Algorithm  string `json:"algorithm"`
+	Key        string `json:"key"`
+	Partitions int    `json:"partitions"`
+}
+
+type exampleMappedSplitBundleRef struct {
+	URL      string `json:"url"`
+	Checksum uint64 `json:"checksum"`
+	Size     uint64 `json:"size"`
+}
+
+type exampleMappedSplitPartitionBundle struct {
+	Partition int    `json:"partition"`
+	URL       string `json:"url"`
+	Checksum  uint64 `json:"checksum"`
+	Size      uint64 `json:"size"`
+}
+
+type exampleMappedSplitStore map[string][]byte
+
+type exampleMappedSplitView struct {
+	defaultPrincipalSlug string
+	spec                 cherry.MappedSplitSpec
+	generationID         string
+	llmGenericRef        exampleMappedSplitBundleRef
+	mcpServersRef        exampleMappedSplitBundleRef
+	llmUserKeyRefs       []exampleMappedSplitBundleRef
+	mcpUserProfileRefs   []exampleMappedSplitBundleRef
+	llmGeneric           cherry.Reader
+	mcpServers           cherry.Reader
+	llmUserKey           []cherry.Reader
+	mcpUserProfile       []cherry.Reader
+}
+
+type exampleMappedSplitOpenStats struct {
+	Fetched int
+	Reused  int
+	Omitted int
+}
+
+func runMappedSplitDemo(args []string) error {
+	flags, args, err := parseMappedSplitDemoFlags(args)
+	if err != nil {
+		return err
+	}
+	if len(args) != 3 {
+		return fmt.Errorf("usage: mapped-split-demo [--partitions n] [--generation id] [--models models.json] [--providers providers.json] [--mcp-catalog catalog.json] <workspace|project> <id> <fixture.yaml>")
+	}
+	scopeKind := transform.ScopeKind(args[0])
+	if scopeKind != transform.ScopeKindWorkspace && scopeKind != transform.ScopeKindProject {
+		return fmt.Errorf("invalid scope kind %q; want workspace or project", args[0])
+	}
+	scopeID := args[1]
+	fixture, err := loadFixtureWithCatalogFlags(args[2], flags.packFlags)
+	if err != nil {
+		return err
+	}
+	result, err := transform.BuildPackInput(fixture, transform.Selection{Kind: scopeKind, ID: scopeID})
+	if err != nil {
+		return err
+	}
+	generationID := flags.generationID
+	if generationID == "" {
+		generationID = "demo-" + time.Now().UTC().Format("20060102T150405Z")
+	}
+
+	splitMap, store, err := buildExampleMappedSplit(
+		string(scopeKind),
+		scopeID,
+		result.Scopes,
+		generationID,
+		flags.partitions,
+		result.Input,
+	)
+	if err != nil {
+		return err
+	}
+
+	mapJSON, err := json.MarshalIndent(splitMap, "", "  ")
+	if err != nil {
+		return err
+	}
+	fmt.Println("producer:")
+	fmt.Printf("  generation: %s\n", splitMap.GenerationID)
+	fmt.Printf("  scopes: %s\n", strings.Join(splitMap.Scopes, ","))
+	fmt.Printf("  low_churn_bundles: %d\n", len(splitMap.Bundles))
+	fmt.Printf("  llm_user_key_partitions: %d\n", len(splitMap.PartitionBundles[string(cherry.MappedSplitLaneLLMUserKey)]))
+	fmt.Printf("  mcp_user_profile_partitions: %d\n", len(splitMap.PartitionBundles[string(cherry.MappedSplitLaneMCPUserProfile)]))
+	fmt.Println("split_map:")
+	fmt.Println(string(mapJSON))
+
+	view, stats, err := openExampleMappedSplit(splitMap, nil, store.fetch)
+	if err != nil {
+		return err
+	}
+	fmt.Println("consumer:")
+	fmt.Println("  opened split map and all referenced zstd bundles as Readers")
+	fmt.Printf("  fetched_bundles: %d reused_bundles: %d omitted_partitions: %d\n", stats.Fetched, stats.Reused, stats.Omitted)
+	activeScope := firstScope(result.Scopes)
+	printMappedSplitDemoQueries(view, result.Input, activeScope)
+
+	if err := runMappedSplitDemoNPlusOne(splitMap, view, store, result.Input, activeScope); err != nil {
+		return err
+	}
+	return nil
+}
+
+func runMappedSplitDemoNPlusOne(
+	splitMap exampleMappedSplitMap,
+	activeView exampleMappedSplitView,
+	store exampleMappedSplitStore,
+	input cherry.Input,
+	scopeID string,
+) error {
+	principalSlug, modelID, hasLLM := firstExampleLLMQuery(input, scopeID)
+	profilePath, profileTool, hasProfile := firstExampleMCPQuery(input, scopeID, false)
+	if !hasLLM || !hasProfile {
+		return nil
+	}
+
+	nextMap, err := cloneExampleMappedSplitMap(splitMap)
+	if err != nil {
+		return err
+	}
+	nextMap.MapRevision++
+
+	spec := exampleMappedSplitSpec(splitMap)
+	updatedLLMKey, err := spec.LLMUserKeyBundle(principalSlug)
+	if err != nil {
+		return err
+	}
+	llmPartitionCount := splitMap.Partitioning[string(cherry.MappedSplitLaneLLMUserKey)].Partitions
+	updatedLLMPartition := updatedLLMKey.Partition
+	updatedInput := exampleInputWithPrincipalSecret(input, principalSlug, "env://DEMO_UPDATED_KEY")
+	component := updatedLLMKey.Component()
+	updatedURL := "mem://" + splitMap.GenerationID + "/" + component + "-nplus1.zst"
+	payload, manifest, _, err := encodeServedBundle(
+		splitMap.ScopeKind,
+		splitMap.ScopeID,
+		splitMap.Scopes,
+		splitMap.GenerationID,
+		exampleLLMUserKeyPartitionInput(updatedInput, llmPartitionCount, updatedLLMPartition),
+	)
+	if err != nil {
+		return err
+	}
+	store[updatedURL] = payload
+	replaceExampleMappedPartitionRef(
+		nextMap.PartitionBundles[string(cherry.MappedSplitLaneLLMUserKey)],
+		updatedLLMPartition,
+		exampleMappedSplitPartitionBundle{
+			Partition: updatedLLMPartition,
+			URL:       updatedURL,
+			Checksum:  manifest.Checksum,
+			Size:      manifest.SizeBytes,
+		},
+	)
+
+	removedMCPKey, err := spec.MCPUserProfileBundle(profilePath)
+	if err != nil {
+		return err
+	}
+	removedMCPPartition := removedMCPKey.Partition
+	nextMap.PartitionBundles[string(cherry.MappedSplitLaneMCPUserProfile)] = removeExampleMappedPartitionRef(
+		nextMap.PartitionBundles[string(cherry.MappedSplitLaneMCPUserProfile)],
+		removedMCPPartition,
+	)
+
+	nextMapJSON, err := json.MarshalIndent(nextMap, "", "  ")
+	if err != nil {
+		return err
+	}
+	fmt.Println("n_plus_one_update:")
+	fmt.Printf("  map_revision: %d -> %d\n", splitMap.MapRevision, nextMap.MapRevision)
+	fmt.Printf("  updated_bundle: %s partition=%d url=%s\n", component, updatedLLMPartition, updatedURL)
+	fmt.Printf("  removed_bundle: %s partition=%d\n", removedMCPKey.Component(), removedMCPPartition)
+	fmt.Println("n_plus_one_split_map:")
+	fmt.Println(string(nextMapJSON))
+
+	nextView, stats, err := openExampleMappedSplit(nextMap, &activeView, store.fetch)
+	if err != nil {
+		return err
+	}
+	fmt.Println("consumer_after_n_plus_one:")
+	fmt.Printf("  fetched_bundles: %d reused_bundles: %d omitted_partitions: %d\n", stats.Fetched, stats.Reused, stats.Omitted)
+	result, source, found := nextView.resolveLLM(scopeID, principalSlug, modelID)
+	fmt.Printf("  llm updated: scope=%s principal=%s model=%s found=%t source=%s secret_ref=%s rpm=%d\n",
+		scopeID,
+		principalSlug,
+		modelID,
+		found,
+		source,
+		result.SecretRef,
+		result.Rate.RPM,
+	)
+	tool, source, found := nextView.resolveMCPTool(scopeID, profilePath, profileTool)
+	fmt.Printf("  mcp removed: scope=%s path=%s tool=%s found=%t source=%s server=%s secret_ref=%s\n",
+		scopeID,
+		profilePath,
+		profileTool,
+		found,
+		source,
+		tool.Server,
+		tool.SecretRef,
+	)
+	return nil
+}
+
+func parseMappedSplitDemoFlags(args []string) (mappedSplitDemoFlags, []string, error) {
+	flags := mappedSplitDemoFlags{
+		packFlags:  packFlags{cluster: packClusterCombined},
+		partitions: 4,
+	}
+	out := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--partitions":
+			if i+1 >= len(args) {
+				return mappedSplitDemoFlags{}, nil, fmt.Errorf("--partitions requires a value")
+			}
+			partitions, err := strconv.Atoi(args[i+1])
+			if err != nil || partitions <= 0 {
+				return mappedSplitDemoFlags{}, nil, fmt.Errorf("invalid --partitions %q", args[i+1])
+			}
+			flags.partitions = partitions
+			i++
+		case "--models":
+			if i+1 >= len(args) {
+				return mappedSplitDemoFlags{}, nil, fmt.Errorf("--models requires a path")
+			}
+			flags.modelsPath = args[i+1]
+			i++
+		case "--providers":
+			if i+1 >= len(args) {
+				return mappedSplitDemoFlags{}, nil, fmt.Errorf("--providers requires a path")
+			}
+			flags.providersPath = args[i+1]
+			i++
+		case "--mcp-catalog":
+			if i+1 >= len(args) {
+				return mappedSplitDemoFlags{}, nil, fmt.Errorf("--mcp-catalog requires a path")
+			}
+			flags.mcpCatalogPath = args[i+1]
+			i++
+		case "--generation":
+			if i+1 >= len(args) {
+				return mappedSplitDemoFlags{}, nil, fmt.Errorf("--generation requires an id")
+			}
+			flags.generationID = args[i+1]
+			i++
+		default:
+			out = append(out, args[i])
+		}
+	}
+	return flags, out, nil
+}
+
+func buildExampleMappedSplit(
+	scopeKind string,
+	scopeID string,
+	scopes []string,
+	generationID string,
+	partitions int,
+	input cherry.Input,
+) (exampleMappedSplitMap, exampleMappedSplitStore, error) {
+	spec := cherry.MappedSplitSpec{
+		LLMUserKeyPartitions:     partitions,
+		MCPUserProfilePartitions: partitions,
+	}
+	if err := spec.Validate(); err != nil {
+		return exampleMappedSplitMap{}, nil, err
+	}
+	store := exampleMappedSplitStore{}
+	splitMap := exampleMappedSplitMap{
+		FormatVersion:           "mapped-split-v1",
+		ScopeKind:               scopeKind,
+		ScopeID:                 scopeID,
+		Scopes:                  append([]string(nil), scopes...),
+		GenerationID:            generationID,
+		MapRevision:             1,
+		LLMDefaultPrincipalSlug: "slug:default",
+		Partitioning: map[string]exampleMappedSplitPartitionSpec{
+			string(cherry.MappedSplitLaneLLMUserKey): {
+				Algorithm:  "fnv1a64",
+				Key:        "principal_slug",
+				Partitions: partitions,
+			},
+			string(cherry.MappedSplitLaneMCPUserProfile): {
+				Algorithm:  "fnv1a64",
+				Key:        "path_suffix",
+				Partitions: partitions,
+			},
+		},
+		Bundles:          map[string]exampleMappedSplitBundleRef{},
+		PartitionBundles: map[string][]exampleMappedSplitPartitionBundle{},
+	}
+	addBundle := func(component string, layerInput cherry.Input) (exampleMappedSplitBundleRef, error) {
+		url := "mem://" + generationID + "/" + component + ".zst"
+		payload, manifest, _, err := encodeServedBundle(scopeKind, scopeID, scopes, generationID, layerInput)
+		if err != nil {
+			return exampleMappedSplitBundleRef{}, err
+		}
+		store[url] = payload
+		return exampleMappedSplitBundleRef{
+			URL:      url,
+			Checksum: manifest.Checksum,
+			Size:     manifest.SizeBytes,
+		}, nil
+	}
+
+	llmGeneric, err := spec.CatalogBundle(cherry.MappedSplitLaneLLMGeneric)
+	if err != nil {
+		return exampleMappedSplitMap{}, nil, err
+	}
+	mcpServers, err := spec.CatalogBundle(cherry.MappedSplitLaneMCPServers)
+	if err != nil {
+		return exampleMappedSplitMap{}, nil, err
+	}
+
+	ref, err := addBundle(llmGeneric.Component(), exampleLLMGenericInput(input))
+	if err != nil {
+		return exampleMappedSplitMap{}, nil, fmt.Errorf("%s: %w", llmGeneric.Component(), err)
+	}
+	splitMap.Bundles[string(cherry.MappedSplitLaneLLMGeneric)] = ref
+	ref, err = addBundle(mcpServers.Component(), exampleMCPServersInput(input))
+	if err != nil {
+		return exampleMappedSplitMap{}, nil, fmt.Errorf("%s: %w", mcpServers.Component(), err)
+	}
+	splitMap.Bundles[string(cherry.MappedSplitLaneMCPServers)] = ref
+
+	for partition := range partitions {
+		key := cherry.MappedSplitBundleKey{Lane: cherry.MappedSplitLaneLLMUserKey, Partition: partition}
+		ref, err = addBundle(key.Component(), exampleLLMUserKeyPartitionInput(input, partitions, partition))
+		if err != nil {
+			return exampleMappedSplitMap{}, nil, fmt.Errorf("%s: %w", key.Component(), err)
+		}
+		splitMap.PartitionBundles[string(cherry.MappedSplitLaneLLMUserKey)] = append(
+			splitMap.PartitionBundles[string(cherry.MappedSplitLaneLLMUserKey)],
+			exampleMappedSplitPartitionBundle{
+				Partition: partition,
+				URL:       ref.URL,
+				Checksum:  ref.Checksum,
+				Size:      ref.Size,
+			},
+		)
+
+		key = cherry.MappedSplitBundleKey{Lane: cherry.MappedSplitLaneMCPUserProfile, Partition: partition}
+		ref, err = addBundle(key.Component(), exampleMCPUserProfilePartitionInput(input, partitions, partition))
+		if err != nil {
+			return exampleMappedSplitMap{}, nil, fmt.Errorf("%s: %w", key.Component(), err)
+		}
+		splitMap.PartitionBundles[string(cherry.MappedSplitLaneMCPUserProfile)] = append(
+			splitMap.PartitionBundles[string(cherry.MappedSplitLaneMCPUserProfile)],
+			exampleMappedSplitPartitionBundle{
+				Partition: partition,
+				URL:       ref.URL,
+				Checksum:  ref.Checksum,
+				Size:      ref.Size,
+			},
+		)
+	}
+	return splitMap, store, nil
+}
+
+func openExampleMappedSplit(
+	splitMap exampleMappedSplitMap,
+	previous *exampleMappedSplitView,
+	fetch func(string) ([]byte, error),
+) (exampleMappedSplitView, exampleMappedSplitOpenStats, error) {
+	spec := exampleMappedSplitSpec(splitMap)
+	llmGenericRef := splitMap.Bundles[string(cherry.MappedSplitLaneLLMGeneric)]
+	llmGeneric, llmGenericStats, err := openExampleMappedBundle(
+		splitMap,
+		llmGenericRef,
+		previousExampleBundleReader(previous, cherry.MappedSplitLaneLLMGeneric, -1),
+		fetch,
+	)
+	if err != nil {
+		return exampleMappedSplitView{}, exampleMappedSplitOpenStats{}, fmt.Errorf("llm-generic: %w", err)
+	}
+	mcpServersRef := splitMap.Bundles[string(cherry.MappedSplitLaneMCPServers)]
+	mcpServers, mcpServersStats, err := openExampleMappedBundle(
+		splitMap,
+		mcpServersRef,
+		previousExampleBundleReader(previous, cherry.MappedSplitLaneMCPServers, -1),
+		fetch,
+	)
+	if err != nil {
+		return exampleMappedSplitView{}, exampleMappedSplitOpenStats{}, fmt.Errorf("mcp-servers: %w", err)
+	}
+	llmUserKey, llmUserKeyRefs, llmUserKeyStats, err := openExampleMappedPartitions(
+		splitMap,
+		splitMap.Partitioning[string(cherry.MappedSplitLaneLLMUserKey)],
+		splitMap.PartitionBundles[string(cherry.MappedSplitLaneLLMUserKey)],
+		previous,
+		cherry.MappedSplitLaneLLMUserKey,
+		fetch,
+	)
+	if err != nil {
+		return exampleMappedSplitView{}, exampleMappedSplitOpenStats{}, fmt.Errorf("llm-user-key: %w", err)
+	}
+	mcpUserProfile, mcpUserProfileRefs, mcpUserProfileStats, err := openExampleMappedPartitions(
+		splitMap,
+		splitMap.Partitioning[string(cherry.MappedSplitLaneMCPUserProfile)],
+		splitMap.PartitionBundles[string(cherry.MappedSplitLaneMCPUserProfile)],
+		previous,
+		cherry.MappedSplitLaneMCPUserProfile,
+		fetch,
+	)
+	if err != nil {
+		return exampleMappedSplitView{}, exampleMappedSplitOpenStats{}, fmt.Errorf("mcp-user-profile: %w", err)
+	}
+	stats := mergeExampleMappedSplitOpenStats(
+		llmGenericStats,
+		mcpServersStats,
+		llmUserKeyStats,
+		mcpUserProfileStats,
+	)
+	return exampleMappedSplitView{
+		defaultPrincipalSlug: splitMap.LLMDefaultPrincipalSlug,
+		spec:                 spec,
+		generationID:         splitMap.GenerationID,
+		llmGenericRef:        llmGenericRef,
+		mcpServersRef:        mcpServersRef,
+		llmUserKeyRefs:       llmUserKeyRefs,
+		mcpUserProfileRefs:   mcpUserProfileRefs,
+		llmGeneric:           llmGeneric.Reader,
+		mcpServers:           mcpServers.Reader,
+		llmUserKey:           llmUserKey,
+		mcpUserProfile:       mcpUserProfile,
+	}, stats, nil
+}
+
+func exampleMappedSplitSpec(splitMap exampleMappedSplitMap) cherry.MappedSplitSpec {
+	return cherry.MappedSplitSpec{
+		LLMUserKeyPartitions:     splitMap.Partitioning[string(cherry.MappedSplitLaneLLMUserKey)].Partitions,
+		MCPUserProfilePartitions: splitMap.Partitioning[string(cherry.MappedSplitLaneMCPUserProfile)].Partitions,
+	}
+}
+
+type exampleMappedSplitCachedReader struct {
+	GenerationID string
+	Ref          exampleMappedSplitBundleRef
+	Reader       cherry.Reader
+}
+
+func (r exampleMappedSplitCachedReader) matches(generationID string, ref exampleMappedSplitBundleRef) bool {
+	return r.GenerationID == generationID && r.Ref == ref && r.Ref.URL != ""
+}
+
+func previousExampleBundleReader(
+	previous *exampleMappedSplitView,
+	lane cherry.MappedSplitLane,
+	partition int,
+) exampleMappedSplitCachedReader {
+	if previous == nil {
+		return exampleMappedSplitCachedReader{}
+	}
+	switch lane {
+	case cherry.MappedSplitLaneLLMGeneric:
+		return exampleMappedSplitCachedReader{
+			GenerationID: previous.generationID,
+			Ref:          previous.llmGenericRef,
+			Reader:       previous.llmGeneric,
+		}
+	case cherry.MappedSplitLaneMCPServers:
+		return exampleMappedSplitCachedReader{
+			GenerationID: previous.generationID,
+			Ref:          previous.mcpServersRef,
+			Reader:       previous.mcpServers,
+		}
+	case cherry.MappedSplitLaneLLMUserKey:
+		if partition >= 0 && partition < len(previous.llmUserKeyRefs) && partition < len(previous.llmUserKey) {
+			return exampleMappedSplitCachedReader{
+				GenerationID: previous.generationID,
+				Ref:          previous.llmUserKeyRefs[partition],
+				Reader:       previous.llmUserKey[partition],
+			}
+		}
+	case cherry.MappedSplitLaneMCPUserProfile:
+		if partition >= 0 && partition < len(previous.mcpUserProfileRefs) && partition < len(previous.mcpUserProfile) {
+			return exampleMappedSplitCachedReader{
+				GenerationID: previous.generationID,
+				Ref:          previous.mcpUserProfileRefs[partition],
+				Reader:       previous.mcpUserProfile[partition],
+			}
+		}
+	}
+	return exampleMappedSplitCachedReader{}
+}
+
+func mergeExampleMappedSplitOpenStats(stats ...exampleMappedSplitOpenStats) exampleMappedSplitOpenStats {
+	var out exampleMappedSplitOpenStats
+	for _, stat := range stats {
+		out.Fetched += stat.Fetched
+		out.Reused += stat.Reused
+		out.Omitted += stat.Omitted
+	}
+	return out
+}
+
+func openExampleMappedBundle(
+	splitMap exampleMappedSplitMap,
+	ref exampleMappedSplitBundleRef,
+	previous exampleMappedSplitCachedReader,
+	fetch func(string) ([]byte, error),
+) (cherry.OpenedBundle, exampleMappedSplitOpenStats, error) {
+	if previous.matches(splitMap.GenerationID, ref) {
+		return cherry.OpenedBundle{Reader: previous.Reader}, exampleMappedSplitOpenStats{Reused: 1}, nil
+	}
+	payload, err := fetch(ref.URL)
+	if err != nil {
+		return cherry.OpenedBundle{}, exampleMappedSplitOpenStats{}, err
+	}
+	opened, err := cherry.OpenBundleZstd(payload)
+	if err != nil {
+		return cherry.OpenedBundle{}, exampleMappedSplitOpenStats{}, err
+	}
+	if opened.Metadata.ScopeKind != splitMap.ScopeKind ||
+		opened.Metadata.ScopeID != splitMap.ScopeID ||
+		opened.Metadata.GenerationID != splitMap.GenerationID {
+		return cherry.OpenedBundle{}, exampleMappedSplitOpenStats{}, fmt.Errorf("metadata mismatch for %s", ref.URL)
+	}
+	if !sameStrings(opened.Metadata.Scopes, splitMap.Scopes) {
+		return cherry.OpenedBundle{}, exampleMappedSplitOpenStats{}, fmt.Errorf("scopes mismatch for %s", ref.URL)
+	}
+	if opened.Metadata.PackManifest.Checksum != ref.Checksum ||
+		opened.Metadata.PackManifest.SizeBytes != ref.Size {
+		return cherry.OpenedBundle{}, exampleMappedSplitOpenStats{}, fmt.Errorf("manifest mismatch for %s", ref.URL)
+	}
+	return opened, exampleMappedSplitOpenStats{Fetched: 1}, nil
+}
+
+func openExampleMappedPartitions(
+	splitMap exampleMappedSplitMap,
+	spec exampleMappedSplitPartitionSpec,
+	refs []exampleMappedSplitPartitionBundle,
+	previous *exampleMappedSplitView,
+	lane cherry.MappedSplitLane,
+	fetch func(string) ([]byte, error),
+) ([]cherry.Reader, []exampleMappedSplitBundleRef, exampleMappedSplitOpenStats, error) {
+	if spec.Algorithm != "fnv1a64" {
+		return nil, nil, exampleMappedSplitOpenStats{}, fmt.Errorf("unsupported partition algorithm %q", spec.Algorithm)
+	}
+	readers := make([]cherry.Reader, spec.Partitions)
+	nextRefs := make([]exampleMappedSplitBundleRef, spec.Partitions)
+	seen := make([]bool, spec.Partitions)
+	stats := exampleMappedSplitOpenStats{}
+	for _, ref := range refs {
+		if ref.Partition < 0 || ref.Partition >= spec.Partitions {
+			return nil, nil, exampleMappedSplitOpenStats{}, fmt.Errorf("partition %d outside [0,%d)", ref.Partition, spec.Partitions)
+		}
+		nextRef := exampleMappedSplitBundleRef{
+			URL:      ref.URL,
+			Checksum: ref.Checksum,
+			Size:     ref.Size,
+		}
+		opened, openStats, err := openExampleMappedBundle(
+			splitMap,
+			nextRef,
+			previousExampleBundleReader(previous, lane, ref.Partition),
+			fetch,
+		)
+		if err != nil {
+			return nil, nil, exampleMappedSplitOpenStats{}, err
+		}
+		stats = mergeExampleMappedSplitOpenStats(stats, openStats)
+		seen[ref.Partition] = true
+		nextRefs[ref.Partition] = nextRef
+		readers[ref.Partition] = opened.Reader
+	}
+	if previous != nil && previous.generationID == splitMap.GenerationID {
+		for partition := range spec.Partitions {
+			if seen[partition] {
+				continue
+			}
+			previousRef := previousExampleBundleReader(previous, lane, partition).Ref
+			if previousRef.URL != "" {
+				stats.Omitted++
+			}
+		}
+	}
+	return readers, nextRefs, stats, nil
+}
+
+func (s exampleMappedSplitStore) fetch(url string) ([]byte, error) {
+	payload, ok := s[url]
+	if !ok {
+		return nil, fmt.Errorf("missing bundle %q", url)
+	}
+	return payload, nil
+}
+
+func cloneExampleMappedSplitMap(splitMap exampleMappedSplitMap) (exampleMappedSplitMap, error) {
+	data, err := json.Marshal(splitMap)
+	if err != nil {
+		return exampleMappedSplitMap{}, err
+	}
+	var cloned exampleMappedSplitMap
+	if err := json.Unmarshal(data, &cloned); err != nil {
+		return exampleMappedSplitMap{}, err
+	}
+	return cloned, nil
+}
+
+func replaceExampleMappedPartitionRef(
+	refs []exampleMappedSplitPartitionBundle,
+	partition int,
+	next exampleMappedSplitPartitionBundle,
+) {
+	for i, ref := range refs {
+		if ref.Partition != partition {
+			continue
+		}
+		refs[i] = next
+		return
+	}
+}
+
+func removeExampleMappedPartitionRef(
+	refs []exampleMappedSplitPartitionBundle,
+	partition int,
+) []exampleMappedSplitPartitionBundle {
+	out := make([]exampleMappedSplitPartitionBundle, 0, len(refs))
+	for _, ref := range refs {
+		if ref.Partition == partition {
+			continue
+		}
+		out = append(out, ref)
+	}
+	return out
+}
+
+func exampleInputWithPrincipalSecret(input cherry.Input, principalSlug string, secretRef string) cherry.Input {
+	out := input
+	out.Providers = append([]cherry.Provider(nil), input.Providers...)
+	out.Models = append([]cherry.Model(nil), input.Models...)
+	out.MCPServers = append([]cherry.MCPServer(nil), input.MCPServers...)
+	out.Scopes = make([]cherry.Scope, 0, len(input.Scopes))
+	for _, scope := range input.Scopes {
+		outScope := cherry.Scope{
+			ID:          scope.ID,
+			Principals:  make([]cherry.Principal, 0, len(scope.Principals)),
+			MCPProfiles: make([]cherry.MCPProfile, 0, len(scope.MCPProfiles)),
+		}
+		for _, principal := range scope.Principals {
+			outPrincipal := clonePrincipal(principal)
+			if outPrincipal.Slug == principalSlug {
+				if len(outPrincipal.ModelRoutes) > 0 {
+					for modelID, route := range outPrincipal.ModelRoutes {
+						outPrincipal.ModelRoutes[modelID] = exampleRouteWithSecret(route, secretRef)
+					}
+				}
+				outPrincipal.Route = exampleRouteWithSecret(outPrincipal.Route, secretRef)
+			}
+			outScope.Principals = append(outScope.Principals, outPrincipal)
+		}
+		for _, profile := range scope.MCPProfiles {
+			outScope.MCPProfiles = append(outScope.MCPProfiles, cloneMCPProfile(profile))
+		}
+		out.Scopes = append(out.Scopes, outScope)
+	}
+	return out
+}
+
+func exampleRouteWithSecret(route cherry.RoutePlan, secretRef string) cherry.RoutePlan {
+	route.SecretRef = secretRef
+	for i, child := range route.Children {
+		route.Children[i] = exampleRouteWithSecret(child, secretRef)
+	}
+	for i, child := range route.Split {
+		route.Split[i].Plan = exampleRouteWithSecret(child.Plan, secretRef)
+	}
+	return route
+}
+
+func exampleLLMUserKeyPartitionInput(input cherry.Input, partitions int, partition int) cherry.Input {
+	out := cherry.Input{
+		Providers: append([]cherry.Provider(nil), input.Providers...),
+		Models:    append([]cherry.Model(nil), input.Models...),
+		Scopes:    make([]cherry.Scope, 0, len(input.Scopes)),
+	}
+	for _, scope := range input.Scopes {
+		outScope := cherry.Scope{
+			ID:         scope.ID,
+			Principals: make([]cherry.Principal, 0, len(scope.Principals)),
+		}
+		for _, principal := range scope.Principals {
+			spec := cherry.MappedSplitSpec{LLMUserKeyPartitions: partitions, MCPUserProfilePartitions: 1}
+			actualPartition, err := spec.LLMUserKeyPartition(principal.Slug)
+			if err != nil || actualPartition != partition {
+				continue
+			}
+			outScope.Principals = append(outScope.Principals, clonePrincipal(principal))
+		}
+		out.Scopes = append(out.Scopes, outScope)
+	}
+	return out
+}
+
+func exampleMCPUserProfilePartitionInput(input cherry.Input, partitions int, partition int) cherry.Input {
+	out := cherry.Input{
+		MCPServers: append([]cherry.MCPServer(nil), input.MCPServers...),
+		Scopes:     make([]cherry.Scope, 0, len(input.Scopes)),
+	}
+	for _, scope := range input.Scopes {
+		outScope := cherry.Scope{
+			ID:          scope.ID,
+			MCPProfiles: make([]cherry.MCPProfile, 0, len(scope.MCPProfiles)),
+		}
+		for _, profile := range scope.MCPProfiles {
+			spec := cherry.MappedSplitSpec{LLMUserKeyPartitions: 1, MCPUserProfilePartitions: partitions}
+			actualPartition, err := spec.MCPUserProfilePartition(profile.Path)
+			if strings.HasPrefix(profile.Path, "s/") ||
+				err != nil ||
+				actualPartition != partition {
+				continue
+			}
+			outScope.MCPProfiles = append(outScope.MCPProfiles, cloneMCPProfile(profile))
+		}
+		out.Scopes = append(out.Scopes, outScope)
+	}
+	return out
+}
+
+func (v exampleMappedSplitView) resolveLLM(
+	scopeID string,
+	principalSlug string,
+	modelID string,
+) (cherry.LLMResult, string, bool) {
+	key, err := v.spec.LLMUserKeyBundle(principalSlug)
+	if err != nil {
+		return cherry.LLMResult{}, "", false
+	}
+	partition := key.Partition
+	if partition >= len(v.llmUserKey) {
+		return cherry.LLMResult{}, "", false
+	}
+	reader := v.llmUserKey[partition]
+	ids, ok := reader.ResolveLLMIDs(scopeID, principalSlug, modelID)
+	if ok {
+		return materializeExampleLLM(reader, principalSlug, ids), key.Component(), true
+	}
+	ids, ok = v.llmGeneric.ResolveLLMIDs(scopeID, v.defaultPrincipalSlug, modelID)
+	if !ok {
+		return cherry.LLMResult{}, "", false
+	}
+	return materializeExampleLLM(v.llmGeneric, principalSlug, ids), "llm-generic", true
+}
+
+func (v exampleMappedSplitView) resolveMCPTool(
+	scopeID string,
+	pathSuffix string,
+	exposedTool string,
+) (cherry.MCPTool, string, bool) {
+	if strings.HasPrefix(pathSuffix, "s/") {
+		ids, ok := v.mcpServers.ResolveMCPToolIDs(scopeID, pathSuffix, exposedTool)
+		if !ok {
+			return cherry.MCPTool{}, "", false
+		}
+		return materializeExampleMCPTool(v.mcpServers, ids), "mcp-servers", true
+	}
+	key, err := v.spec.MCPUserProfileBundle(pathSuffix)
+	if err != nil {
+		return cherry.MCPTool{}, "", false
+	}
+	partition := key.Partition
+	if partition >= len(v.mcpUserProfile) {
+		return cherry.MCPTool{}, "", false
+	}
+	reader := v.mcpUserProfile[partition]
+	ids, ok := reader.ResolveMCPToolIDs(scopeID, pathSuffix, exposedTool)
+	if !ok {
+		return cherry.MCPTool{}, "", false
+	}
+	return materializeExampleMCPTool(reader, ids), key.Component(), true
+}
+
+func printMappedSplitDemoQueries(view exampleMappedSplitView, input cherry.Input, scopeID string) {
+	if principalSlug, modelID, ok := firstExampleLLMQuery(input, scopeID); ok {
+		result, source, found := view.resolveLLM(scopeID, principalSlug, modelID)
+		fmt.Printf("  llm override: scope=%s principal=%s model=%s found=%t source=%s provider=%s secret_ref=%s rpm=%d\n",
+			scopeID,
+			principalSlug,
+			modelID,
+			found,
+			source,
+			result.Provider,
+			result.SecretRef,
+			result.Rate.RPM,
+		)
+		result, source, found = view.resolveLLM(scopeID, "slug:not-in-key-partitions", modelID)
+		fmt.Printf("  llm fallback: scope=%s principal=%s model=%s found=%t source=%s provider=%s secret_ref=%s rpm=%d\n",
+			scopeID,
+			"slug:not-in-key-partitions",
+			modelID,
+			found,
+			source,
+			result.Provider,
+			result.SecretRef,
+			result.Rate.RPM,
+		)
+	}
+	if path, toolName, ok := firstExampleMCPQuery(input, scopeID, true); ok {
+		tool, source, found := view.resolveMCPTool(scopeID, path, toolName)
+		fmt.Printf("  mcp server: scope=%s path=%s tool=%s found=%t source=%s server=%s secret_ref=%s\n",
+			scopeID,
+			path,
+			toolName,
+			found,
+			source,
+			tool.Server,
+			tool.SecretRef,
+		)
+	}
+	if path, toolName, ok := firstExampleMCPQuery(input, scopeID, false); ok {
+		tool, source, found := view.resolveMCPTool(scopeID, path, toolName)
+		fmt.Printf("  mcp profile: scope=%s path=%s tool=%s found=%t source=%s server=%s secret_ref=%s\n",
+			scopeID,
+			path,
+			toolName,
+			found,
+			source,
+			tool.Server,
+			tool.SecretRef,
+		)
+	}
+}
+
+func materializeExampleLLM(reader cherry.Reader, principalSlug string, ids cherry.LLMIDs) cherry.LLMResult {
+	return cherry.LLMResult{
+		PrincipalSlug: principalSlug,
+		Provider:      reader.String(ids.ProviderSID),
+		ProviderKind:  reader.String(ids.KindSID),
+		Endpoint:      reader.String(ids.EndpointSID),
+		Model:         reader.String(ids.ModelSID),
+		ModelName:     reader.String(ids.ModelNameSID),
+		SecretRef:     reader.String(ids.SecretSID),
+		Rate: cherry.RatePolicy{
+			USDPerDayCents: ids.Rate.USDPerDayCents,
+			RPM:            ids.Rate.RPM,
+			OnExceed:       reader.String(ids.Rate.OnExceedSID),
+		},
+	}
+}
+
+func materializeExampleMCPTool(reader cherry.Reader, ids cherry.MCPToolIDs) cherry.MCPTool {
+	return cherry.MCPTool{
+		ExposedName:    reader.String(ids.ExposedNameSID),
+		Server:         reader.String(ids.ServerSID),
+		ServerEndpoint: reader.String(ids.ServerEndpointSID),
+		Tool:           reader.String(ids.ToolSID),
+		SecretRef:      reader.String(ids.SecretSID),
+		AuthType:       reader.String(ids.AuthTypeSID),
+	}
+}
+
+func clonePrincipal(principal cherry.Principal) cherry.Principal {
+	out := principal
+	out.ModelRoutes = cloneRouteMap(principal.ModelRoutes)
+	return out
+}
+
+func firstScope(scopes []string) string {
+	if len(scopes) == 0 {
+		return ""
+	}
+	return scopes[0]
+}
+
+func firstExampleLLMQuery(input cherry.Input, scopeID string) (string, string, bool) {
+	for _, scope := range input.Scopes {
+		if scope.ID != scopeID {
+			continue
+		}
+		for _, principal := range scope.Principals {
+			models := examplePrincipalModels(principal)
+			if len(models) == 0 {
+				continue
+			}
+			return principal.Slug, models[0], true
+		}
+	}
+	return "", "", false
+}
+
+func examplePrincipalModels(principal cherry.Principal) []string {
+	if len(principal.ModelRoutes) > 0 {
+		models := make([]string, 0, len(principal.ModelRoutes))
+		for modelID := range principal.ModelRoutes {
+			models = append(models, modelID)
+		}
+		sort.Strings(models)
+		return models
+	}
+	if principal.Route.Model == "" {
+		return nil
+	}
+	return []string{principal.Route.Model}
+}
+
+func firstExampleMCPQuery(input cherry.Input, scopeID string, directServer bool) (string, string, bool) {
+	for _, scope := range input.Scopes {
+		if scope.ID != scopeID {
+			continue
+		}
+		for _, profile := range scope.MCPProfiles {
+			isDirectServer := strings.HasPrefix(profile.Path, "s/")
+			if isDirectServer != directServer || len(profile.Tools) == 0 {
+				continue
+			}
+			return profile.Path, profile.Tools[0].ExposedName, true
+		}
+	}
+	return "", "", false
+}
+
+func sameStrings(a []string, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	left := append([]string(nil), a...)
+	right := append([]string(nil), b...)
+	sort.Strings(left)
+	sort.Strings(right)
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }
 
 type replSession struct {

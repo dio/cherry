@@ -74,23 +74,32 @@ Pack one project:
 go run ./example pack project project1 example/source/testdata/example_fixture.yaml /tmp/project1.cherry.zst
 ```
 
-Pack one project as independent LLM and MCP bundles from the same source
-selection:
+Run the mapped split demo:
 
 ```sh
-go run ./example pack --cluster llm --generation gen1 \
-  project project1 example/source/testdata/example_fixture.yaml /tmp/project1.llm.cherry.zst
-
-go run ./example pack --cluster mcp --generation gen1 \
-  project project1 example/source/testdata/example_fixture.yaml /tmp/project1.mcp.cherry.zst
-
-go run ./example split-check --generation gen1 \
-  /tmp/project1.llm.cherry.zst /tmp/project1.mcp.cherry.zst
+go run ./example mapped-split-demo --partitions 4 --generation gen-demo \
+  project project1 example/source/testdata/example_fixture.yaml
 ```
 
-This uses the same single-bundle envelope for each artifact. The enforcement
-point opens the pair with `cherry.OpenSplitBundleZstdWithOptions`, validates the
-shared generation and scope set, then swaps a composed `SplitView`.
+This command keeps everything in memory so you can see both halves together. The
+producer half builds `llm-generic`, `mcp-servers`, partitioned `llm-user-key-*`,
+and partitioned `mcp-user-profile-*` bundles, then prints a `mapped-split-v1`
+document. The consumer half opens the map, opens the listed zstd bundles as
+Cherry readers, and runs LLM/MCP queries that show which lane or partition
+answered.
+
+The demo uses `cherry.MappedSplitSpec` for lane constants, component names, and
+partition selection. Producer code uses it while assigning principals and MCP
+profiles to bundle partitions; consumer code uses the same spec while choosing
+which reader to query. This is the recommended integration shape for high-churn
+bundle delivery.
+
+It also prints an N+1 map revision where one `llm-user-key-*` partition URL and
+checksum change, one `mcp-user-profile-*` partition is omitted, and the consumer
+opens the revised map to show the updated LLM route and removed MCP profile. The
+consumer side compares the revised map with the active view and fetches only
+missing or stale bundle refs; unchanged refs are reused from the already-opened
+readers.
 
 Pack one project with the copied LLM/MCP catalogs:
 

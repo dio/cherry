@@ -26,6 +26,9 @@ or package godoc once the measurements and optimization direction settle.
   optimization target.
 - A typed struct-key route dedupe experiment reduced allocation count but
   regressed CPU badly; do not reintroduce it without a better hashing strategy.
+- The supported no-format-change split direction is mapped split: low-churn
+  `llm-generic` and `mcp-servers` bundles plus partitioned high-churn
+  `llm-user-key-*` and `mcp-user-profile-*` bundles.
 - V2 incremental updates are documented as a future architecture path, preferably
   via immutable static catalog packs plus mutable policy/profile overlays rather
   than in-place blob patching.
@@ -53,6 +56,35 @@ The higher-churn surface is principal and policy data:
 That means provider/model scale is still useful as a baseline, but the primary
 reload risk is route/profile churn and the temporary allocation generated during
 full rebuild.
+
+## Mapped Split Direction
+
+The production split should be either one bundle or mapped split. Do not use a
+fixed four-bundle layout. Mapped split follows churn boundaries and partitions
+only the high-churn lanes:
+
+```text
+llm-generic                  -> low-churn default/platform routing
+mcp-servers                  -> low-churn /mcp/s/<server> paths
+llm-user-key-{000..N}        -> mutable keys, BYOK, route/rate overrides
+mcp-user-profile-{000..N}    -> mutable /mcp/<profile> paths
+```
+
+This direction is compatible with the current pack format because each artifact
+is still a normal immutable pack. The split map tells the EP which component
+URLs belong to a generation and which partition reader should answer a
+principal/profile lookup.
+
+The producer still owns the classification. Cherry should not infer whether a
+change belongs to generic LLM policy, MCP server policy, a per-key LLM
+partition, or an MCP profile partition. `MappedSplitSpec` only provides stable
+lane names, component names, and partition selection.
+
+Current limitation: route and MCP tool records contain reader-local table IDs, so
+override/profile artifacts still need enough local provider/model or MCP server
+rows for `Build` validation and ID resolution. A future pack format could reduce
+that duplication with stable cross-pack catalog IDs, but that is a format change
+and belongs with the V2 incremental/static-catalog work.
 
 ## Initial Finding
 
@@ -2075,6 +2107,9 @@ make lint
 ```
 
 Split-view query/open benchmark:
+
+Note: this is a historical API/prototype benchmark, not current integration
+guidance. Current guidance is single bundle or mapped split.
 
 ```sh
 go test -run '^$' \
