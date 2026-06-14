@@ -615,6 +615,50 @@ func TestReaderResolveMCPInitialize(t *testing.T) {
 	}
 }
 
+func TestReaderResolveMCPProfileAuth(t *testing.T) {
+	input := testPackInput(1, 1)
+	auth := MCPProfileAuth{
+		Type:      "oauth-token",
+		Provider:  "builtin",
+		SecretRef: "env://MCP_OAUTH_CLIENT_SECRET",
+		OAuth: MCPOAuthConfig{
+			TokenEndpoint: "https://auth.example.com/oauth/token",
+			ClientID:      "github-client",
+			Audience:      "https://api.github.com",
+			Scopes:        []string{"repo:read", "user:email"},
+		},
+	}
+	input.Scopes[0].MCPProfiles[0].Auth = auth
+
+	blob, err := Build(input)
+	require.NoError(t, err)
+	reader, err := Open(blob)
+	require.NoError(t, err)
+
+	init, ok := reader.ResolveMCPInitialize("workspace1", "profile-dev-tools")
+	require.True(t, ok)
+	require.Len(t, init.Servers, 2)
+	assert.Equal(t, auth, init.Auth)
+
+	mcp, ok := reader.ResolveMCP("workspace1", "profile-dev-tools")
+	require.True(t, ok)
+	assert.Equal(t, auth, mcp.Auth)
+
+	ids, ok := reader.ResolveMCPIDs("workspace1", "profile-dev-tools")
+	require.True(t, ok)
+	assert.Equal(t, "oauth-token", reader.String(ids.Auth.TypeSID))
+	assert.Equal(t, "builtin", reader.String(ids.Auth.ProviderSID))
+	assert.Equal(t, "env://MCP_OAUTH_CLIENT_SECRET", reader.String(ids.Auth.SecretSID))
+	assert.Equal(t, "https://auth.example.com/oauth/token", reader.String(ids.Auth.OAuth.TokenEndpointSID))
+	assert.Equal(t, "github-client", reader.String(ids.Auth.OAuth.ClientIDSID))
+	assert.Equal(t, "https://api.github.com", reader.String(ids.Auth.OAuth.AudienceSID))
+
+	paths, ok := reader.MCPPaths("workspace1")
+	require.True(t, ok)
+	require.NotEmpty(t, paths)
+	assert.Equal(t, auth, paths[0].Auth)
+}
+
 func TestBuildRejectsConflictingMCPInitializeAuth(t *testing.T) {
 	input := testPackInput(1, 1)
 	input.Scopes[0].MCPProfiles[0].Tools = append(input.Scopes[0].MCPProfiles[0].Tools, MCPToolBinding{

@@ -28,7 +28,7 @@ import (
 
 const (
 	magic              = "OPK1"
-	currentPackVersion = uint32(6)
+	currentPackVersion = uint32(7)
 	headerSize         = 64
 
 	// Header layout:
@@ -71,7 +71,7 @@ const (
 	mcpToolsetLen     = 8  // bindingCount, bindingOffset
 	mcpToolBindingLen = 20 // exposedSID, serverID, toolSID, secretSID, authTypeSID
 	scopeLen          = 20 // sid, principalCount, principalOffset, mcpPathCount, mcpPathOffset
-	mcpPathLen        = 16 // hash64, pathSID, toolsetID
+	mcpPathLen        = 44 // hash64, pathSID, toolsetID, profile auth typeSID, providerSID, secretSID, oauth tokenEndpointSID, clientIDSID, audienceSID, scopesSID
 
 	smallMCPToolsetAuthLinearLimit = 16
 )
@@ -198,11 +198,34 @@ type MCPToolBinding struct {
 	AuthType    string
 }
 
+// MCPProfileAuth describes the client-facing authentication required before a
+// request may use an MCP profile path. Type is a normalized mode such as "none",
+// "api-key", or "oauth-token"; Provider optionally selects the Plum auth
+// provider implementation for that type, such as "builtin" or "custom".
+// SecretRef is a reference only and must never contain secret material.
+type MCPProfileAuth struct {
+	Type      string
+	Provider  string
+	SecretRef string
+	OAuth     MCPOAuthConfig
+}
+
+// MCPOAuthConfig stores normalized OAuth settings for MCP profile auth. Secret
+// material is still represented only by SecretRef on the containing profile
+// auth record.
+type MCPOAuthConfig struct {
+	TokenEndpoint string
+	ClientID      string
+	Audience      string
+	Scopes        []string
+}
+
 // MCPProfile describes one MCP path suffix within a scope and the tools exposed
 // through that path. Path is the normalized suffix after the HTTP layer strips
 // the MCP prefix.
 type MCPProfile struct {
 	Path  string
+	Auth  MCPProfileAuth
 	Tools []MCPToolBinding
 }
 
@@ -389,6 +412,7 @@ type MCPToolIDs struct {
 type MCPResultIDs struct {
 	PathSID   uint32
 	ToolsetID uint32
+	Auth      MCPProfileAuthIDs
 	Tools     []MCPToolIDs
 }
 
@@ -402,11 +426,28 @@ type MCPUpstreamServerIDs struct {
 	AuthTypeSID uint32
 }
 
+// MCPProfileAuthIDs is the string-table ID form of MCPProfileAuth.
+type MCPProfileAuthIDs struct {
+	TypeSID     uint32
+	ProviderSID uint32
+	SecretSID   uint32
+	OAuth       MCPOAuthConfigIDs
+}
+
+// MCPOAuthConfigIDs is the string-table ID form of MCPOAuthConfig.
+type MCPOAuthConfigIDs struct {
+	TokenEndpointSID uint32
+	ClientIDSID      uint32
+	AudienceSID      uint32
+	ScopesSID        uint32
+}
+
 // MCPInitializeIDs is the allocation-minimizing result for MCP initialize. It
 // contains the upstream servers behind a path, including the effective auth and
 // secret refs selected for that path.
 type MCPInitializeIDs struct {
 	PathSID uint32
+	Auth    MCPProfileAuthIDs
 	Servers []MCPUpstreamServerIDs
 }
 
@@ -423,6 +464,7 @@ type MCPTool struct {
 // MCPResult is the string-materialized form of an MCP path lookup.
 type MCPResult struct {
 	Path  string
+	Auth  MCPProfileAuth
 	Tools []MCPTool
 }
 
@@ -438,6 +480,7 @@ type MCPUpstreamServer struct {
 // MCPInitializeResult is the string-materialized result for MCP initialize.
 type MCPInitializeResult struct {
 	Path    string
+	Auth    MCPProfileAuth
 	Servers []MCPUpstreamServer
 }
 
@@ -468,6 +511,7 @@ type PrincipalInfo struct {
 type MCPPath struct {
 	ScopeID string
 	Path    string
+	Auth    MCPProfileAuth
 	Tools   []MCPTool
 }
 
@@ -591,6 +635,7 @@ func Build(input Input) ([]byte, error) {
 		}
 		for _, profile := range scope.MCPProfiles {
 			builder.stringID(profile.Path)
+			internMCPProfileAuth(builder, profile.Auth)
 			canonicalTools := canonicalToolset(profile.Tools)
 			var serverAuth map[string]MCPToolBinding
 			if len(canonicalTools) > smallMCPToolsetAuthLinearLimit {
@@ -608,8 +653,7 @@ func Build(input Input) ([]byte, error) {
 					}
 				} else {
 					if existing, ok := serverAuth[tool.Server]; ok &&
-						(existing.SecretRef != tool.SecretRef ||
-							existing.AuthType != tool.AuthType) {
+						!sameMCPToolAuth(existing, tool) {
 						return nil, fmt.Errorf("mcp profile %q has conflicting auth for server %q", profile.Path, tool.Server)
 					}
 					serverAuth[tool.Server] = tool
@@ -626,6 +670,7 @@ func Build(input Input) ([]byte, error) {
 				path:      profile.Path,
 				pathHash:  pathHash,
 				toolsetID: toolsetID,
+				auth:      profile.Auth,
 			})
 		}
 		compiledScopes = append(compiledScopes, compiled)
@@ -1010,6 +1055,7 @@ func (r Reader) ResolveMCPIDs(scopeID string, pathSuffix string) (MCPResultIDs, 
 	return MCPResultIDs{
 		PathSID:   path.pathSID,
 		ToolsetID: path.toolsetID,
+		Auth:      path.auth,
 		Tools:     r.toolset(path.toolsetID),
 	}, true
 }
@@ -1042,6 +1088,7 @@ func (r Reader) ResolveMCPInitializeIDs(scopeID string, pathSuffix string) (MCPI
 	})
 	return MCPInitializeIDs{
 		PathSID: result.PathSID,
+		Auth:    result.Auth,
 		Servers: servers,
 	}, true
 }
@@ -1098,6 +1145,7 @@ func (r Reader) ResolveMCPInitialize(scopeID string, pathSuffix string) (MCPInit
 	}
 	return MCPInitializeResult{
 		Path:    r.String(ids.PathSID),
+		Auth:    r.materializeMCPProfileAuth(ids.Auth),
 		Servers: servers,
 	}, true
 }
@@ -1123,6 +1171,7 @@ func (r Reader) ResolveMCP(scopeID string, pathSuffix string) (MCPResult, bool) 
 	}
 	return MCPResult{
 		Path:  r.String(ids.PathSID),
+		Auth:  r.materializeMCPProfileAuth(ids.Auth),
 		Tools: tools,
 	}, true
 }
@@ -1169,6 +1218,24 @@ func (r Reader) mcpServerInfo(id uint32) MCPServerInfo {
 		Endpoint:  r.String(server.endpointSID),
 		SecretRef: r.String(server.secretSID),
 		AuthType:  r.String(server.authTypeSID),
+	}
+}
+
+func (r Reader) materializeMCPProfileAuth(ids MCPProfileAuthIDs) MCPProfileAuth {
+	return MCPProfileAuth{
+		Type:      r.String(ids.TypeSID),
+		Provider:  r.String(ids.ProviderSID),
+		SecretRef: r.String(ids.SecretSID),
+		OAuth:     r.materializeMCPOAuthConfig(ids.OAuth),
+	}
+}
+
+func (r Reader) materializeMCPOAuthConfig(ids MCPOAuthConfigIDs) MCPOAuthConfig {
+	return MCPOAuthConfig{
+		TokenEndpoint: r.String(ids.TokenEndpointSID),
+		ClientID:      r.String(ids.ClientIDSID),
+		Audience:      r.String(ids.AudienceSID),
+		Scopes:        splitOAuthScopes(r.String(ids.ScopesSID)),
 	}
 }
 
@@ -1272,6 +1339,7 @@ func (r Reader) MCPPaths(scopeID string) ([]MCPPath, bool) {
 		path := mcpPathRef{
 			pathSID:   r.read32(entryBase + 8),
 			toolsetID: r.read32(entryBase + 12),
+			auth:      r.mcpProfileAuth(entryBase + 16),
 		}
 		result, ok := r.ResolveMCP(scopeID, r.string(path.pathSID))
 		if !ok {
@@ -1280,6 +1348,7 @@ func (r Reader) MCPPaths(scopeID string) ([]MCPPath, bool) {
 		paths = append(paths, MCPPath{
 			ScopeID: scopeID,
 			Path:    result.Path,
+			Auth:    result.Auth,
 			Tools:   result.Tools,
 		})
 	}
@@ -1342,6 +1411,7 @@ type compiledMCPProfile struct {
 	path      string
 	pathHash  uint64
 	toolsetID uint32
+	auth      MCPProfileAuth
 }
 
 type routeInterner struct {
@@ -1402,6 +1472,16 @@ func (b *builder) stringID(value string) uint32 {
 	return id
 }
 
+func internMCPProfileAuth(b *builder, auth MCPProfileAuth) {
+	b.stringID(auth.Type)
+	b.stringID(auth.Provider)
+	b.stringID(auth.SecretRef)
+	b.stringID(auth.OAuth.TokenEndpoint)
+	b.stringID(auth.OAuth.ClientID)
+	b.stringID(auth.OAuth.Audience)
+	b.stringID(oauthScopesKey(auth.OAuth.Scopes))
+}
+
 func sortedProviders(values []Provider) []Provider {
 	out := append([]Provider{}, values...)
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
@@ -1460,18 +1540,24 @@ func mcpToolBindingLess(left MCPToolBinding, right MCPToolBinding) bool {
 	if left.SecretRef != right.SecretRef {
 		return left.SecretRef < right.SecretRef
 	}
-	return left.AuthType < right.AuthType
+	if left.AuthType != right.AuthType {
+		return left.AuthType < right.AuthType
+	}
+	return false
 }
 
 func validateMCPToolAuthLinear(profilePath string, previous []MCPToolBinding, tool MCPToolBinding) error {
 	for _, existing := range previous {
-		if existing.Server == tool.Server &&
-			(existing.SecretRef != tool.SecretRef ||
-				existing.AuthType != tool.AuthType) {
+		if existing.Server == tool.Server && !sameMCPToolAuth(existing, tool) {
 			return fmt.Errorf("mcp profile %q has conflicting auth for server %q", profilePath, tool.Server)
 		}
 	}
 	return nil
+}
+
+func sameMCPToolAuth(left MCPToolBinding, right MCPToolBinding) bool {
+	return left.SecretRef == right.SecretRef &&
+		left.AuthType == right.AuthType
 }
 
 // principalRoutes expands the compatibility Route field into the same shape as
@@ -1825,12 +1911,25 @@ func mcpToolsetsEqual(left []MCPToolBinding, right []MCPToolBinding) bool {
 		if left[i].ExposedName != right[i].ExposedName ||
 			left[i].Server != right[i].Server ||
 			left[i].Tool != right[i].Tool ||
-			left[i].SecretRef != right[i].SecretRef ||
-			left[i].AuthType != right[i].AuthType {
+			!sameMCPToolAuth(left[i], right[i]) {
 			return false
 		}
 	}
 	return true
+}
+
+func oauthScopesKey(scopes []string) string {
+	if len(scopes) == 0 {
+		return ""
+	}
+	return strings.Join(scopes, "\x00")
+}
+
+func splitOAuthScopes(value string) []string {
+	if value == "" {
+		return nil
+	}
+	return strings.Split(value, "\x00")
 }
 
 // writeStrings writes the shared string table as count, data length, offsets,
@@ -2097,6 +2196,13 @@ func writeScopes(out *bytes.Buffer, b *builder, scopes []compiledScope, rateIDs 
 			putU64(out, profile.pathHash)
 			putU32(out, b.stringID(profile.path))
 			putU32(out, profile.toolsetID)
+			putU32(out, b.stringID(profile.auth.Type))
+			putU32(out, b.stringID(profile.auth.Provider))
+			putU32(out, b.stringID(profile.auth.SecretRef))
+			putU32(out, b.stringID(profile.auth.OAuth.TokenEndpoint))
+			putU32(out, b.stringID(profile.auth.OAuth.ClientID))
+			putU32(out, b.stringID(profile.auth.OAuth.Audience))
+			putU32(out, b.stringID(oauthScopesKey(profile.auth.OAuth.Scopes)))
 		}
 	}
 
@@ -2131,6 +2237,7 @@ type principalRef struct {
 type mcpPathRef struct {
 	pathSID   uint32
 	toolsetID uint32
+	auth      MCPProfileAuthIDs
 }
 
 type modelRef struct {
@@ -2358,10 +2465,25 @@ func (r Reader) findMCPPath(scope scopeRef, path string) (mcpPathRef, bool) {
 			return mcpPathRef{
 				pathSID:   sid,
 				toolsetID: r.read32(entryBase + 12),
+				auth:      r.mcpProfileAuth(entryBase + 16),
 			}, true
 		}
 	}
 	return mcpPathRef{}, false
+}
+
+func (r Reader) mcpProfileAuth(base int) MCPProfileAuthIDs {
+	return MCPProfileAuthIDs{
+		TypeSID:     r.read32(base),
+		ProviderSID: r.read32(base + 4),
+		SecretSID:   r.read32(base + 8),
+		OAuth: MCPOAuthConfigIDs{
+			TokenEndpointSID: r.read32(base + 12),
+			ClientIDSID:      r.read32(base + 16),
+			AudienceSID:      r.read32(base + 20),
+			ScopesSID:        r.read32(base + 24),
+		},
+	}
 }
 
 func (r Reader) findModel(modelID string) (uint32, bool) {

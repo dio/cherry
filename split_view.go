@@ -702,6 +702,7 @@ func (v LayeredSplitView) ResolveMCPInitialize(
 	}
 	return MCPInitializeResult{
 		Path:    reader.String(ids.PathSID),
+		Auth:    reader.materializeMCPProfileAuth(ids.Auth),
 		Servers: servers,
 	}, true
 }
@@ -726,6 +727,7 @@ func (v LayeredSplitView) ResolveMCP(scopeID string, pathSuffix string) (MCPResu
 	}
 	return MCPResult{
 		Path:  reader.String(ids.PathSID),
+		Auth:  reader.materializeMCPProfileAuth(ids.Auth),
 		Tools: tools,
 	}, true
 }
