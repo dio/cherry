@@ -54,7 +54,7 @@ source records
   -> delivery bytes
 ```
 
-Minimal shape:
+Minimal shape (open catalog objects use `encoding/json.RawMessage`):
 
 ```go
 input := cherry.Input{
@@ -73,6 +73,13 @@ input := cherry.Input{
             Name:         "gpt-4o-mini",
             Mode:         "chat",
             Capabilities: []string{"vision", "tool_choice"},
+            Modalities: cherry.ModelModalities{
+                Input:  []string{"text", "image"},
+                Output: []string{"text"},
+            },
+            Limits: cherry.ModelCatalogObject{
+                "max_output_tokens": json.RawMessage(`16384`),
+            },
             MetadataJSON: `{"model":"gpt-4o-mini","inputTokensPricePerMillion":"0.15","capabilities":["vision","tool_choice"]}`,
         },
     },

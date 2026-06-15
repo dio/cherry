@@ -29,8 +29,9 @@ The `testdata/catalogs` files are copied seed/catalog examples. The example
 loader treats them as external source data and transforms them into normalized
 Cherry rows:
 
-- `models.json` becomes enabled `cherry.Model` rows with pricing, limits, and
-  capabilities preserved in `MetadataJSON`.
+- `models.json` becomes enabled `cherry.Model` rows. `mode`, `capabilities`,
+  `modalities`, `additionalPricePerMillion`, and `limits` are promoted to
+  first-class fields, while the full source row remains in `MetadataJSON`.
 - `providers.json` becomes provider endpoint metadata. Fixture secret refs are
   preserved when catalog provider rows do not include secrets.
 - `mcp-catalog-data-with-tools.json` becomes MCP server rows with tool pools.
@@ -201,8 +202,9 @@ llm model gpt-5
 llm models
 ```
 
-`llm models` prints the simulated `/v1/models` response derived from the packed
-catalog metadata.
+`llm model <id>` prints first-class catalog fields such as mode, capabilities,
+and selected limit/pricing metadata. `llm models` prints the simulated
+`/v1/models` response derived from the packed catalog metadata.
 
 Resolve an MCP tool:
 
