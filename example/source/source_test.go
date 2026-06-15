@@ -22,6 +22,22 @@ func TestLoadModelCatalogJSON(t *testing.T) {
 	require.Equal(t, "openai", gpt5.Provider)
 	require.NotEmpty(t, gpt5.MetadataJSON)
 	require.Contains(t, gpt5.Capabilities, "image_generation")
+	require.ElementsMatch(t, []string{"text", "image"}, gpt5.Modalities.Input)
+	require.Equal(t, []string{"text"}, gpt5.Modalities.Output)
+	require.Contains(t, gpt5.Limits, "max_output_tokens")
+
+	var imageModel Model
+	for _, model := range models {
+		if model.ID == "chatgpt-image-latest" {
+			imageModel = model
+			break
+		}
+	}
+	require.NotEmpty(t, imageModel.ID)
+	require.Equal(t, "image_generation", imageModel.Mode)
+	require.Contains(t, imageModel.AdditionalPricePerMillion, "image_generation")
+	require.Contains(t, imageModel.AdditionalPricePerMillion, "image_tokens")
+	require.Contains(t, imageModel.Limits, "max_prompt_length")
 }
 
 func TestLoadProviderCatalogJSON(t *testing.T) {

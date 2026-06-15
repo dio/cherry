@@ -28,7 +28,7 @@ import (
 
 const (
 	magic              = "OPK1"
-	currentPackVersion = uint32(7)
+	currentPackVersion = uint32(8)
 	headerSize         = 64
 
 	// Header layout:
@@ -62,7 +62,7 @@ const (
 
 	principalLen      = 32 // hash64(slug + "\x00" + requestedModel), slugSID, routeID, rateID, requestedModelID, credentialCount, credentialOffset
 	credentialLen     = 8  // target ordinal, secretSID
-	modelLen          = 32 // hash64, idSID, providerID, nameSID, modeSID, capabilitiesSID, metadataSID
+	modelLen          = 44 // hash64, idSID, providerID, nameSID, modeSID, capabilitiesSID, modalitiesSID, additionalPriceSID, limitsSID, metadataSID
 	providerLen       = 24 // idSID, kindSID, endpointSID, secretSID, authTypeSID, pathPrefixSID
 	routeLen          = 24 // kind, target fields or child count/offset/retry fields
 	routeChildLen     = 8  // weight, childRouteID; weight is zero for chain children
@@ -113,18 +113,34 @@ type Provider struct {
 // Provider must reference an entry in Input.Providers. Name is the upstream model
 // name sent to the selected provider after routing has been resolved.
 //
-// Mode, Capabilities, and MetadataJSON preserve normalized catalog data for
-// model listing and capability checks. MetadataJSON is intentionally opaque to
-// Cherry so producers can retain pricing, limits, modalities, and provider-
-// specific fields without forcing those fields into the binary schema.
+// Mode, Capabilities, Modalities, AdditionalPricePerMillion, and Limits preserve
+// normalized catalog data for model listing, capability checks, request shaping,
+// and cost calculation. MetadataJSON is intentionally opaque to Cherry so
+// producers can retain aliases, options, descriptions, source URLs, and future
+// provider-specific fields without forcing those fields into the binary schema.
 type Model struct {
-	ID           string
-	Provider     string
-	Name         string
-	Mode         string
-	Capabilities []string
-	MetadataJSON string
+	ID                        string
+	Provider                  string
+	Name                      string
+	Mode                      string
+	Capabilities              []string
+	Modalities                ModelModalities
+	AdditionalPricePerMillion ModelCatalogObject
+	Limits                    ModelCatalogObject
+	MetadataJSON              string
 }
+
+// ModelModalities describes the input and output modalities supported by a
+// model catalog entry.
+type ModelModalities struct {
+	Input  []string `json:"input,omitempty"`
+	Output []string `json:"output,omitempty"`
+}
+
+// ModelCatalogObject is an open normalized model-catalog object. It is used for
+// source fields whose key sets vary by provider or mode, such as limits and
+// additional price dimensions.
+type ModelCatalogObject map[string]json.RawMessage
 
 // RetryPolicy describes retry/fallback behavior attached to a chain route node.
 // Cherry stores this metadata verbatim; the enforcement point decides how to
@@ -386,12 +402,15 @@ type ProviderInfo struct {
 // pack. MetadataJSON is the raw normalized catalog object supplied by the
 // producer.
 type ModelInfo struct {
-	ID           string
-	Provider     string
-	Name         string
-	Mode         string
-	Capabilities []string
-	MetadataJSON string
+	ID                        string
+	Provider                  string
+	Name                      string
+	Mode                      string
+	Capabilities              []string
+	Modalities                ModelModalities
+	AdditionalPricePerMillion ModelCatalogObject
+	Limits                    ModelCatalogObject
+	MetadataJSON              string
 }
 
 // MCPToolIDs is the allocation-minimizing representation of one MCP tool
@@ -577,6 +596,9 @@ func Build(input Input) ([]byte, error) {
 		builder.stringID(model.Name)
 		builder.stringID(model.Mode)
 		builder.stringID(capabilitiesKey(model.Capabilities))
+		builder.stringID(modalitiesJSON(model.Modalities))
+		builder.stringID(catalogObjectJSON(model.AdditionalPricePerMillion))
+		builder.stringID(catalogObjectJSON(model.Limits))
 		builder.stringID(model.MetadataJSON)
 	}
 
@@ -1243,12 +1265,15 @@ func (r Reader) modelInfo(id uint32) ModelInfo {
 	model := r.model(id)
 	provider := r.provider(model.providerID)
 	return ModelInfo{
-		ID:           r.String(model.idSID),
-		Provider:     r.String(provider.idSID),
-		Name:         r.String(model.nameSID),
-		Mode:         r.String(model.modeSID),
-		Capabilities: splitCapabilities(r.String(model.capabilitiesSID)),
-		MetadataJSON: r.String(model.metadataSID),
+		ID:                        r.String(model.idSID),
+		Provider:                  r.String(provider.idSID),
+		Name:                      r.String(model.nameSID),
+		Mode:                      r.String(model.modeSID),
+		Capabilities:              splitCapabilities(r.String(model.capabilitiesSID)),
+		Modalities:                splitModalities(r.String(model.modalitiesSID)),
+		AdditionalPricePerMillion: splitCatalogObject(r.String(model.additionalPriceSID)),
+		Limits:                    splitCatalogObject(r.String(model.limitsSID)),
+		MetadataJSON:              r.String(model.metadataSID),
 	}
 }
 
@@ -1868,6 +1893,51 @@ func splitCapabilities(value string) []string {
 	return strings.Split(value, "\x00")
 }
 
+func modalitiesJSON(value ModelModalities) string {
+	if len(value.Input) == 0 && len(value.Output) == 0 {
+		return ""
+	}
+	data, err := json.Marshal(value)
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+func splitModalities(value string) ModelModalities {
+	if value == "" {
+		return ModelModalities{}
+	}
+	var out ModelModalities
+	_ = json.Unmarshal([]byte(value), &out)
+	return out
+}
+
+func catalogObjectJSON(value ModelCatalogObject) string {
+	if value == nil {
+		return ""
+	}
+	data, err := json.Marshal(value)
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+func splitCatalogObject(value string) ModelCatalogObject {
+	if value == "" {
+		return nil
+	}
+	var out ModelCatalogObject
+	if err := json.Unmarshal([]byte(value), &out); err != nil {
+		return nil
+	}
+	for key, raw := range out {
+		out[key] = append(json.RawMessage(nil), raw...)
+	}
+	return out
+}
+
 func internMCPToolset(
 	hash uint64,
 	canonicalTools []MCPToolBinding,
@@ -1978,6 +2048,9 @@ func writeModels(out *bytes.Buffer, b *builder, models []Model, providerIDs map[
 		putU32(out, b.stringID(model.Name))
 		putU32(out, b.stringID(model.Mode))
 		putU32(out, b.stringID(capabilitiesKey(model.Capabilities)))
+		putU32(out, b.stringID(modalitiesJSON(model.Modalities)))
+		putU32(out, b.stringID(catalogObjectJSON(model.AdditionalPricePerMillion)))
+		putU32(out, b.stringID(catalogObjectJSON(model.Limits)))
 		putU32(out, b.stringID(model.MetadataJSON))
 	}
 }
@@ -2241,12 +2314,15 @@ type mcpPathRef struct {
 }
 
 type modelRef struct {
-	idSID           uint32
-	providerID      uint32
-	nameSID         uint32
-	modeSID         uint32
-	capabilitiesSID uint32
-	metadataSID     uint32
+	idSID              uint32
+	providerID         uint32
+	nameSID            uint32
+	modeSID            uint32
+	capabilitiesSID    uint32
+	modalitiesSID      uint32
+	additionalPriceSID uint32
+	limitsSID          uint32
+	metadataSID        uint32
 }
 
 type providerRef struct {
@@ -2347,8 +2423,11 @@ func v1ModelFromModelInfo(model ModelInfo) v1Model {
 	if raw.ContextWindow != nil {
 		out.ContextWindow = *raw.ContextWindow
 	}
+	if value, ok := catalogObjectInt64(model.Limits, "max_output_tokens"); ok {
+		out.MaxOutputTokens = value
+	}
 	var limits rawModelLimits
-	if len(raw.Limits) > 0 {
+	if out.MaxOutputTokens == 0 && len(raw.Limits) > 0 {
 		_ = json.Unmarshal(raw.Limits, &limits)
 		out.MaxOutputTokens = limits.MaxOutputTokens
 	}
@@ -2392,6 +2471,28 @@ func trimDecimal(value string) string {
 		return "0"
 	}
 	return value
+}
+
+func catalogObjectInt64(object ModelCatalogObject, key string) (int64, bool) {
+	raw, ok := object[key]
+	if !ok || len(raw) == 0 || string(raw) == "null" {
+		return 0, false
+	}
+	var number json.Number
+	if err := json.Unmarshal(raw, &number); err == nil {
+		if value, err := number.Int64(); err == nil {
+			return value, true
+		}
+	}
+	var text string
+	if err := json.Unmarshal(raw, &text); err != nil {
+		return 0, false
+	}
+	value, err := strconv.ParseInt(text, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return value, true
 }
 
 func hasCapability(capabilities []string, capability string) bool {
@@ -2509,12 +2610,15 @@ func (r Reader) findModel(modelID string) (uint32, bool) {
 func (r Reader) model(id uint32) modelRef {
 	base := int(r.modelsOff) + 4 + int(id)*modelLen
 	return modelRef{
-		idSID:           r.read32(base + 8),
-		providerID:      r.read32(base + 12),
-		nameSID:         r.read32(base + 16),
-		modeSID:         r.read32(base + 20),
-		capabilitiesSID: r.read32(base + 24),
-		metadataSID:     r.read32(base + 28),
+		idSID:              r.read32(base + 8),
+		providerID:         r.read32(base + 12),
+		nameSID:            r.read32(base + 16),
+		modeSID:            r.read32(base + 20),
+		capabilitiesSID:    r.read32(base + 24),
+		modalitiesSID:      r.read32(base + 28),
+		additionalPriceSID: r.read32(base + 32),
+		limitsSID:          r.read32(base + 36),
+		metadataSID:        r.read32(base + 40),
 	}
 }
 

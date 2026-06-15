@@ -205,10 +205,35 @@ if decision.TakeSnapshot {
 ```
 
 Model catalog records can carry opaque normalized metadata. A producer can read
-its raw model catalog, keep pricing, limits, modalities, and capabilities in
-`Model.MetadataJSON`, and pass selected capability names in `Model.Capabilities`.
-Cherry validates and packs that data but does not define the source catalog
-schema.
+its raw model catalog, promote fields Cherry needs for stable query semantics,
+and keep the full normalized row in `Model.MetadataJSON`.
+
+For a seed row such as `gpt-image-2`, the field boundary is:
+
+| Source field | Cherry field | Notes |
+| --- | --- | --- |
+| `model` | `Model.ID`, `Model.Name` | Logical requested model ID and upstream model name. |
+| `provider` | `Model.Provider` | Must reference an `Input.Providers` entry. |
+| `mode` | `Model.Mode` | First-class catalog metadata, e.g. `chat`, `responses`, `image_generation`. |
+| `capabilities` | `Model.Capabilities` | First-class capability list used by `ModelCapability`. |
+| `modalities` | `Model.Modalities` | First-class input/output modality lists for request shaping and diagnostics. |
+| `additionalPricePerMillion` | `Model.AdditionalPricePerMillion` | First-class open catalog object for provider- and mode-specific price dimensions. |
+| `limits` | `Model.Limits` | First-class open catalog object for provider- and mode-specific request limits. |
+| Full enabled row | `Model.MetadataJSON` | Opaque JSON for source-specific fields and future catalog changes. |
+
+Fields such as `backendUrls`, `metadata.aliases`, `metadata.options`,
+`metadata.source_url`, `metadata.description`, and `metadata.display_name` are
+preserved in `Model.MetadataJSON`. They are not first-class pack fields today
+because Cherry does not make routing or compatibility decisions from them.
+
+`AdditionalPricePerMillion` and `Limits` intentionally use open JSON objects:
+the seed schema allows provider- and mode-specific keys such as
+`image_tokens`, `image_generation`, `max_edge_px`, `edge_multiple_px`,
+`max_total_pixels`, or `max_long_edge_to_short_edge_ratio`. This keeps those
+objects queryable without hard-coding every provider-specific nested shape.
+`V1ModelsJSON` uses the typed `Limits` object for `max_output_tokens` and still
+uses `MetadataJSON` for source pricing fields needed by the OpenAI-compatible
+model-list projection.
 
 ## Enforcement Point Consumption
 

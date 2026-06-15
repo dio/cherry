@@ -324,11 +324,14 @@ type rawModelCatalog struct {
 }
 
 type rawModelRow struct {
-	Model        string   `json:"model"`
-	Provider     string   `json:"provider"`
-	Mode         string   `json:"mode"`
-	IsEnabled    bool     `json:"isEnabled"`
-	Capabilities []string `json:"capabilities"`
+	Model                     string                    `json:"model"`
+	Provider                  string                    `json:"provider"`
+	Mode                      string                    `json:"mode"`
+	IsEnabled                 bool                      `json:"isEnabled"`
+	Capabilities              []string                  `json:"capabilities"`
+	Modalities                cherry.ModelModalities    `json:"modalities"`
+	AdditionalPricePerMillion cherry.ModelCatalogObject `json:"additionalPricePerMillion"`
+	Limits                    cherry.ModelCatalogObject `json:"limits"`
 }
 
 type rawProviderCatalog struct {
@@ -398,12 +401,15 @@ func LoadModelCatalogJSON(path string) ([]Model, error) {
 			continue
 		}
 		models = append(models, Model{
-			ID:           row.Model,
-			Provider:     row.Provider,
-			Name:         row.Model,
-			Mode:         row.Mode,
-			Capabilities: row.Capabilities,
-			MetadataJSON: string(raw),
+			ID:                        row.Model,
+			Provider:                  row.Provider,
+			Name:                      row.Model,
+			Mode:                      row.Mode,
+			Capabilities:              row.Capabilities,
+			Modalities:                row.Modalities,
+			AdditionalPricePerMillion: row.AdditionalPricePerMillion,
+			Limits:                    row.Limits,
+			MetadataJSON:              string(raw),
 		})
 	}
 	return models, nil

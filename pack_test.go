@@ -352,6 +352,10 @@ func TestReaderResolveModelMetadata(t *testing.T) {
 	if model.Mode != "chat" || model.MetadataJSON == "" {
 		t.Fatalf("ResolveModel() = %#v, want mode and metadata", model)
 	}
+	assert.Equal(t, []string{"text", "image"}, model.Modalities.Input)
+	assert.Equal(t, []string{"text"}, model.Modalities.Output)
+	require.JSONEq(t, `0.42`, string(model.AdditionalPricePerMillion["web_search_per_thousand_sources"]))
+	require.JSONEq(t, `16384`, string(model.Limits["max_output_tokens"]))
 	if !reader.ModelCapability("gpt-4o-mini", "vision") {
 		t.Fatal("ModelCapability(vision) = false, want true")
 	}
@@ -887,6 +891,16 @@ func testPackInput(scopeCount int, principalsPerScope int) Input {
 			Name:         "gpt-4o-mini",
 			Mode:         "chat",
 			Capabilities: []string{"vision", "tool_choice"},
+			Modalities: ModelModalities{
+				Input:  []string{"text", "image"},
+				Output: []string{"text"},
+			},
+			AdditionalPricePerMillion: ModelCatalogObject{
+				"web_search_per_thousand_sources": json.RawMessage(`0.42`),
+			},
+			Limits: ModelCatalogObject{
+				"max_output_tokens": json.RawMessage(`16384`),
+			},
 			MetadataJSON: `{"model":"gpt-4o-mini","inputTokensPricePerMillion":"0.1500000000","contextWindow":128000,"capabilities":["vision","tool_choice"],"limits":{"max_output_tokens":16384}}`,
 		},
 	}
