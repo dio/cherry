@@ -400,6 +400,22 @@ type ProviderInfo struct {
 	Extra      map[string]string
 }
 
+// ProviderDescription describes one provider available from the loaded bundle.
+// It is intended for diagnostics and admin UIs that need to list possible LLM
+// providers and the normalized model IDs routed through each provider.
+//
+// AuthType is the effective provider auth scheme. An empty provider AuthType is
+// reported as "bearer" for backwards compatibility with enforcement points.
+type ProviderDescription struct {
+	ID         string
+	Kind       string
+	Endpoint   string
+	AuthType   string
+	PathPrefix string
+	ModelIDs   []string
+	Extra      map[string]string
+}
+
 // ModelInfo is the string-materialized metadata for one model stored in the
 // pack. MetadataJSON is the raw normalized catalog object supplied by the
 // producer.
@@ -970,6 +986,32 @@ func (r Reader) Providers() []ProviderInfo {
 		return providers[i].ID < providers[j].ID
 	})
 	return providers
+}
+
+// ProviderDescriptions returns every LLM provider available in this bundle,
+// including its effective auth type and the model IDs attached to it.
+func (r Reader) ProviderDescriptions() []ProviderDescription {
+	providers := r.Providers()
+	modelsByProvider := map[string][]string{}
+	for _, model := range r.Models() {
+		modelsByProvider[model.Provider] = append(modelsByProvider[model.Provider], model.ID)
+	}
+
+	descriptions := make([]ProviderDescription, 0, len(providers))
+	for _, provider := range providers {
+		models := append([]string{}, modelsByProvider[provider.ID]...)
+		sort.Strings(models)
+		descriptions = append(descriptions, ProviderDescription{
+			ID:         provider.ID,
+			Kind:       provider.Kind,
+			Endpoint:   provider.Endpoint,
+			AuthType:   effectiveProviderAuthType(provider.AuthType),
+			PathPrefix: provider.PathPrefix,
+			ModelIDs:   models,
+			Extra:      provider.Extra,
+		})
+	}
+	return descriptions
 }
 
 // ResolveMCPServer returns catalog metadata for one MCP server ID.
@@ -2026,6 +2068,13 @@ func parseStringMap(value string) map[string]string {
 		return nil
 	}
 	return out
+}
+
+func effectiveProviderAuthType(authType string) string {
+	if authType == "" {
+		return "bearer"
+	}
+	return authType
 }
 
 // writeStrings writes the shared string table as count, data length, offsets,

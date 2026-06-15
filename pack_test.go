@@ -387,6 +387,75 @@ func TestReaderProviders(t *testing.T) {
 	}
 }
 
+func TestReaderProviderDescriptions(t *testing.T) {
+	input := testPackInput(1, 1)
+	input.Providers = append(input.Providers,
+		Provider{
+			ID:        "anthropic",
+			Kind:      "anthropic",
+			Endpoint:  "https://api.anthropic.com",
+			AuthType:  "anthropic",
+			SecretRef: "env://ANTHROPIC_API_KEY",
+			Extra: map[string]string{
+				"anthropic_version": "2023-06-01",
+			},
+		},
+		Provider{
+			ID:       "bedrock",
+			Kind:     "openai",
+			Endpoint: "https://bedrock-runtime.us-east-1.amazonaws.com",
+			AuthType: "aws",
+			Extra: map[string]string{
+				"aws_region": "us-east-1",
+			},
+		},
+		Provider{
+			ID:       "gemini",
+			Kind:     "openai",
+			Endpoint: "https://generativelanguage.googleapis.com",
+			AuthType: "gemini",
+		},
+		Provider{
+			ID:       "vertex_anthropic",
+			Kind:     "anthropic",
+			Endpoint: "https://us-east5-aiplatform.googleapis.com",
+			AuthType: "gcp",
+			Extra: map[string]string{
+				"anthropic_version": "vertex-2023-10-16",
+				"gcp_location":      "us-east5",
+			},
+		},
+	)
+	input.Models = append(input.Models,
+		Model{ID: "claude-haiku-4-5", Provider: "anthropic", Name: "claude-haiku-4-5-20251001", Mode: "chat"},
+		Model{ID: "amazon.nova-lite-v1:0", Provider: "bedrock", Name: "amazon.nova-lite-v1:0", Mode: "chat"},
+		Model{ID: "gemini-2.5-flash", Provider: "gemini", Name: "gemini-2.5-flash", Mode: "chat"},
+		Model{ID: "vertex/claude-opus-4", Provider: "vertex_anthropic", Name: "claude-opus-4@20250514", Mode: "chat"},
+	)
+
+	blob, err := Build(input)
+	require.NoError(t, err)
+	reader, err := Open(blob)
+	require.NoError(t, err)
+
+	descriptions := reader.ProviderDescriptions()
+	require.Len(t, descriptions, 5)
+	byID := map[string]ProviderDescription{}
+	for _, description := range descriptions {
+		byID[description.ID] = description
+	}
+
+	assert.Equal(t, "bearer", byID["openai"].AuthType)
+	assert.Equal(t, []string{"gpt-4o-mini"}, byID["openai"].ModelIDs)
+	assert.Equal(t, "anthropic", byID["anthropic"].AuthType)
+	assert.Equal(t, []string{"claude-haiku-4-5"}, byID["anthropic"].ModelIDs)
+	assert.Equal(t, "aws", byID["bedrock"].AuthType)
+	assert.Equal(t, "us-east-1", byID["bedrock"].Extra["aws_region"])
+	assert.Equal(t, "gemini", byID["gemini"].AuthType)
+	assert.Equal(t, "gcp", byID["vertex_anthropic"].AuthType)
+	assert.Equal(t, "us-east5", byID["vertex_anthropic"].Extra["gcp_location"])
+}
+
 // TestProviderPathPrefixRoundTrip guards against the pre-intern bug where a
 // non-empty PathPrefix or AuthType that appears only in a provider record would
 // be written with an ID beyond the frozen string table, making it unreadable.

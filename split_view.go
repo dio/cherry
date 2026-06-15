@@ -203,6 +203,11 @@ func (v SplitView) Providers() []ProviderInfo {
 	return v.llm.Providers()
 }
 
+// ProviderDescriptions returns provider descriptions from the LLM reader.
+func (v SplitView) ProviderDescriptions() []ProviderDescription {
+	return v.llm.ProviderDescriptions()
+}
+
 // ResolveModel returns model catalog metadata from the LLM reader.
 func (v SplitView) ResolveModel(modelID string) (ModelInfo, bool) {
 	return v.llm.ResolveModel(modelID)
@@ -607,6 +612,12 @@ func (v LayeredSplitView) ResolveProvider(providerID string) (ProviderInfo, bool
 // Providers returns provider catalog metadata from the generic LLM reader.
 func (v LayeredSplitView) Providers() []ProviderInfo {
 	return v.llmGeneric.Providers()
+}
+
+// ProviderDescriptions returns provider descriptions from the generic LLM
+// reader.
+func (v LayeredSplitView) ProviderDescriptions() []ProviderDescription {
+	return v.llmGeneric.ProviderDescriptions()
 }
 
 // ResolveModel returns model catalog metadata from the generic LLM reader.

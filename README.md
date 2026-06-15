@@ -320,6 +320,7 @@ Model catalog and MCP server queries are available from the same loaded bundle:
 model, ok := reader.ResolveModel("gpt-4o-mini")
 supportsImages := reader.ModelCapability("gpt-5", "image_generation")
 providers := reader.Providers()
+providerDescriptions := reader.ProviderDescriptions()
 provider, ok := reader.ResolveProvider("openai")
 modelsJSON, err := reader.V1ModelsJSON()
 openAIModelsJSON, err := reader.V1ModelsJSONForProvider("openai")
@@ -333,6 +334,15 @@ preserving pricing and capability-derived fields from the normalized metadata.
 The example directory includes fixture loaders for seed-style model/provider
 catalogs and MCP catalogs. Those loaders are example producer code, not root
 package schema contracts.
+
+Provider source schemas should be normalized before calling `Build`. For
+example, a source provider with nested `auth.type`, `auth.secret_ref`, and
+provider-specific `extra` fields maps to `Provider.AuthType`,
+`Provider.SecretRef`, and `Provider.Extra`. Cherry stores auth types as open
+strings so bundles can describe providers such as `bearer`, `anthropic`,
+`gemini`, `gcp`, and `aws` without hard-coding a provider registry in the root
+package. `ProviderDescriptions` lists all packed providers, their effective auth
+types, and the model IDs attached to each provider.
 
 ## Boundary
 

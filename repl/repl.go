@@ -48,7 +48,7 @@ type Backend interface {
 	LLMPrincipals(ctx context.Context, scope string) ([]cherry.PrincipalInfo, error)
 	ResolveLLMPlan(ctx context.Context, scope string, principalSlug string, modelID string) (cherry.LLMPlan, bool, error)
 
-	Providers(ctx context.Context) ([]cherry.ProviderInfo, error)
+	ProviderDescriptions(ctx context.Context) ([]cherry.ProviderDescription, error)
 	Models(ctx context.Context) ([]cherry.ModelInfo, error)
 	ResolveModel(ctx context.Context, modelID string) (cherry.ModelInfo, bool, error)
 	ModelCapability(ctx context.Context, modelID string, capability string) (bool, error)
@@ -408,7 +408,7 @@ func (s *Session) llmProviders(ctx context.Context, fields []string) (Result, er
 	if len(fields) != 2 {
 		return s.result("usage: llm providers\n", nil), nil
 	}
-	providers, err := s.backend.Providers(ctx)
+	providers, err := s.backend.ProviderDescriptions(ctx)
 	if err != nil {
 		return Result{}, err
 	}
@@ -910,8 +910,8 @@ func (b LocalBackend) ResolveLLMPlan(_ context.Context, scope string, principalS
 	return plan, ok, nil
 }
 
-func (b LocalBackend) Providers(context.Context) ([]cherry.ProviderInfo, error) {
-	return b.opened.Reader.Providers(), nil
+func (b LocalBackend) ProviderDescriptions(context.Context) ([]cherry.ProviderDescription, error) {
+	return b.opened.Reader.ProviderDescriptions(), nil
 }
 
 func (b LocalBackend) Models(context.Context) ([]cherry.ModelInfo, error) {

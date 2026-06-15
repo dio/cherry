@@ -1722,7 +1722,7 @@ func (s *replSession) llmProviders(fields []string) {
 		fmt.Println("usage: llm providers")
 		return
 	}
-	printYAML(s.pack.Reader.Providers())
+	printYAML(s.pack.Reader.ProviderDescriptions())
 }
 
 func (s *replSession) llmModels(fields []string) {
