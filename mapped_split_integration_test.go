@@ -580,6 +580,7 @@ func materializeTestLLM(reader Reader, principalSlug string, ids LLMIDs) LLMResu
 		PrincipalSlug: principalSlug,
 		Provider:      reader.String(ids.ProviderSID),
 		ProviderKind:  reader.String(ids.KindSID),
+		BackendSchema: reader.String(ids.BackendSchemaSID),
 		Endpoint:      reader.String(ids.EndpointSID),
 		Model:         reader.String(ids.ModelSID),
 		ModelName:     reader.String(ids.ModelNameSID),
@@ -709,10 +710,11 @@ func testMappedSplitInput(keyASecret string) Input {
 	return Input{
 		Providers: []Provider{
 			{
-				ID:        "openai",
-				Kind:      "openai",
-				Endpoint:  "https://api.openai.com",
-				SecretRef: "env://OPENAI_PLATFORM",
+				ID:            "openai",
+				Kind:          "openai",
+				BackendSchema: "openai",
+				Endpoint:      "https://api.openai.com",
+				SecretRef:     "env://OPENAI_PLATFORM",
 			},
 		},
 		Models: []Model{

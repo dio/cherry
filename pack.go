@@ -28,7 +28,7 @@ import (
 
 const (
 	magic              = "OPK1"
-	currentPackVersion = uint32(9)
+	currentPackVersion = uint32(10)
 	headerSize         = 64
 
 	// Header layout:
@@ -63,7 +63,7 @@ const (
 	principalLen      = 32 // hash64(slug + "\x00" + requestedModel), slugSID, routeID, rateID, requestedModelID, credentialCount, credentialOffset
 	credentialLen     = 8  // target ordinal, secretSID
 	modelLen          = 44 // hash64, idSID, providerID, nameSID, modeSID, capabilitiesSID, modalitiesSID, additionalPriceSID, limitsSID, metadataSID
-	providerLen       = 28 // idSID, kindSID, endpointSID, secretSID, authTypeSID, pathPrefixSID, extraSID
+	providerLen       = 32 // idSID, kindSID, backendSchemaSID, endpointSID, secretSID, authTypeSID, pathPrefixSID, extraSID
 	routeLen          = 24 // kind, target fields or child count/offset/retry fields
 	routeChildLen     = 8  // weight, childRouteID; weight is zero for chain children
 	rateLen           = 16 // usdCents, rpm, onExceedSID
@@ -96,18 +96,25 @@ const (
 )
 
 // Provider describes an upstream LLM provider available to compiled LLM routes.
+// BackendSchema is required and identifies the request/response adapter schema
+// an enforcement point should use for this provider, such as "openai",
+// "anthropic", "gcpvertexai", "gcpanthropic", or "awsbedrock". Kind is the
+// higher-level provider family, while BackendSchema may select a more specific
+// compatibility or hosting backend within that family.
+//
 // SecretRef is a reference to secret material, not the secret material itself.
 // AuthType identifies the credential scheme used to authenticate requests to
 // this provider (e.g. "bearer"). Empty string is treated as "bearer" by
 // enforcement points for backwards compatibility.
 type Provider struct {
-	ID         string
-	Kind       string
-	Endpoint   string
-	SecretRef  string
-	AuthType   string
-	PathPrefix string
-	Extra      map[string]string
+	ID            string
+	Kind          string
+	BackendSchema string
+	Endpoint      string
+	SecretRef     string
+	AuthType      string
+	PathPrefix    string
+	Extra         map[string]string
 }
 
 // Model describes a logical model name accepted by enforcement requests.
@@ -285,18 +292,19 @@ type Reader struct {
 // into the pack tables and string table. Callers that only need to dispatch to an
 // already-interned provider/model can avoid materializing strings entirely.
 type LLMIDs struct {
-	PrincipalSID uint32
-	ProviderID   uint32
-	ProviderSID  uint32
-	KindSID      uint32
-	EndpointSID  uint32
-	ModelID      uint32
-	ModelSID     uint32
-	ModelNameSID uint32
-	SecretSID    uint32
-	RouteID      uint32
-	RateID       uint32
-	Rate         RatePolicyIDs
+	PrincipalSID     uint32
+	ProviderID       uint32
+	ProviderSID      uint32
+	KindSID          uint32
+	BackendSchemaSID uint32
+	EndpointSID      uint32
+	ModelID          uint32
+	ModelSID         uint32
+	ModelNameSID     uint32
+	SecretSID        uint32
+	RouteID          uint32
+	RateID           uint32
+	Rate             RatePolicyIDs
 }
 
 type RatePolicyIDs struct {
@@ -316,19 +324,20 @@ type LLMRouteChildIDs struct {
 // is the preferred data-path API when the enforcement point needs fallback or
 // weighted split behavior without string materialization.
 type LLMRoutePlanIDs struct {
-	RouteID         uint32
-	Kind            RouteKind
-	ProviderID      uint32
-	ProviderSID     uint32
-	KindSID         uint32
-	EndpointSID     uint32
-	ModelID         uint32
-	ModelSID        uint32
-	ModelNameSID    uint32
-	SecretSID       uint32
-	RetryOnSID      uint32
-	PerTryTimeoutMS uint32
-	Children        []LLMRouteChildIDs
+	RouteID          uint32
+	Kind             RouteKind
+	ProviderID       uint32
+	ProviderSID      uint32
+	KindSID          uint32
+	BackendSchemaSID uint32
+	EndpointSID      uint32
+	ModelID          uint32
+	ModelSID         uint32
+	ModelNameSID     uint32
+	SecretSID        uint32
+	RetryOnSID       uint32
+	PerTryTimeoutMS  uint32
+	Children         []LLMRouteChildIDs
 }
 
 // LLMPlanIDs is the complete ID-returning result for an LLM lookup, including
@@ -350,6 +359,7 @@ type LLMResult struct {
 	PrincipalSlug string
 	Provider      string
 	ProviderKind  string
+	BackendSchema string
 	Endpoint      string
 	Model         string
 	ModelName     string
@@ -371,6 +381,7 @@ type LLMRoutePlan struct {
 	Kind            RouteKind
 	Provider        string
 	ProviderKind    string
+	BackendSchema   string
 	Endpoint        string
 	Model           string
 	ModelName       string
@@ -391,13 +402,14 @@ type LLMPlan struct {
 // ProviderInfo is the string-materialized metadata for one provider stored in
 // the pack. It is intended for diagnostics and EP setup inspection.
 type ProviderInfo struct {
-	ID         string
-	Kind       string
-	Endpoint   string
-	SecretRef  string
-	AuthType   string
-	PathPrefix string
-	Extra      map[string]string
+	ID            string
+	Kind          string
+	BackendSchema string
+	Endpoint      string
+	SecretRef     string
+	AuthType      string
+	PathPrefix    string
+	Extra         map[string]string
 }
 
 // ProviderDescription describes one provider available from the loaded bundle.
@@ -407,13 +419,14 @@ type ProviderInfo struct {
 // AuthType is the effective provider auth scheme. An empty provider AuthType is
 // reported as "bearer" for backwards compatibility with enforcement points.
 type ProviderDescription struct {
-	ID         string
-	Kind       string
-	Endpoint   string
-	AuthType   string
-	PathPrefix string
-	ModelIDs   []string
-	Extra      map[string]string
+	ID            string
+	Kind          string
+	BackendSchema string
+	Endpoint      string
+	AuthType      string
+	PathPrefix    string
+	ModelIDs      []string
+	Extra         map[string]string
 }
 
 // ModelInfo is the string-materialized metadata for one model stored in the
@@ -595,9 +608,13 @@ func Build(input Input) ([]byte, error) {
 
 	providers := sortedProviders(input.Providers)
 	for i, provider := range providers {
+		if strings.TrimSpace(provider.BackendSchema) == "" {
+			return nil, fmt.Errorf("provider %q backend schema is required", provider.ID)
+		}
 		providerIDs[provider.ID] = uint32(i)
 		builder.stringID(provider.ID)
 		builder.stringID(provider.Kind)
+		builder.stringID(provider.BackendSchema)
 		builder.stringID(provider.Endpoint)
 		builder.stringID(provider.SecretRef)
 		builder.stringID(provider.AuthType)
@@ -903,18 +920,19 @@ func (r Reader) ResolveLLMIDs(scopeID string, principalSlug string, modelID stri
 		return LLMIDs{}, false
 	}
 	return LLMIDs{
-		PrincipalSID: plan.PrincipalSID,
-		ProviderID:   target.ProviderID,
-		ProviderSID:  target.ProviderSID,
-		KindSID:      target.KindSID,
-		EndpointSID:  target.EndpointSID,
-		ModelID:      target.ModelID,
-		ModelSID:     target.ModelSID,
-		ModelNameSID: target.ModelNameSID,
-		SecretSID:    target.SecretSID,
-		RouteID:      target.RouteID,
-		RateID:       plan.RateID,
-		Rate:         plan.Rate,
+		PrincipalSID:     plan.PrincipalSID,
+		ProviderID:       target.ProviderID,
+		ProviderSID:      target.ProviderSID,
+		KindSID:          target.KindSID,
+		BackendSchemaSID: target.BackendSchemaSID,
+		EndpointSID:      target.EndpointSID,
+		ModelID:          target.ModelID,
+		ModelSID:         target.ModelSID,
+		ModelNameSID:     target.ModelNameSID,
+		SecretSID:        target.SecretSID,
+		RouteID:          target.RouteID,
+		RateID:           plan.RateID,
+		Rate:             plan.Rate,
 	}, true
 }
 
@@ -930,6 +948,7 @@ func (r Reader) ResolveLLM(scopeID string, principalSlug string, modelID string)
 		PrincipalSlug: principalSlug,
 		Provider:      r.String(ids.ProviderSID),
 		ProviderKind:  r.String(ids.KindSID),
+		BackendSchema: r.String(ids.BackendSchemaSID),
 		Endpoint:      r.String(ids.EndpointSID),
 		Model:         r.String(ids.ModelSID),
 		ModelName:     r.String(ids.ModelNameSID),
@@ -1002,13 +1021,14 @@ func (r Reader) ProviderDescriptions() []ProviderDescription {
 		models := append([]string{}, modelsByProvider[provider.ID]...)
 		sort.Strings(models)
 		descriptions = append(descriptions, ProviderDescription{
-			ID:         provider.ID,
-			Kind:       provider.Kind,
-			Endpoint:   provider.Endpoint,
-			AuthType:   effectiveProviderAuthType(provider.AuthType),
-			PathPrefix: provider.PathPrefix,
-			ModelIDs:   models,
-			Extra:      provider.Extra,
+			ID:            provider.ID,
+			Kind:          provider.Kind,
+			BackendSchema: provider.BackendSchema,
+			Endpoint:      provider.Endpoint,
+			AuthType:      effectiveProviderAuthType(provider.AuthType),
+			PathPrefix:    provider.PathPrefix,
+			ModelIDs:      models,
+			Extra:         provider.Extra,
 		})
 	}
 	return descriptions
@@ -1269,13 +1289,14 @@ func (r Reader) ScopeIDs() []string {
 func (r Reader) providerInfo(id uint32) ProviderInfo {
 	provider := r.provider(id)
 	return ProviderInfo{
-		ID:         r.String(provider.idSID),
-		Kind:       r.String(provider.kindSID),
-		Endpoint:   r.String(provider.endpointSID),
-		SecretRef:  r.String(provider.secretSID),
-		AuthType:   r.String(provider.authTypeSID),
-		PathPrefix: r.String(provider.pathPrefixSID),
-		Extra:      parseStringMap(r.String(provider.extraSID)),
+		ID:            r.String(provider.idSID),
+		Kind:          r.String(provider.kindSID),
+		BackendSchema: r.String(provider.backendSchemaSID),
+		Endpoint:      r.String(provider.endpointSID),
+		SecretRef:     r.String(provider.secretSID),
+		AuthType:      r.String(provider.authTypeSID),
+		PathPrefix:    r.String(provider.pathPrefixSID),
+		Extra:         parseStringMap(r.String(provider.extraSID)),
 	}
 }
 
@@ -2105,6 +2126,7 @@ func writeProviders(out *bytes.Buffer, b *builder, providers []Provider) {
 	for _, provider := range providers {
 		putU32(out, b.stringID(provider.ID))
 		putU32(out, b.stringID(provider.Kind))
+		putU32(out, b.stringID(provider.BackendSchema))
 		putU32(out, b.stringID(provider.Endpoint))
 		putU32(out, b.stringID(provider.SecretRef))
 		putU32(out, b.stringID(provider.AuthType))
@@ -2402,13 +2424,14 @@ type modelRef struct {
 }
 
 type providerRef struct {
-	idSID         uint32
-	kindSID       uint32
-	endpointSID   uint32
-	secretSID     uint32
-	authTypeSID   uint32
-	pathPrefixSID uint32
-	extraSID      uint32
+	idSID            uint32
+	kindSID          uint32
+	backendSchemaSID uint32
+	endpointSID      uint32
+	secretSID        uint32
+	authTypeSID      uint32
+	pathPrefixSID    uint32
+	extraSID         uint32
 }
 
 type routeRef struct {
@@ -2702,13 +2725,14 @@ func (r Reader) model(id uint32) modelRef {
 func (r Reader) provider(id uint32) providerRef {
 	base := int(r.providersOff) + 4 + int(id)*providerLen
 	return providerRef{
-		idSID:         r.read32(base),
-		kindSID:       r.read32(base + 4),
-		endpointSID:   r.read32(base + 8),
-		secretSID:     r.read32(base + 12),
-		authTypeSID:   r.read32(base + 16),
-		pathPrefixSID: r.read32(base + 20),
-		extraSID:      r.read32(base + 24),
+		idSID:            r.read32(base),
+		kindSID:          r.read32(base + 4),
+		backendSchemaSID: r.read32(base + 8),
+		endpointSID:      r.read32(base + 12),
+		secretSID:        r.read32(base + 16),
+		authTypeSID:      r.read32(base + 20),
+		pathPrefixSID:    r.read32(base + 24),
+		extraSID:         r.read32(base + 28),
 	}
 }
 
@@ -2757,16 +2781,17 @@ func (r Reader) routePlanIDs(routeID uint32, principal principalRef, targetOrdin
 			secretSID = provider.secretSID
 		}
 		return LLMRoutePlanIDs{
-			RouteID:      routeID,
-			Kind:         RouteKindTarget,
-			ProviderID:   route.providerID,
-			ProviderSID:  provider.idSID,
-			KindSID:      provider.kindSID,
-			EndpointSID:  provider.endpointSID,
-			ModelID:      route.modelID,
-			ModelSID:     model.idSID,
-			ModelNameSID: model.nameSID,
-			SecretSID:    secretSID,
+			RouteID:          routeID,
+			Kind:             RouteKindTarget,
+			ProviderID:       route.providerID,
+			ProviderSID:      provider.idSID,
+			KindSID:          provider.kindSID,
+			BackendSchemaSID: provider.backendSchemaSID,
+			EndpointSID:      provider.endpointSID,
+			ModelID:          route.modelID,
+			ModelSID:         model.idSID,
+			ModelNameSID:     model.nameSID,
+			SecretSID:        secretSID,
 		}, true
 	case routeKindChainID:
 		children, ok := r.routeChildren(route, principal, targetOrdinal)
@@ -2857,6 +2882,7 @@ func (r Reader) materializeLLMRoutePlan(plan LLMRoutePlanIDs) LLMRoutePlan {
 	if plan.Kind == RouteKindTarget {
 		out.Provider = r.String(plan.ProviderSID)
 		out.ProviderKind = r.String(plan.KindSID)
+		out.BackendSchema = r.String(plan.BackendSchemaSID)
 		out.Endpoint = r.String(plan.EndpointSID)
 		out.Model = r.String(plan.ModelSID)
 		out.ModelName = r.String(plan.ModelNameSID)

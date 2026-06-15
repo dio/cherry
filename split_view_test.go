@@ -152,12 +152,14 @@ func TestLayeredSplitViewRoutesOverridesFallbacksAndMCPPaths(t *testing.T) {
 	override, ok := view.ResolveLLM("workspace1", "slug:key-override", "gpt-4o-mini")
 	require.True(t, ok)
 	assert.Equal(t, "slug:key-override", override.PrincipalSlug)
+	assert.Equal(t, "openai", override.BackendSchema)
 	assert.Equal(t, "env://OPENAI_KEY_OVERRIDE", override.SecretRef)
 	assert.Equal(t, uint32(30), override.Rate.RPM)
 
 	fallback, ok := view.ResolveLLM("workspace1", "slug:key-default", "gpt-4o-mini")
 	require.True(t, ok)
 	assert.Equal(t, "slug:key-default", fallback.PrincipalSlug)
+	assert.Equal(t, "openai", fallback.BackendSchema)
 	assert.Equal(t, "env://OPENAI_DEFAULT_ROUTE", fallback.SecretRef)
 	assert.Equal(t, uint32(300), fallback.Rate.RPM)
 
@@ -166,6 +168,7 @@ func TestLayeredSplitViewRoutesOverridesFallbacksAndMCPPaths(t *testing.T) {
 	assert.Equal(t, LayeredLLMSourceGeneric, fallbackIDs.Source)
 	assert.Equal(t, "slug:default", fallbackIDs.ResolvedPrincipalSlug)
 	assert.Equal(t, "openai", view.LLMString(fallbackIDs.Source, fallbackIDs.ProviderSID))
+	assert.Equal(t, "openai", view.LLMString(fallbackIDs.Source, fallbackIDs.BackendSchemaSID))
 
 	serverTool, ok := view.ResolveMCPToolIDs("workspace1", "s/github", "github__list-repos")
 	require.True(t, ok)

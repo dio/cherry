@@ -40,7 +40,7 @@ func TestReaderResolveLLMIDs(t *testing.T) {
 func TestReaderResolveLLMPlan(t *testing.T) {
 	input := testPackInput(1, 1)
 	input.Providers = append(input.Providers,
-		Provider{ID: "fallback", Kind: "openai", Endpoint: "https://fallback.example", SecretRef: "env://FALLBACK_KEY"},
+		Provider{ID: "fallback", Kind: "openai", BackendSchema: "openai", Endpoint: "https://fallback.example", SecretRef: "env://FALLBACK_KEY"},
 	)
 	input.Models = append(input.Models,
 		Model{ID: "gpt-fallback", Provider: "fallback", Name: "gpt-fallback", Mode: "chat"},
@@ -159,7 +159,7 @@ func TestReaderProviderBYOKPreferDedupesRouteShapeAndKeepsPlatformFallback(t *te
 func TestReaderShortChainRouteKeysKeepRetryAndChildOrder(t *testing.T) {
 	input := testPackInput(1, 1)
 	input.Providers = append(input.Providers,
-		Provider{ID: "fallback", Kind: "openai", Endpoint: "https://fallback.example", SecretRef: "env://FALLBACK_KEY"},
+		Provider{ID: "fallback", Kind: "openai", BackendSchema: "openai", Endpoint: "https://fallback.example", SecretRef: "env://FALLBACK_KEY"},
 	)
 	input.Models = append(input.Models,
 		Model{ID: "gpt-fallback", Provider: "fallback", Name: "gpt-fallback", Mode: "chat"},
@@ -232,7 +232,7 @@ func TestReaderShortChainRouteKeysKeepRetryAndChildOrder(t *testing.T) {
 func TestReaderCredentialSlotOverflowPreservesSplitSecrets(t *testing.T) {
 	input := testPackInput(1, 1)
 	input.Providers = append(input.Providers,
-		Provider{ID: "fallback", Kind: "openai", Endpoint: "https://fallback.example", SecretRef: "env://FALLBACK_KEY"},
+		Provider{ID: "fallback", Kind: "openai", BackendSchema: "openai", Endpoint: "https://fallback.example", SecretRef: "env://FALLBACK_KEY"},
 	)
 	input.Models = append(input.Models,
 		Model{ID: "gpt-fallback", Provider: "fallback", Name: "gpt-fallback", Mode: "chat"},
@@ -387,39 +387,51 @@ func TestReaderProviders(t *testing.T) {
 	}
 }
 
+func TestBuildRejectsProviderWithoutBackendSchema(t *testing.T) {
+	input := testPackInput(1, 1)
+	input.Providers[0].BackendSchema = ""
+
+	_, err := Build(input)
+	require.ErrorContains(t, err, `provider "openai" backend schema is required`)
+}
+
 func TestReaderProviderDescriptions(t *testing.T) {
 	input := testPackInput(1, 1)
 	input.Providers = append(input.Providers,
 		Provider{
-			ID:        "anthropic",
-			Kind:      "anthropic",
-			Endpoint:  "https://api.anthropic.com",
-			AuthType:  "anthropic",
-			SecretRef: "env://ANTHROPIC_API_KEY",
+			ID:            "anthropic",
+			Kind:          "anthropic",
+			BackendSchema: "anthropic",
+			Endpoint:      "https://api.anthropic.com",
+			AuthType:      "anthropic",
+			SecretRef:     "env://ANTHROPIC_API_KEY",
 			Extra: map[string]string{
 				"anthropic_version": "2023-06-01",
 			},
 		},
 		Provider{
-			ID:       "bedrock",
-			Kind:     "openai",
-			Endpoint: "https://bedrock-runtime.us-east-1.amazonaws.com",
-			AuthType: "aws",
+			ID:            "bedrock",
+			Kind:          "openai",
+			BackendSchema: "awsbedrock",
+			Endpoint:      "https://bedrock-runtime.us-east-1.amazonaws.com",
+			AuthType:      "aws",
 			Extra: map[string]string{
 				"aws_region": "us-east-1",
 			},
 		},
 		Provider{
-			ID:       "gemini",
-			Kind:     "openai",
-			Endpoint: "https://generativelanguage.googleapis.com",
-			AuthType: "gemini",
+			ID:            "gemini",
+			Kind:          "openai",
+			BackendSchema: "gcpvertexai",
+			Endpoint:      "https://generativelanguage.googleapis.com",
+			AuthType:      "gemini",
 		},
 		Provider{
-			ID:       "vertex_anthropic",
-			Kind:     "anthropic",
-			Endpoint: "https://us-east5-aiplatform.googleapis.com",
-			AuthType: "gcp",
+			ID:            "vertex_anthropic",
+			Kind:          "anthropic",
+			BackendSchema: "gcpanthropic",
+			Endpoint:      "https://us-east5-aiplatform.googleapis.com",
+			AuthType:      "gcp",
 			Extra: map[string]string{
 				"anthropic_version": "vertex-2023-10-16",
 				"gcp_location":      "us-east5",
@@ -450,9 +462,15 @@ func TestReaderProviderDescriptions(t *testing.T) {
 	assert.Equal(t, "anthropic", byID["anthropic"].AuthType)
 	assert.Equal(t, []string{"claude-haiku-4-5"}, byID["anthropic"].ModelIDs)
 	assert.Equal(t, "aws", byID["bedrock"].AuthType)
+	assert.Equal(t, "openai", byID["bedrock"].Kind)
+	assert.Equal(t, "awsbedrock", byID["bedrock"].BackendSchema)
 	assert.Equal(t, "us-east-1", byID["bedrock"].Extra["aws_region"])
 	assert.Equal(t, "gemini", byID["gemini"].AuthType)
+	assert.Equal(t, "openai", byID["gemini"].Kind)
+	assert.Equal(t, "gcpvertexai", byID["gemini"].BackendSchema)
 	assert.Equal(t, "gcp", byID["vertex_anthropic"].AuthType)
+	assert.Equal(t, "anthropic", byID["vertex_anthropic"].Kind)
+	assert.Equal(t, "gcpanthropic", byID["vertex_anthropic"].BackendSchema)
 	assert.Equal(t, "us-east5", byID["vertex_anthropic"].Extra["gcp_location"])
 }
 
@@ -464,12 +482,13 @@ func TestProviderPathPrefixRoundTrip(t *testing.T) {
 	// Inject a provider whose PathPrefix and AuthType are unique strings that
 	// would be missed by the pre-intern loop if it didn't include them.
 	input.Providers = append(input.Providers, Provider{
-		ID:         "custom",
-		Kind:       "openai",
-		Endpoint:   "https://custom.example.com",
-		SecretRef:  "env://CUSTOM_KEY",
-		AuthType:   "custom-auth",
-		PathPrefix: "/api/v2",
+		ID:            "custom",
+		Kind:          "openai",
+		BackendSchema: "openai",
+		Endpoint:      "https://custom.example.com",
+		SecretRef:     "env://CUSTOM_KEY",
+		AuthType:      "custom-auth",
+		PathPrefix:    "/api/v2",
 	})
 	// Add a model to satisfy the scope route requirements.
 	input.Models = append(input.Models, Model{
@@ -978,7 +997,7 @@ func TestReaderResolveLLMManyScopes(t *testing.T) {
 
 func testPackInput(scopeCount int, principalsPerScope int) Input {
 	providers := []Provider{
-		{ID: "openai", Kind: "openai", Endpoint: "https://api.openai.com", SecretRef: "env://OPENAI_API_KEY"},
+		{ID: "openai", Kind: "openai", BackendSchema: "openai", Endpoint: "https://api.openai.com", SecretRef: "env://OPENAI_API_KEY"},
 	}
 	models := []Model{
 		{

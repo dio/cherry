@@ -298,6 +298,7 @@ type Model = cherry.Model
 type Provider struct {
 	ID                string                     `yaml:"id"`
 	Kind              string                     `yaml:"kind"`
+	BackendSchema     string                     `yaml:"backend_schema"`
 	Endpoint          string                     `yaml:"endpoint"`
 	SecretRef         string                     `yaml:"secret_ref"`
 	AuthType          string                     `yaml:"auth_type"`
@@ -520,6 +521,9 @@ func MergeProviders(base []Provider, overlay []Provider) []Provider {
 func mergeProvider(base Provider, overlay Provider) Provider {
 	if overlay.Kind != "" {
 		base.Kind = overlay.Kind
+	}
+	if overlay.BackendSchema != "" {
+		base.BackendSchema = overlay.BackendSchema
 	}
 	if overlay.Endpoint != "" {
 		base.Endpoint = overlay.Endpoint

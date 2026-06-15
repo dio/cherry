@@ -1296,6 +1296,7 @@ func materializeExampleLLM(reader cherry.Reader, principalSlug string, ids cherr
 		PrincipalSlug: principalSlug,
 		Provider:      reader.String(ids.ProviderSID),
 		ProviderKind:  reader.String(ids.KindSID),
+		BackendSchema: reader.String(ids.BackendSchemaSID),
 		Endpoint:      reader.String(ids.EndpointSID),
 		Model:         reader.String(ids.ModelSID),
 		ModelName:     reader.String(ids.ModelNameSID),
@@ -2276,7 +2277,7 @@ func runStressPack(args []string) error {
 }
 
 func buildStressInput(scopeCount int, principalsPerScope int) cherry.Input {
-	providers := []cherry.Provider{{ID: "openai", Kind: "openai", Endpoint: "https://api.openai.com", SecretRef: "env://OPENAI_API_KEY"}}
+	providers := []cherry.Provider{{ID: "openai", Kind: "openai", BackendSchema: "openai", Endpoint: "https://api.openai.com", SecretRef: "env://OPENAI_API_KEY"}}
 	models := []cherry.Model{{ID: "gpt-4o-mini", Provider: "openai", Name: "gpt-4o-mini"}}
 	mcpServers := []cherry.MCPServer{{ID: "github", Endpoint: "https://api.github.com"}, {ID: "kiwi", Endpoint: "https://mcp.kiwi.com"}}
 	scopes := make([]cherry.Scope, 0, scopeCount)

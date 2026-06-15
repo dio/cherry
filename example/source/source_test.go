@@ -78,8 +78,8 @@ func TestLoadMCPCatalogJSONWithoutToolsShape(t *testing.T) {
 
 func TestMergeProvidersPreservesSecretRefs(t *testing.T) {
 	got := MergeProviders(
-		[]Provider{{ID: "openai", Kind: "openai", SecretRef: "env://OPENAI_API_KEY", AuthType: "bearer"}},
-		[]Provider{{ID: "openai", Kind: "openai", Endpoint: "https://api.openai.com", AuthType: "api_key"}},
+		[]Provider{{ID: "openai", Kind: "openai", BackendSchema: "openai", SecretRef: "env://OPENAI_API_KEY", AuthType: "bearer"}},
+		[]Provider{{ID: "openai", Kind: "openai", BackendSchema: "openai", Endpoint: "https://api.openai.com", AuthType: "api_key"}},
 	)
 	require.Len(t, got, 1)
 	require.Equal(t, "env://OPENAI_API_KEY", got[0].SecretRef)

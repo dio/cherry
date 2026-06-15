@@ -555,11 +555,12 @@ func benchmarkProviders(count int) []Provider {
 	for i := range count {
 		providerID := benchmarkProviderID(i)
 		providers = append(providers, Provider{
-			ID:        providerID,
-			Kind:      "openai",
-			Endpoint:  "https://" + providerID + ".example.com",
-			SecretRef: "env://PROVIDER_" + itoa(i),
-			AuthType:  "bearer",
+			ID:            providerID,
+			Kind:          "openai",
+			BackendSchema: "openai",
+			Endpoint:      "https://" + providerID + ".example.com",
+			SecretRef:     "env://PROVIDER_" + itoa(i),
+			AuthType:      "bearer",
 		})
 	}
 	return providers

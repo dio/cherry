@@ -70,11 +70,12 @@ func openTestBundle(t *testing.T) cherry.OpenedBundle {
 	input := cherry.Input{
 		Providers: []cherry.Provider{
 			{
-				ID:        "openai",
-				Kind:      "openai",
-				Endpoint:  "https://api.openai.example",
-				SecretRef: "env://OPENAI_API_KEY",
-				AuthType:  "bearer",
+				ID:            "openai",
+				Kind:          "openai",
+				BackendSchema: "openai",
+				Endpoint:      "https://api.openai.example",
+				SecretRef:     "env://OPENAI_API_KEY",
+				AuthType:      "bearer",
 			},
 		},
 		Models: []cherry.Model{
