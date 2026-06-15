@@ -28,7 +28,7 @@ import (
 
 const (
 	magic              = "OPK1"
-	currentPackVersion = uint32(8)
+	currentPackVersion = uint32(9)
 	headerSize         = 64
 
 	// Header layout:
@@ -63,7 +63,7 @@ const (
 	principalLen      = 32 // hash64(slug + "\x00" + requestedModel), slugSID, routeID, rateID, requestedModelID, credentialCount, credentialOffset
 	credentialLen     = 8  // target ordinal, secretSID
 	modelLen          = 44 // hash64, idSID, providerID, nameSID, modeSID, capabilitiesSID, modalitiesSID, additionalPriceSID, limitsSID, metadataSID
-	providerLen       = 24 // idSID, kindSID, endpointSID, secretSID, authTypeSID, pathPrefixSID
+	providerLen       = 28 // idSID, kindSID, endpointSID, secretSID, authTypeSID, pathPrefixSID, extraSID
 	routeLen          = 24 // kind, target fields or child count/offset/retry fields
 	routeChildLen     = 8  // weight, childRouteID; weight is zero for chain children
 	rateLen           = 16 // usdCents, rpm, onExceedSID
@@ -107,6 +107,7 @@ type Provider struct {
 	SecretRef  string
 	AuthType   string
 	PathPrefix string
+	Extra      map[string]string
 }
 
 // Model describes a logical model name accepted by enforcement requests.
@@ -396,6 +397,7 @@ type ProviderInfo struct {
 	SecretRef  string
 	AuthType   string
 	PathPrefix string
+	Extra      map[string]string
 }
 
 // ModelInfo is the string-materialized metadata for one model stored in the
@@ -584,6 +586,7 @@ func Build(input Input) ([]byte, error) {
 		builder.stringID(provider.SecretRef)
 		builder.stringID(provider.AuthType)
 		builder.stringID(provider.PathPrefix)
+		builder.stringID(stringMapJSON(provider.Extra))
 	}
 
 	models := sortedModels(input.Models)
@@ -1230,6 +1233,7 @@ func (r Reader) providerInfo(id uint32) ProviderInfo {
 		SecretRef:  r.String(provider.secretSID),
 		AuthType:   r.String(provider.authTypeSID),
 		PathPrefix: r.String(provider.pathPrefixSID),
+		Extra:      parseStringMap(r.String(provider.extraSID)),
 	}
 }
 
@@ -2002,6 +2006,28 @@ func splitOAuthScopes(value string) []string {
 	return strings.Split(value, "\x00")
 }
 
+func stringMapJSON(values map[string]string) string {
+	if len(values) == 0 {
+		return ""
+	}
+	data, err := json.Marshal(values)
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+func parseStringMap(value string) map[string]string {
+	if value == "" {
+		return nil
+	}
+	out := map[string]string{}
+	if err := json.Unmarshal([]byte(value), &out); err != nil {
+		return nil
+	}
+	return out
+}
+
 // writeStrings writes the shared string table as count, data length, offsets,
 // and contiguous string bytes. The offsets array has count+1 entries so string
 // length is derived from adjacent offsets.
@@ -2034,6 +2060,7 @@ func writeProviders(out *bytes.Buffer, b *builder, providers []Provider) {
 		putU32(out, b.stringID(provider.SecretRef))
 		putU32(out, b.stringID(provider.AuthType))
 		putU32(out, b.stringID(provider.PathPrefix))
+		putU32(out, b.stringID(stringMapJSON(provider.Extra)))
 	}
 }
 
@@ -2332,6 +2359,7 @@ type providerRef struct {
 	secretSID     uint32
 	authTypeSID   uint32
 	pathPrefixSID uint32
+	extraSID      uint32
 }
 
 type routeRef struct {
@@ -2631,6 +2659,7 @@ func (r Reader) provider(id uint32) providerRef {
 		secretSID:     r.read32(base + 12),
 		authTypeSID:   r.read32(base + 16),
 		pathPrefixSID: r.read32(base + 20),
+		extraSID:      r.read32(base + 24),
 	}
 }
 

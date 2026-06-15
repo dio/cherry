@@ -427,6 +427,33 @@ func TestProviderPathPrefixRoundTrip(t *testing.T) {
 	}
 }
 
+func TestProviderExtraRoundTrip(t *testing.T) {
+	input := testPackInput(1, 1)
+	input.Providers[0].Extra = map[string]string{
+		"anthropic_version": "2023-06-01",
+		"aws_region":        "us-east-1",
+	}
+
+	blob, err := Build(input)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	reader, err := Open(blob)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	info, ok := reader.ResolveProvider(input.Providers[0].ID)
+	if !ok {
+		t.Fatalf("ResolveProvider(%q) = false", input.Providers[0].ID)
+	}
+	if got := info.Extra["anthropic_version"]; got != "2023-06-01" {
+		t.Fatalf("anthropic_version = %q", got)
+	}
+	if got := info.Extra["aws_region"]; got != "us-east-1" {
+		t.Fatalf("aws_region = %q", got)
+	}
+}
+
 func TestReaderMCPServers(t *testing.T) {
 	blob, err := Build(testPackInput(1, 1))
 	if err != nil {
