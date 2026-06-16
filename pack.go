@@ -63,7 +63,7 @@ const (
 	principalLen      = 32 // hash64(slug + "\x00" + requestedModel), slugSID, routeID, rateID, requestedModelID, credentialCount, credentialOffset
 	credentialLen     = 8  // target ordinal, secretSID
 	modelLen          = 44 // hash64, idSID, providerID, nameSID, modeSID, capabilitiesSID, modalitiesSID, additionalPriceSID, limitsSID, metadataSID
-	providerLen       = 32 // idSID, kindSID, backendSchemaSID, endpointSID, secretSID, authTypeSID, pathPrefixSID, extraSID
+	providerLen       = 36 // idSID, kindSID, backendSchemaSID, endpointSID, secretSID, authTypeSID, pathPrefixSID, parentProviderSID, extraSID
 	routeLen          = 24 // kind, target fields or child count/offset/retry fields
 	routeChildLen     = 8  // weight, childRouteID; weight is zero for chain children
 	rateLen           = 16 // usdCents, rpm, onExceedSID
@@ -107,14 +107,15 @@ const (
 // this provider (e.g. "bearer"). Empty string is treated as "bearer" by
 // enforcement points for backwards compatibility.
 type Provider struct {
-	ID            string
-	Kind          string
-	BackendSchema string
-	Endpoint      string
-	SecretRef     string
-	AuthType      string
-	PathPrefix    string
-	Extra         map[string]string
+	ID               string
+	ParentProviderID string
+	Kind             string
+	BackendSchema    string
+	Endpoint         string
+	SecretRef        string
+	AuthType         string
+	PathPrefix       string
+	Extra            map[string]string
 }
 
 // Model describes a logical model name accepted by enforcement requests.
@@ -178,6 +179,7 @@ type RoutePlan struct {
 	Retry     *RetryPolicy
 	Children  []RoutePlan
 	Split     []WeightedRoutePlan
+	Metadata  map[string]string
 }
 
 // RatePolicy is immutable rate-limit metadata attached to a principal route.
@@ -292,19 +294,20 @@ type Reader struct {
 // into the pack tables and string table. Callers that only need to dispatch to an
 // already-interned provider/model can avoid materializing strings entirely.
 type LLMIDs struct {
-	PrincipalSID     uint32
-	ProviderID       uint32
-	ProviderSID      uint32
-	KindSID          uint32
-	BackendSchemaSID uint32
-	EndpointSID      uint32
-	ModelID          uint32
-	ModelSID         uint32
-	ModelNameSID     uint32
-	SecretSID        uint32
-	RouteID          uint32
-	RateID           uint32
-	Rate             RatePolicyIDs
+	PrincipalSID      uint32
+	ProviderID        uint32
+	ProviderSID       uint32
+	ParentProviderSID uint32
+	KindSID           uint32
+	BackendSchemaSID  uint32
+	EndpointSID       uint32
+	ModelID           uint32
+	ModelSID          uint32
+	ModelNameSID      uint32
+	SecretSID         uint32
+	RouteID           uint32
+	RateID            uint32
+	Rate              RatePolicyIDs
 }
 
 type RatePolicyIDs struct {
@@ -324,20 +327,22 @@ type LLMRouteChildIDs struct {
 // is the preferred data-path API when the enforcement point needs fallback or
 // weighted split behavior without string materialization.
 type LLMRoutePlanIDs struct {
-	RouteID          uint32
-	Kind             RouteKind
-	ProviderID       uint32
-	ProviderSID      uint32
-	KindSID          uint32
-	BackendSchemaSID uint32
-	EndpointSID      uint32
-	ModelID          uint32
-	ModelSID         uint32
-	ModelNameSID     uint32
-	SecretSID        uint32
-	RetryOnSID       uint32
-	PerTryTimeoutMS  uint32
-	Children         []LLMRouteChildIDs
+	RouteID           uint32
+	Kind              RouteKind
+	ProviderID        uint32
+	ProviderSID       uint32
+	ParentProviderSID uint32
+	KindSID           uint32
+	BackendSchemaSID  uint32
+	EndpointSID       uint32
+	ModelID           uint32
+	ModelSID          uint32
+	ModelNameSID      uint32
+	SecretSID         uint32
+	RetryOnSID        uint32
+	MetadataSID       uint32
+	PerTryTimeoutMS   uint32
+	Children          []LLMRouteChildIDs
 }
 
 // LLMPlanIDs is the complete ID-returning result for an LLM lookup, including
@@ -356,15 +361,16 @@ type LLMPlanIDs struct {
 // LLMResult is the string-materialized form of an LLM lookup. It is convenient
 // for tests, CLIs, and diagnostics; hot paths should prefer LLMIDs.
 type LLMResult struct {
-	PrincipalSlug string
-	Provider      string
-	ProviderKind  string
-	BackendSchema string
-	Endpoint      string
-	Model         string
-	ModelName     string
-	SecretRef     string
-	Rate          RatePolicy
+	PrincipalSlug  string
+	Provider       string
+	ParentProvider string
+	ProviderKind   string
+	BackendSchema  string
+	Endpoint       string
+	Model          string
+	ModelName      string
+	SecretRef      string
+	Rate           RatePolicy
 }
 
 // LLMRouteChild is one materialized route-plan child. Weight is zero for chain
@@ -380,6 +386,7 @@ type LLMRouteChild struct {
 type LLMRoutePlan struct {
 	Kind            RouteKind
 	Provider        string
+	ParentProvider  string
 	ProviderKind    string
 	BackendSchema   string
 	Endpoint        string
@@ -387,6 +394,7 @@ type LLMRoutePlan struct {
 	ModelName       string
 	SecretRef       string
 	RetryOn         string
+	Metadata        map[string]string
 	PerTryTimeoutMS uint32
 	Children        []LLMRouteChild
 }
@@ -402,14 +410,15 @@ type LLMPlan struct {
 // ProviderInfo is the string-materialized metadata for one provider stored in
 // the pack. It is intended for diagnostics and EP setup inspection.
 type ProviderInfo struct {
-	ID            string
-	Kind          string
-	BackendSchema string
-	Endpoint      string
-	SecretRef     string
-	AuthType      string
-	PathPrefix    string
-	Extra         map[string]string
+	ID               string
+	ParentProviderID string
+	Kind             string
+	BackendSchema    string
+	Endpoint         string
+	SecretRef        string
+	AuthType         string
+	PathPrefix       string
+	Extra            map[string]string
 }
 
 // ProviderDescription describes one provider available from the loaded bundle.
@@ -419,14 +428,16 @@ type ProviderInfo struct {
 // AuthType is the effective provider auth scheme. An empty provider AuthType is
 // reported as "bearer" for backwards compatibility with enforcement points.
 type ProviderDescription struct {
-	ID            string
-	Kind          string
-	BackendSchema string
-	Endpoint      string
-	AuthType      string
-	PathPrefix    string
-	ModelIDs      []string
-	Extra         map[string]string
+	ID               string
+	ParentProviderID string
+	Kind             string
+	BackendSchema    string
+	Endpoint         string
+	AuthSecretRef    string
+	AuthType         string
+	PathPrefix       string
+	ModelIDs         []string
+	Extra            map[string]string
 }
 
 // ModelInfo is the string-materialized metadata for one model stored in the
@@ -613,6 +624,7 @@ func Build(input Input) ([]byte, error) {
 		}
 		providerIDs[provider.ID] = uint32(i)
 		builder.stringID(provider.ID)
+		builder.stringID(provider.ParentProviderID)
 		builder.stringID(provider.Kind)
 		builder.stringID(provider.BackendSchema)
 		builder.stringID(provider.Endpoint)
@@ -920,19 +932,20 @@ func (r Reader) ResolveLLMIDs(scopeID string, principalSlug string, modelID stri
 		return LLMIDs{}, false
 	}
 	return LLMIDs{
-		PrincipalSID:     plan.PrincipalSID,
-		ProviderID:       target.ProviderID,
-		ProviderSID:      target.ProviderSID,
-		KindSID:          target.KindSID,
-		BackendSchemaSID: target.BackendSchemaSID,
-		EndpointSID:      target.EndpointSID,
-		ModelID:          target.ModelID,
-		ModelSID:         target.ModelSID,
-		ModelNameSID:     target.ModelNameSID,
-		SecretSID:        target.SecretSID,
-		RouteID:          target.RouteID,
-		RateID:           plan.RateID,
-		Rate:             plan.Rate,
+		PrincipalSID:      plan.PrincipalSID,
+		ProviderID:        target.ProviderID,
+		ProviderSID:       target.ProviderSID,
+		ParentProviderSID: target.ParentProviderSID,
+		KindSID:           target.KindSID,
+		BackendSchemaSID:  target.BackendSchemaSID,
+		EndpointSID:       target.EndpointSID,
+		ModelID:           target.ModelID,
+		ModelSID:          target.ModelSID,
+		ModelNameSID:      target.ModelNameSID,
+		SecretSID:         target.SecretSID,
+		RouteID:           target.RouteID,
+		RateID:            plan.RateID,
+		Rate:              plan.Rate,
 	}, true
 }
 
@@ -945,14 +958,15 @@ func (r Reader) ResolveLLM(scopeID string, principalSlug string, modelID string)
 		return LLMResult{}, false
 	}
 	return LLMResult{
-		PrincipalSlug: principalSlug,
-		Provider:      r.String(ids.ProviderSID),
-		ProviderKind:  r.String(ids.KindSID),
-		BackendSchema: r.String(ids.BackendSchemaSID),
-		Endpoint:      r.String(ids.EndpointSID),
-		Model:         r.String(ids.ModelSID),
-		ModelName:     r.String(ids.ModelNameSID),
-		SecretRef:     r.String(ids.SecretSID),
+		PrincipalSlug:  principalSlug,
+		Provider:       r.String(ids.ProviderSID),
+		ParentProvider: r.String(ids.ParentProviderSID),
+		ProviderKind:   r.String(ids.KindSID),
+		BackendSchema:  r.String(ids.BackendSchemaSID),
+		Endpoint:       r.String(ids.EndpointSID),
+		Model:          r.String(ids.ModelSID),
+		ModelName:      r.String(ids.ModelNameSID),
+		SecretRef:      r.String(ids.SecretSID),
 		Rate: RatePolicy{
 			USDPerDayCents: ids.Rate.USDPerDayCents,
 			RPM:            ids.Rate.RPM,
@@ -1018,20 +1032,33 @@ func (r Reader) ProviderDescriptions() []ProviderDescription {
 
 	descriptions := make([]ProviderDescription, 0, len(providers))
 	for _, provider := range providers {
-		models := append([]string{}, modelsByProvider[provider.ID]...)
+		modelProviderID := provider.ID
+		if len(modelsByProvider[modelProviderID]) == 0 && provider.ParentProviderID != "" {
+			modelProviderID = provider.ParentProviderID
+		}
+		models := append([]string{}, modelsByProvider[modelProviderID]...)
 		sort.Strings(models)
 		descriptions = append(descriptions, ProviderDescription{
-			ID:            provider.ID,
-			Kind:          provider.Kind,
-			BackendSchema: provider.BackendSchema,
-			Endpoint:      provider.Endpoint,
-			AuthType:      effectiveProviderAuthType(provider.AuthType),
-			PathPrefix:    provider.PathPrefix,
-			ModelIDs:      models,
-			Extra:         provider.Extra,
+			ID:               provider.ID,
+			ParentProviderID: provider.ParentProviderID,
+			Kind:             provider.Kind,
+			BackendSchema:    provider.BackendSchema,
+			Endpoint:         provider.Endpoint,
+			AuthSecretRef:    displayAuthSecretRef(provider.SecretRef),
+			AuthType:         effectiveProviderAuthType(provider.AuthType),
+			PathPrefix:       provider.PathPrefix,
+			ModelIDs:         models,
+			Extra:            provider.Extra,
 		})
 	}
 	return descriptions
+}
+
+func displayAuthSecretRef(secretRef string) string {
+	if strings.TrimSpace(secretRef) == "" {
+		return "<missing>"
+	}
+	return secretRef
 }
 
 // ResolveMCPServer returns catalog metadata for one MCP server ID.
@@ -1107,9 +1134,13 @@ func (r Reader) V1ModelsJSON() ([]byte, error) {
 // V1ModelsJSONForProvider renders a /v1/models response shape containing only
 // models whose base provider matches providerID.
 func (r Reader) V1ModelsJSONForProvider(providerID string) ([]byte, error) {
+	modelProviderID := providerID
+	if provider, ok := r.ResolveProvider(providerID); ok && provider.ParentProviderID != "" {
+		modelProviderID = provider.ParentProviderID
+	}
 	models := []ModelInfo{}
 	for _, model := range r.Models() {
-		if model.Provider == providerID {
+		if model.Provider == modelProviderID {
 			models = append(models, model)
 		}
 	}
@@ -1289,14 +1320,15 @@ func (r Reader) ScopeIDs() []string {
 func (r Reader) providerInfo(id uint32) ProviderInfo {
 	provider := r.provider(id)
 	return ProviderInfo{
-		ID:            r.String(provider.idSID),
-		Kind:          r.String(provider.kindSID),
-		BackendSchema: r.String(provider.backendSchemaSID),
-		Endpoint:      r.String(provider.endpointSID),
-		SecretRef:     r.String(provider.secretSID),
-		AuthType:      r.String(provider.authTypeSID),
-		PathPrefix:    r.String(provider.pathPrefixSID),
-		Extra:         parseStringMap(r.String(provider.extraSID)),
+		ID:               r.String(provider.idSID),
+		ParentProviderID: r.String(provider.parentProviderSID),
+		Kind:             r.String(provider.kindSID),
+		BackendSchema:    r.String(provider.backendSchemaSID),
+		Endpoint:         r.String(provider.endpointSID),
+		SecretRef:        r.String(provider.secretSID),
+		AuthType:         r.String(provider.authTypeSID),
+		PathPrefix:       r.String(provider.pathPrefixSID),
+		Extra:            parseStringMap(r.String(provider.extraSID)),
 	}
 }
 
@@ -1514,28 +1546,31 @@ type routeInterner struct {
 }
 
 type targetRouteKey struct {
-	providerID uint32
-	modelID    uint32
+	providerID  uint32
+	modelID     uint32
+	metadataSID uint32
 }
 
 type chainRouteKey struct {
-	retrySID   uint32
-	timeoutMS  uint32
-	child0     uint32
-	child1     uint32
-	child2     uint32
-	childCount uint8
-	hasRetry   bool
+	metadataSID uint32
+	retrySID    uint32
+	timeoutMS   uint32
+	child0      uint32
+	child1      uint32
+	child2      uint32
+	childCount  uint8
+	hasRetry    bool
 }
 
 type splitRouteKey struct {
-	child0     uint32
-	child1     uint32
-	child2     uint32
-	weight0    uint32
-	weight1    uint32
-	weight2    uint32
-	childCount uint8
+	metadataSID uint32
+	child0      uint32
+	child1      uint32
+	child2      uint32
+	weight0     uint32
+	weight1     uint32
+	weight2     uint32
+	childCount  uint8
 }
 
 func newBuilder() *builder {
@@ -1696,6 +1731,7 @@ func internRoute(
 	routes *[]compiledRoute,
 ) (uint32, error) {
 	normalized := normalizeRoutePlan(route)
+	metadataSID := b.stringID(stringMapJSON(normalized.Metadata))
 	if normalized.Kind == RouteKindTarget {
 		modelID, ok := modelIDs[normalized.Model]
 		if !ok {
@@ -1705,7 +1741,7 @@ func internRoute(
 		if !ok {
 			return 0, fmt.Errorf("references unknown provider %q", normalized.Provider)
 		}
-		key := targetRouteKey{providerID: providerID, modelID: modelID}
+		key := targetRouteKey{providerID: providerID, modelID: modelID, metadataSID: metadataSID}
 		if id, ok := routeIDs.targetIDs[key]; ok {
 			return id, nil
 		}
@@ -1780,7 +1816,10 @@ func internShortChainRoute(
 	if len(route.Children) == 0 {
 		return 0, errors.New("chain route node must not be empty")
 	}
-	key := chainRouteKey{childCount: uint8(len(route.Children))}
+	key := chainRouteKey{
+		metadataSID: b.stringID(stringMapJSON(route.Metadata)),
+		childCount:  uint8(len(route.Children)),
+	}
 	if route.Retry != nil {
 		key.hasRetry = true
 		key.retrySID = b.stringID(route.Retry.RetryOn)
@@ -1823,7 +1862,10 @@ func internShortSplitRoute(
 	if len(route.Split) == 0 {
 		return 0, errors.New("split route node must not be empty")
 	}
-	key := splitRouteKey{childCount: uint8(len(route.Split))}
+	key := splitRouteKey{
+		metadataSID: b.stringID(stringMapJSON(route.Metadata)),
+		childCount:  uint8(len(route.Split)),
+	}
 	var childIDs [3]uint32
 	var weights [3]uint32
 	for index, child := range route.Split {
@@ -1867,6 +1909,8 @@ func routeKey(route RoutePlan) string {
 func writeRouteKey(builder *strings.Builder, route RoutePlan) {
 	route = normalizeRoutePlan(route)
 	builder.WriteString(string(route.Kind))
+	builder.WriteByte('\x00')
+	builder.WriteString(stringMapJSON(route.Metadata))
 	builder.WriteByte('\x00')
 	switch route.Kind {
 	case RouteKindTarget:
@@ -2125,6 +2169,7 @@ func writeProviders(out *bytes.Buffer, b *builder, providers []Provider) {
 	putU32(out, uint32(len(providers)))
 	for _, provider := range providers {
 		putU32(out, b.stringID(provider.ID))
+		putU32(out, b.stringID(provider.ParentProviderID))
 		putU32(out, b.stringID(provider.Kind))
 		putU32(out, b.stringID(provider.BackendSchema))
 		putU32(out, b.stringID(provider.Endpoint))
@@ -2166,10 +2211,11 @@ func writeRoutes(out *bytes.Buffer, b *builder, routes []compiledRoute, provider
 		switch route.Kind {
 		case RouteKindTarget:
 			records[i] = routeRef{
-				kind:       routeKindTargetID,
-				providerID: providerIDs[route.Provider],
-				modelID:    modelIDs[route.Model],
-				secretSID:  b.stringID(route.SecretRef),
+				kind:        routeKindTargetID,
+				providerID:  providerIDs[route.Provider],
+				modelID:     modelIDs[route.Model],
+				secretSID:   b.stringID(route.SecretRef),
+				metadataSID: b.stringID(stringMapJSON(route.Metadata)),
 			}
 		case RouteKindChain:
 			records[i] = routeRef{
@@ -2178,6 +2224,7 @@ func writeRoutes(out *bytes.Buffer, b *builder, routes []compiledRoute, provider
 				childOffset:     baseOffset + uint32(children.Len()),
 				retryOnSID:      retryOnSID(b, route.Retry),
 				perTryTimeoutMS: retryTimeout(route.Retry),
+				metadataSID:     b.stringID(stringMapJSON(route.Metadata)),
 			}
 			for _, childID := range compiled.chainChildIDs {
 				putU32(&children, 0)
@@ -2188,6 +2235,7 @@ func writeRoutes(out *bytes.Buffer, b *builder, routes []compiledRoute, provider
 				kind:        routeKindSplitID,
 				childCount:  uint32(len(route.Split)),
 				childOffset: baseOffset + uint32(children.Len()),
+				metadataSID: b.stringID(stringMapJSON(route.Metadata)),
 			}
 			for childIndex, child := range route.Split {
 				putU32(&children, child.Weight)
@@ -2202,18 +2250,18 @@ func writeRoutes(out *bytes.Buffer, b *builder, routes []compiledRoute, provider
 			putU32(out, record.providerID)
 			putU32(out, record.modelID)
 			putU32(out, record.secretSID)
-			putU32(out, 0)
+			putU32(out, record.metadataSID)
 			putU32(out, 0)
 		case routeKindChainID:
 			putU32(out, record.childCount)
 			putU32(out, record.childOffset)
 			putU32(out, record.retryOnSID)
 			putU32(out, record.perTryTimeoutMS)
-			putU32(out, 0)
+			putU32(out, record.metadataSID)
 		case routeKindSplitID:
 			putU32(out, record.childCount)
 			putU32(out, record.childOffset)
-			putU32(out, 0)
+			putU32(out, record.metadataSID)
 			putU32(out, 0)
 			putU32(out, 0)
 		}
@@ -2424,14 +2472,15 @@ type modelRef struct {
 }
 
 type providerRef struct {
-	idSID            uint32
-	kindSID          uint32
-	backendSchemaSID uint32
-	endpointSID      uint32
-	secretSID        uint32
-	authTypeSID      uint32
-	pathPrefixSID    uint32
-	extraSID         uint32
+	idSID             uint32
+	parentProviderSID uint32
+	kindSID           uint32
+	backendSchemaSID  uint32
+	endpointSID       uint32
+	secretSID         uint32
+	authTypeSID       uint32
+	pathPrefixSID     uint32
+	extraSID          uint32
 }
 
 type routeRef struct {
@@ -2439,6 +2488,7 @@ type routeRef struct {
 	providerID      uint32
 	modelID         uint32
 	secretSID       uint32
+	metadataSID     uint32
 	childCount      uint32
 	childOffset     uint32
 	retryOnSID      uint32
@@ -2725,14 +2775,15 @@ func (r Reader) model(id uint32) modelRef {
 func (r Reader) provider(id uint32) providerRef {
 	base := int(r.providersOff) + 4 + int(id)*providerLen
 	return providerRef{
-		idSID:            r.read32(base),
-		kindSID:          r.read32(base + 4),
-		backendSchemaSID: r.read32(base + 8),
-		endpointSID:      r.read32(base + 12),
-		secretSID:        r.read32(base + 16),
-		authTypeSID:      r.read32(base + 20),
-		pathPrefixSID:    r.read32(base + 24),
-		extraSID:         r.read32(base + 28),
+		idSID:             r.read32(base),
+		parentProviderSID: r.read32(base + 4),
+		kindSID:           r.read32(base + 8),
+		backendSchemaSID:  r.read32(base + 12),
+		endpointSID:       r.read32(base + 16),
+		secretSID:         r.read32(base + 20),
+		authTypeSID:       r.read32(base + 24),
+		pathPrefixSID:     r.read32(base + 28),
+		extraSID:          r.read32(base + 32),
 	}
 }
 
@@ -2742,10 +2793,11 @@ func (r Reader) route(id uint32) routeRef {
 	switch kind {
 	case routeKindTargetID:
 		return routeRef{
-			kind:       kind,
-			providerID: r.read32(base + 4),
-			modelID:    r.read32(base + 8),
-			secretSID:  r.read32(base + 12),
+			kind:        kind,
+			providerID:  r.read32(base + 4),
+			modelID:     r.read32(base + 8),
+			secretSID:   r.read32(base + 12),
+			metadataSID: r.read32(base + 16),
 		}
 	case routeKindChainID:
 		return routeRef{
@@ -2754,12 +2806,14 @@ func (r Reader) route(id uint32) routeRef {
 			childOffset:     r.read32(base + 8),
 			retryOnSID:      r.read32(base + 12),
 			perTryTimeoutMS: r.read32(base + 16),
+			metadataSID:     r.read32(base + 20),
 		}
 	case routeKindSplitID:
 		return routeRef{
 			kind:        kind,
 			childCount:  r.read32(base + 4),
 			childOffset: r.read32(base + 8),
+			metadataSID: r.read32(base + 12),
 		}
 	default:
 		return routeRef{kind: kind}
@@ -2781,17 +2835,19 @@ func (r Reader) routePlanIDs(routeID uint32, principal principalRef, targetOrdin
 			secretSID = provider.secretSID
 		}
 		return LLMRoutePlanIDs{
-			RouteID:          routeID,
-			Kind:             RouteKindTarget,
-			ProviderID:       route.providerID,
-			ProviderSID:      provider.idSID,
-			KindSID:          provider.kindSID,
-			BackendSchemaSID: provider.backendSchemaSID,
-			EndpointSID:      provider.endpointSID,
-			ModelID:          route.modelID,
-			ModelSID:         model.idSID,
-			ModelNameSID:     model.nameSID,
-			SecretSID:        secretSID,
+			RouteID:           routeID,
+			Kind:              RouteKindTarget,
+			ProviderID:        route.providerID,
+			ProviderSID:       provider.idSID,
+			ParentProviderSID: provider.parentProviderSID,
+			KindSID:           provider.kindSID,
+			BackendSchemaSID:  provider.backendSchemaSID,
+			EndpointSID:       provider.endpointSID,
+			ModelID:           route.modelID,
+			ModelSID:          model.idSID,
+			ModelNameSID:      model.nameSID,
+			SecretSID:         secretSID,
+			MetadataSID:       route.metadataSID,
 		}, true
 	case routeKindChainID:
 		children, ok := r.routeChildren(route, principal, targetOrdinal)
@@ -2802,6 +2858,7 @@ func (r Reader) routePlanIDs(routeID uint32, principal principalRef, targetOrdin
 			RouteID:         routeID,
 			Kind:            RouteKindChain,
 			RetryOnSID:      route.retryOnSID,
+			MetadataSID:     route.metadataSID,
 			PerTryTimeoutMS: route.perTryTimeoutMS,
 			Children:        children,
 		}, true
@@ -2811,9 +2868,10 @@ func (r Reader) routePlanIDs(routeID uint32, principal principalRef, targetOrdin
 			return LLMRoutePlanIDs{}, false
 		}
 		return LLMRoutePlanIDs{
-			RouteID:  routeID,
-			Kind:     RouteKindSplit,
-			Children: children,
+			RouteID:     routeID,
+			Kind:        RouteKindSplit,
+			MetadataSID: route.metadataSID,
+			Children:    children,
 		}, true
 	default:
 		return LLMRoutePlanIDs{}, false
@@ -2877,10 +2935,12 @@ func (r Reader) materializeLLMRoutePlan(plan LLMRoutePlanIDs) LLMRoutePlan {
 	out := LLMRoutePlan{
 		Kind:            plan.Kind,
 		RetryOn:         r.String(plan.RetryOnSID),
+		Metadata:        parseStringMap(r.String(plan.MetadataSID)),
 		PerTryTimeoutMS: plan.PerTryTimeoutMS,
 	}
 	if plan.Kind == RouteKindTarget {
 		out.Provider = r.String(plan.ProviderSID)
+		out.ParentProvider = r.String(plan.ParentProviderSID)
 		out.ProviderKind = r.String(plan.KindSID)
 		out.BackendSchema = r.String(plan.BackendSchemaSID)
 		out.Endpoint = r.String(plan.EndpointSID)

@@ -387,6 +387,120 @@ func TestReaderProviders(t *testing.T) {
 	}
 }
 
+func TestReaderProviderParentRoundTrip(t *testing.T) {
+	input := testPackInput(1, 1)
+	input.Providers = append(input.Providers, Provider{
+		ID:            "anthropic",
+		Kind:          "anthropic",
+		BackendSchema: "anthropic",
+		Endpoint:      "https://api.anthropic.com",
+		SecretRef:     "env://ANTHROPIC_API_KEY",
+		AuthType:      "anthropic",
+	})
+	input.Providers = append(input.Providers, Provider{
+		ID:               "anthropic-openai-compat",
+		ParentProviderID: "anthropic",
+		Kind:             "openai",
+		BackendSchema:    "openai",
+		Endpoint:         "https://api.anthropic.com",
+		SecretRef:        "env://ANTHROPIC_API_KEY",
+		AuthType:         "bearer",
+	})
+	input.Models = append(input.Models, Model{
+		ID:       "claude-chat",
+		Provider: "anthropic",
+		Name:     "claude-sonnet-4-5",
+		Mode:     "chat",
+	})
+	if input.Scopes[0].Principals[0].ModelRoutes == nil {
+		input.Scopes[0].Principals[0].ModelRoutes = map[string]RoutePlan{}
+	}
+	input.Scopes[0].Principals[0].ModelRoutes["claude-chat"] = RoutePlan{
+		Kind:     RouteKindTarget,
+		Provider: "anthropic-openai-compat",
+		Model:    "claude-chat",
+	}
+
+	blob, err := Build(input)
+	require.NoError(t, err)
+	reader, err := Open(blob)
+	require.NoError(t, err)
+
+	provider, ok := reader.ResolveProvider("anthropic-openai-compat")
+	require.True(t, ok)
+	require.Equal(t, "anthropic", provider.ParentProviderID)
+
+	got, ok := reader.ResolveLLM("workspace1", "slug:1:1", "claude-chat")
+	require.True(t, ok)
+	require.Equal(t, "anthropic-openai-compat", got.Provider)
+	require.Equal(t, "anthropic", got.ParentProvider)
+
+	plan, ok := reader.ResolveLLMPlan("workspace1", "slug:1:1", "claude-chat")
+	require.True(t, ok)
+	require.Equal(t, "anthropic", plan.Plan.ParentProvider)
+
+	byID := map[string]ProviderDescription{}
+	for _, description := range reader.ProviderDescriptions() {
+		byID[description.ID] = description
+	}
+	require.Equal(t, []string{"claude-chat"}, byID["anthropic-openai-compat"].ModelIDs)
+
+	modelsJSON, err := reader.V1ModelsJSONForProvider("anthropic-openai-compat")
+	require.NoError(t, err)
+	require.Contains(t, string(modelsJSON), `"id":"claude-chat"`)
+}
+
+func TestReaderRouteMetadataRoundTrip(t *testing.T) {
+	input := testPackInput(1, 1)
+	input.Scopes[0].Principals[0].ModelRoutes = map[string]RoutePlan{
+		"gpt-4o-mini": {
+			Kind: RouteKindChain,
+			Retry: &RetryPolicy{
+				RetryOn:         "401,403",
+				PerTryTimeoutMS: 900000,
+			},
+			Metadata: map[string]string{
+				"realm":     "byok",
+				"byok_mode": "primary",
+			},
+			Children: []RoutePlan{
+				{
+					Kind:      RouteKindTarget,
+					Provider:  "openai",
+					Model:     "gpt-4o-mini",
+					SecretRef: "sm://byok-openai",
+					Metadata: map[string]string{
+						"realm":     "byok",
+						"byok_role": "primary",
+					},
+				},
+				{
+					Kind:     RouteKindTarget,
+					Provider: "openai",
+					Model:    "gpt-4o-mini",
+					Metadata: map[string]string{
+						"realm":     "byok",
+						"byok_role": "platform_fallback",
+					},
+				},
+			},
+		},
+	}
+
+	blob, err := Build(input)
+	require.NoError(t, err)
+	reader, err := Open(blob)
+	require.NoError(t, err)
+
+	plan, ok := reader.ResolveLLMPlan("workspace1", "slug:1:1", "gpt-4o-mini")
+	require.True(t, ok)
+	require.Equal(t, "byok", plan.Plan.Metadata["realm"])
+	require.Equal(t, "primary", plan.Plan.Metadata["byok_mode"])
+	require.Len(t, plan.Plan.Children, 2)
+	require.Equal(t, "primary", plan.Plan.Children[0].Plan.Metadata["byok_role"])
+	require.Equal(t, "platform_fallback", plan.Plan.Children[1].Plan.Metadata["byok_role"])
+}
+
 func TestBuildRejectsProviderWithoutBackendSchema(t *testing.T) {
 	input := testPackInput(1, 1)
 	input.Providers[0].BackendSchema = ""
@@ -458,10 +572,13 @@ func TestReaderProviderDescriptions(t *testing.T) {
 	}
 
 	assert.Equal(t, "bearer", byID["openai"].AuthType)
+	assert.Equal(t, "env://OPENAI_API_KEY", byID["openai"].AuthSecretRef)
 	assert.Equal(t, []string{"gpt-4o-mini"}, byID["openai"].ModelIDs)
 	assert.Equal(t, "anthropic", byID["anthropic"].AuthType)
+	assert.Equal(t, "env://ANTHROPIC_API_KEY", byID["anthropic"].AuthSecretRef)
 	assert.Equal(t, []string{"claude-haiku-4-5"}, byID["anthropic"].ModelIDs)
 	assert.Equal(t, "aws", byID["bedrock"].AuthType)
+	assert.Equal(t, "<missing>", byID["bedrock"].AuthSecretRef)
 	assert.Equal(t, "openai", byID["bedrock"].Kind)
 	assert.Equal(t, "awsbedrock", byID["bedrock"].BackendSchema)
 	assert.Equal(t, "us-east-1", byID["bedrock"].Extra["aws_region"])
