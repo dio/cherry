@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -234,7 +235,7 @@ func (s *Session) inspect(ctx context.Context, fields []string) (Result, error) 
 		if err != nil {
 			return Result{}, err
 		}
-		return s.result(mustYAML(paths), paths), nil
+		return s.result(mustYAML(inspectMCPPaths(paths)), paths), nil
 	case "all":
 		scope, ok := s.activeScope()
 		if !ok {
@@ -353,8 +354,10 @@ func printLLMRoutePlan(b *strings.Builder, plan cherry.LLMRoutePlan, indent int)
 			plan.Endpoint,
 			plan.SecretRef,
 		)
+		printRouteMetadata(b, plan.Metadata, indent+2)
 	case cherry.RouteKindChain:
 		fmt.Fprintf(b, "%schain:\n", pad)
+		printRouteMetadata(b, plan.Metadata, indent+2)
 		if plan.RetryOn != "" || plan.PerTryTimeoutMS != 0 {
 			fmt.Fprintf(b, "%s  retry_on: %s\n", pad, plan.RetryOn)
 			fmt.Fprintf(b, "%s  per_try_timeout_ms: %d\n", pad, plan.PerTryTimeoutMS)
@@ -366,6 +369,7 @@ func printLLMRoutePlan(b *strings.Builder, plan cherry.LLMRoutePlan, indent int)
 		}
 	case cherry.RouteKindSplit:
 		fmt.Fprintf(b, "%ssplit:\n", pad)
+		printRouteMetadata(b, plan.Metadata, indent+2)
 		fmt.Fprintf(b, "%s  children:\n", pad)
 		for _, child := range plan.Children {
 			fmt.Fprintf(b, "%s    - weight: %d\n", pad, child.Weight)
@@ -373,6 +377,22 @@ func printLLMRoutePlan(b *strings.Builder, plan cherry.LLMRoutePlan, indent int)
 		}
 	default:
 		fmt.Fprintf(b, "%sunknown: %s\n", pad, plan.Kind)
+	}
+}
+
+func printRouteMetadata(b *strings.Builder, metadata map[string]string, indent int) {
+	if len(metadata) == 0 {
+		return
+	}
+	pad := strings.Repeat(" ", indent)
+	keys := make([]string, 0, len(metadata))
+	for key := range metadata {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	fmt.Fprintf(b, "%smetadata:\n", pad)
+	for _, key := range keys {
+		fmt.Fprintf(b, "%s  %s: %s\n", pad, key, metadata[key])
 	}
 }
 
@@ -648,9 +668,10 @@ func (s *Session) mcpInitialize(ctx context.Context, fields []string) (Result, e
 	fmt.Fprintf(&b, "lane: %s\n", s.ctx.Lane)
 	fmt.Fprintf(&b, "scope: %s\n", scope)
 	fmt.Fprintf(&b, "path: %s\n", result.Path)
+	fmt.Fprintf(&b, "profile_access_auth: type=%s provider=%s secret_ref=%s\n", result.Auth.Type, result.Auth.Provider, result.Auth.SecretRef)
 	b.WriteString("initialize_servers:\n")
 	for _, server := range result.Servers {
-		fmt.Fprintf(&b, "  server=%s endpoint=%s auth_type=%s secret_ref=%s\n", server.Server, server.Endpoint, server.AuthType, server.SecretRef)
+		fmt.Fprintf(&b, "  server=%s endpoint=%s upstream_auth_type=%s upstream_secret_ref=%s\n", server.Server, server.Endpoint, server.AuthType, server.SecretRef)
 	}
 	return s.result(b.String(), result), nil
 }
@@ -710,15 +731,16 @@ func formatMCPResult(lane string, scope string, result cherry.MCPResult) string 
 	fmt.Fprintf(&b, "lane: %s\n", lane)
 	fmt.Fprintf(&b, "scope: %s\n", scope)
 	fmt.Fprintf(&b, "path: %s\n", result.Path)
+	fmt.Fprintf(&b, "profile_access_auth: type=%s provider=%s secret_ref=%s\n", result.Auth.Type, result.Auth.Provider, result.Auth.SecretRef)
 	b.WriteString("tools:\n")
 	for _, tool := range result.Tools {
-		fmt.Fprintf(&b, "  %s -> server=%s endpoint=%s upstream_tool=%s auth_type=%s secret_ref=%s\n", tool.ExposedName, tool.Server, tool.ServerEndpoint, tool.Tool, tool.AuthType, tool.SecretRef)
+		fmt.Fprintf(&b, "  %s -> server=%s endpoint=%s upstream_tool=%s upstream_auth_type=%s upstream_secret_ref=%s\n", tool.ExposedName, tool.Server, tool.ServerEndpoint, tool.Tool, tool.AuthType, tool.SecretRef)
 	}
 	return b.String()
 }
 
 func formatMCPTool(lane string, scope string, path string, label string, toolName string, tool cherry.MCPTool) string {
-	return fmt.Sprintf("lane: %s\nscope: %s\npath: %s\n%s: %s -> server=%s endpoint=%s upstream_tool=%s auth_type=%s secret_ref=%s\n",
+	return fmt.Sprintf("lane: %s\nscope: %s\npath: %s\n%s: %s -> server=%s endpoint=%s upstream_tool=%s upstream_auth_type=%s upstream_secret_ref=%s\n",
 		lane,
 		scope,
 		path,
@@ -730,6 +752,52 @@ func formatMCPTool(lane string, scope string, path string, label string, toolNam
 		tool.AuthType,
 		tool.SecretRef,
 	)
+}
+
+type inspectMCPPath struct {
+	ScopeID           string                `yaml:"scopeid"`
+	Path              string                `yaml:"path"`
+	ProfileAccessAuth cherry.MCPProfileAuth `yaml:"profile_access_auth"`
+	Tools             []inspectMCPTool      `yaml:"tools"`
+}
+
+type inspectMCPTool struct {
+	ExposedName  string              `yaml:"exposedname"`
+	Server       string              `yaml:"server"`
+	Endpoint     string              `yaml:"serverendpoint"`
+	Tool         string              `yaml:"tool"`
+	UpstreamAuth inspectUpstreamAuth `yaml:"upstream_auth"`
+}
+
+type inspectUpstreamAuth struct {
+	Type      string `yaml:"type"`
+	SecretRef string `yaml:"secretref"`
+}
+
+func inspectMCPPaths(paths []cherry.MCPPath) []inspectMCPPath {
+	out := make([]inspectMCPPath, 0, len(paths))
+	for _, path := range paths {
+		tools := make([]inspectMCPTool, 0, len(path.Tools))
+		for _, tool := range path.Tools {
+			tools = append(tools, inspectMCPTool{
+				ExposedName: tool.ExposedName,
+				Server:      tool.Server,
+				Endpoint:    tool.ServerEndpoint,
+				Tool:        tool.Tool,
+				UpstreamAuth: inspectUpstreamAuth{
+					Type:      tool.AuthType,
+					SecretRef: tool.SecretRef,
+				},
+			})
+		}
+		out = append(out, inspectMCPPath{
+			ScopeID:           path.ScopeID,
+			Path:              path.Path,
+			ProfileAccessAuth: path.Auth,
+			Tools:             tools,
+		})
+	}
+	return out
 }
 
 func (s *Session) mcpCommandScopeAndPath(ctx context.Context, fields []string, usage string) (string, string, bool, error) {

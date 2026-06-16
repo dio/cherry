@@ -38,6 +38,12 @@ func TestSessionExecuteAbsorbsLaneAndScope(t *testing.T) {
 	require.Contains(t, result.Text, "scope: prod")
 	require.Contains(t, result.Text, "principal: slug:alice")
 	require.Contains(t, result.Text, "provider=openai")
+
+	result, err = session.Execute(context.Background(), "llm providers")
+	require.NoError(t, err)
+	require.Contains(t, result.Text, "id: openai")
+	require.Contains(t, result.Text, "authtype: bearer")
+	require.Contains(t, result.Text, "authsecretref: env://OPENAI_API_KEY")
 }
 
 func TestSessionExecuteUseScope(t *testing.T) {
